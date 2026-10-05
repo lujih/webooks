@@ -1,0 +1,12 @@
+node_modules/
+.wrangler/
+dist/
+*.log
+
+# wrangler 本地状态
+.dev.vars
+.wrangler/state/
+
+# 编辑器
+.vscode/
+.idea/

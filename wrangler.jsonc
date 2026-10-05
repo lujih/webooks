@@ -1,0 +1,55 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "webooks",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-08-22",
+  "observability": {
+    "enabled": true
+  },
+
+  // ── 预算相关的可调参数 ────────────────────────────────────────────────
+  // 这些值直接决定 Workers Free 每天 100,000 请求的消耗速度。
+  "vars": {
+    // R2 桶的公开自定义域（必须绑自定义域，不要用 r2.dev：官方明示不适用于生产）
+    // GET 会 302 跳到这里，从而不占用 Worker 的 CPU/内存。
+    "R2_PUBLIC_BASE": "https://books.example.com",
+
+    // WebDAV 挂载前缀。会原样出现在 207 响应的 D:href 里。
+    "DAV_MOUNT": "/dav",
+
+    // 单目录最多返回多少个子项。既控制 PROPFIND 响应体积，也保证 XML 生成
+    // 在 Workers Free 的 10ms CPU 限制内（200 条约 1–3ms）。
+    "MAX_ENTRIES": "200",
+
+    // PROPFIND 结果的 Cache API TTL（秒）。这是免费方案的关键：
+    // 未命中的 PROPFIND 要读约 200 行 D1，而 D1 免费额度只有 500 万行/天。
+    "PROPFIND_TTL": "300",
+
+    // "downgrade"（默认，把 infinity 当 Depth:1 处理，兼容性好）
+    // "deny"（按 RFC 4918 返回 403 + DAV:propfind-finite-depth）
+    "DEPTH_INFINITY": "downgrade"
+  },
+
+  // ── 资源绑定：故意不写 ID / 名称 ──────────────────────────────────────
+  // 这是 wrangler 的「自动资源创建」（2025-10-24 上线的 open beta，需 wrangler ≥ 4.45）。
+  // 好处：配置文件不含任何账号相关信息，仓库可以直接公开，别人 fork 后一条命令就能部署。
+  //   · wrangler dev    → 本地自动创建
+  //   · wrangler deploy → 调用 Cloudflare API 创建并绑定，并把生成的 ID 写回本文件
+  // 想改回手动模式：先 `wrangler d1 create` / `wrangler r2 bucket create`，再把
+  // database_name / database_id / bucket_name 填回来。
+  "r2_buckets": [
+    {
+      "binding": "BUCKET"
+    }
+  ],
+
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "migrations_dir": "migrations"
+    }
+  ]
+
+  // ADMIN_TOKEN 不在 vars 里 —— 它必须用 `wrangler secret put ADMIN_TOKEN` 设置，
+  // 绝不进代码仓库。
+}

@@ -1,0 +1,32 @@
+{
+  "name": "webooks",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Budget-aware WebDAV + OPDS ebook library on Cloudflare Workers Free + R2",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "budget": "node scripts/budget.mjs",
+    "check:dav": "node scripts/dav-probe.mjs",
+    "check:size": "node scripts/size-probe.mjs",
+    "db:migrate:local": "wrangler d1 migrations apply DB --local",
+    "db:migrate": "wrangler d1 migrations apply DB --remote",
+    "check": "npm run typecheck && npm test"
+  },
+  "devDependencies": {
+    "@cloudflare/vitest-pool-workers": "^0.22.0",
+    "@cloudflare/workers-types": "^5.20261001.1",
+    "typescript": "^5.9.0",
+    "vitest": "^4.1.0",
+    "wrangler": "^4.147.0"
+  },
+  "allowScripts": {
+    "esbuild@0.28.1": true,
+    "workerd@1.20260815.1": true,
+    "workerd@1.20261001.1": true
+  }
+}
