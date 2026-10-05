@@ -39,12 +39,21 @@ gh repo create webooks --public --source=. --remote=origin --push
 Dashboard → Workers & Pages → Create → Workers → Connect to Git
   → 选 webooks 仓库
   → Build command:      npm ci
-  → Deploy command:     npx wrangler d1 migrations apply DB --remote && npx wrangler deploy
+  → Deploy command:     npm run deploy:cloudflare
 ```
 
-**Deploy command 必须把迁移串在前面**：先有表结构，Worker 上线才能正常服务。
-（这个仓库里 `.github/workflows/deploy.yml` 是路径 B 用的，走路径 A 时不会执行，
-但放着不影响。）
+`deploy:cloudflare` 的内容是 **`wrangler deploy && wrangler d1 migrations apply DB --remote`**。
+
+> ⚠️ **顺序不能反**。wrangler 的自动资源创建只发生在 `wrangler deploy` 期间，
+> 所以首次构建时 D1 根本还不存在。写成 `migrations apply && wrangler deploy` 会直接报：
+>
+> ```
+> ✘ [ERROR] Couldn't find an auto-provisioned D1 DB named 'webooks-db' for binding 'DB'.
+>   Run 'wrangler deploy' to provision it, or add 'database_name' / 'database_id' to your config.
+> ```
+>
+> 先 deploy 的代价是存在一个「Worker 已上线但还没建表」的窗口（几秒）。
+> 这个窗口内访问会返回 **503 并附上修复命令**，不是裸 500。
 
 ### 3. 设密钥
 
@@ -120,10 +129,9 @@ npx wrangler login
 npm run db:migrate:local
 npm run dev            # http://127.0.0.1:8788/dav/
 
-# 部署到线上
-npm run db:migrate     # 应用到远端 D1（会自动创建 D1 和 R2）
+# 部署到线上（先 deploy 创建资源，再迁移；顺序不能反，原因见路径 A）
 npx wrangler secret put ADMIN_TOKEN
-npm run deploy
+npm run deploy:cloudflare
 ```
 
 ⚠️ 首次 `wrangler deploy` 后，wrangler 会把自动生成的 `database_id` **写回 `wrangler.jsonc`**。
@@ -179,9 +187,30 @@ curl -X POST "https://你的域名/api/admin/reindex?prefix=library/" \
 
 | 症状 | 原因 | 处理 |
 |---|---|---|
+| `Couldn't find an auto-provisioned D1 DB named 'webooks-db' for binding 'DB'` | 迁移跑在 deploy 之前，而 D1 要等 deploy 才创建 | Deploy command 改成 `npm run deploy:cloudflare`（deploy 在前）|
+| 访问返回 503 `Database schema is not initialised` | 已部署但还没跑迁移 | `npm run db:migrate`，或重跑一次 deploy command |
 | 下载 302 到 530 / DNS 失败 | R2 公开自定义域没配，或 `R2_PUBLIC_BASE` 没改 | 见本文开头 |
 | `PROPFIND` 返回 404 | 表没建 | `npm run db:migrate` |
 | 目录列得出来但一直是空的 | 没跑 reindex，或 reindex 没走到最后一个 cursor | 看 `bucketsRebuilt` 是否为 true |
 | 新增的书 5 分钟内不出现 | PROPFIND 缓存 TTL | 正常。`POST /api/admin/purge?path=/title/A/` 可立即失效 |
 | 每天固定时段整站 1027 | Workers Free 每天 10 万请求打满（UTC 0 点 = 北京 08:00 重置） | `npm run budget` 看瓶颈；引导 rclone 用户走 S3 端点 |
 | `wrangler deploy` 报账号未认证 | 没 `wrangler login` | 路径 C 第 1 步，或改用路径 A/B |
+
+### 兜底：自动资源创建始终不工作时
+
+改用显式创建（wrangler 的自动创建还是 open beta）：
+
+```bash
+npx wrangler d1 create webooks-db     # 记下返回的 database_id
+npx wrangler r2 bucket create webooks
+```
+
+然后把 `wrangler.jsonc` 里的绑定补全：
+
+```jsonc
+"r2_buckets":  [{ "binding": "BUCKET", "bucket_name": "webooks" }],
+"d1_databases":[{ "binding": "DB", "database_name": "webooks-db",
+                  "database_id": "<上一步的 id>", "migrations_dir": "migrations" }]
+```
+
+这样配置里就带上了你的账号信息 —— 自己用没问题，但仓库不再适合直接 fork 部署。

@@ -35,7 +35,7 @@ export default {
 
     // admin 必须在 DAV 之前判断：DAV_MOUNT 为空（根挂载）时否则会被 DAV 吃掉
     if (path.startsWith('/api/admin/')) {
-      return handleAdmin(request, env, cfg, url);
+      return guarded(() => handleAdmin(request, env, cfg, url));
     }
 
     const mount = cfg.mountPath; // '' 表示挂在站点根
@@ -44,7 +44,7 @@ export default {
 
     if (isDav) {
       const davPath = mount === '' ? path : path.slice(mount.length) || '/';
-      return handleDav(request, env, cfg, davPath);
+      return guarded(() => handleDav(request, env, cfg, davPath));
     }
 
     if (path === '/' || path === '') {
@@ -60,6 +60,31 @@ export default {
     return textResponse(404, 'Not Found');
   },
 } satisfies ExportedHandler<Env>;
+
+/**
+ * 「先 deploy 再 migrate」是有意为之：wrangler 的自动资源创建只在 deploy 期间发生，
+ * 首次构建时 D1 还不存在，迁移必须排在后面。代价是存在一个「已部署但没建表」的窗口。
+ * 这里把这个窗口的报错换成可操作的提示，而不是裸 500。
+ */
+async function guarded(run: () => Promise<Response>): Promise<Response> {
+  try {
+    return await run();
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    if (/no such table|no such column|no such index/i.test(message)) {
+      return textResponse(
+        503,
+        'Database schema is not initialised.\n\n' +
+          'D1 已绑定但还没建表。执行：\n' +
+          '  npm run db:migrate          # 本地配置了远端凭据时\n' +
+          '  或在 Cloudflare 的 Deploy command 里使用：\n' +
+          '  npx wrangler deploy && npx wrangler d1 migrations apply DB --remote\n',
+        { 'retry-after': '60' },
+      );
+    }
+    throw err;
+  }
+}
 
 function indexHtml(cfg: Settings): string {
   const mount = `${cfg.mountPath}/`;
