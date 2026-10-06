@@ -29,6 +29,17 @@ describe('createPresignedPutUrl', () => {
     expect(u.pathname).toBe('/my-bucket/uploads/20261006/abc/Book.epub');
   });
 
+  it('canonical URI 必须包含 bucket（否则 R2 返回 SignatureDoesNotMatch）', async () => {
+    // 真实 R2 验证踩过的坑：canonical request 的 URI 必须与最终 URL 路径一致，
+    // 即 /{bucket}/{key}。只写 /{key} 会导致签名不匹配。
+    const url = await createPresignedPutUrl(base);
+    expect(parse(url).pathname).toBe('/my-bucket/uploads/20261006/abc/Book.epub');
+    // 用不同 bucket 时路径前缀必须跟着变（签名也随之改变）
+    const other = await createPresignedPutUrl({ ...base, bucket: 'other-bucket' });
+    expect(parse(other).pathname).toBe('/other-bucket/uploads/20261006/abc/Book.epub');
+    expect(other).not.toBe(url);
+  });
+
   it('包含 SigV4 必需的全部查询参数', async () => {
     const u = parse(await createPresignedPutUrl(base));
     expect(u.searchParams.get('X-Amz-Algorithm')).toBe('AWS4-HMAC-SHA256');

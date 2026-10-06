@@ -111,7 +111,7 @@ export async function createPresignedPutUrl(input: PresignInput): Promise<string
     : `host:${host}\n`;
   const canonicalRequest = [
     'PUT',
-    `/${encodedKey}`,
+    `/${bucket}/${encodedKey}`, // canonical URI 必须含 bucket（与最终 URL 路径一致）
     canonicalQuery,
     canonicalHeaders,
     contentType ? 'content-type;host' : 'host',
