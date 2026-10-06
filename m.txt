@@ -1,0 +1,8 @@
+feat: 指向真实的 R2 公开自定义域，解锁下载
+
+R2_PUBLIC_BASE 之前是占位域名 books.example.com，导致
+  GET -> 302 -> fetch failed
+这是 dav-probe 里最后一个失败项，也是库里唯一没配完的一步。
+
+已在 R2 桶上绑定自定义域 books.cszxorx.dpdns.org（活动/已启用），
+把它写进 vars，让 WebDAV 的 GET 能真正跳到 R2 下载字节。

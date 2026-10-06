@@ -12,7 +12,9 @@
   "vars": {
     // R2 桶的公开自定义域（必须绑自定义域，不要用 r2.dev：官方明示不适用于生产）
     // GET 会 302 跳到这里，从而不占用 Worker 的 CPU/内存。
-    "R2_PUBLIC_BASE": "https://books.example.com",
+    // 换域名部署时改这一行即可；也可以去掉它，改在 Dashboard 的
+    // Variables 里设（Dashboard 的值不会被 wrangler 覆盖）。
+    "R2_PUBLIC_BASE": "https://books.cszxorx.dpdns.org",
 
     // WebDAV 挂载前缀。会原样出现在 207 响应的 D:href 里。
     "DAV_MOUNT": "/dav",
