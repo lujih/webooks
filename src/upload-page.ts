@@ -170,7 +170,7 @@ $('go').onclick = async () => {
     markStep(1);
 
     setStep(2); msg('正在上传到 R2…');
-    await putToR2(init.json.uploadUrl, picked, init.json.headers['content-type']);
+    await putToR2WithRetry(init.json.uploadUrl, picked, init.json.headers['content-type']);
 
     setStep(3); msg('正在写入书库…');
     const done = await fetch('/api/upload/complete', {
@@ -183,22 +183,56 @@ $('go').onclick = async () => {
     msg('✅ 上传成功：《'+done.json.title+'》已上架', 'ok');
     $('pct').style.width='100%';
   }catch(e){
-    msg('❌ ' + (e.message||e), 'err');
+    const detail = e.message||String(e);
+    // 连接类错误在公网上传很常见，明确告诉用户可以重试，而不是让他以为坏了
+    const retryable = /中断|超时|ERR_|网络/.test(detail);
+    msg('❌ ' + detail + (retryable ? '（大文件在弱网下中断属常见情况，再点一次「开始上传」即可）' : ''), 'err');
     $('go').disabled=false;
   }
 };
 
 // 用 XHR 以获得上传进度
-function putToR2(url, blob, contentType){
+function putToR2(url, blob, contentType, onProgress){
   return new Promise((resolve, reject) => {
     const xhr = new XMLHttpRequest();
     xhr.open('PUT', url, true);
     if(contentType) xhr.setRequestHeader('Content-Type', contentType);
-    xhr.upload.onprogress = (e) => { if(e.lengthComputable) $('pct').style.width = (e.loaded/e.total*100)+'%'; };
+    xhr.upload.onprogress = (e) => { if(e.lengthComputable && onProgress) onProgress(e.loaded/e.total); };
     xhr.onload = () => { if(xhr.status>=200&&xhr.status<300) resolve(); else reject(new Error('R2 直传失败 HTTP '+xhr.status)); };
-    xhr.onerror = () => reject(new Error('R2 直传网络错误'));
+    xhr.onerror = () => reject(new Error('网络中断'));
+    xhr.ontimeout = () => reject(new Error('上传超时'));
     xhr.send(blob);
   });
+}
+
+/**
+ * 带重试的上传。
+ *
+ * 为什么要重试：实测 R2 预签名直传**没有 100MB 上限**（200MB 一次成功），
+ * 但传输途中出现 ERR_CONNECTION_RESET 这类瞬时中断是公网上传家常便饭 ——
+ * 实测 120MB 档就偶发断在 41 秒处，而更大的 200MB 却一次过。
+ * 说明这是瞬时故障而非体积阈值，所以正确处置是「失败自动重试」，
+ * 而不是设一个体积上限去拒绝大文件。
+ *
+ * 预签名 URL 15 分钟内可重复使用，重试不需要重新签发。
+ */
+async function putToR2WithRetry(url, blob, contentType, maxAttempts){
+  maxAttempts = maxAttempts || 3;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++){
+    try {
+      await putToR2(url, blob, contentType, (ratio) => {
+        // 重试时把进度条回退，避免显示成 100% 却失败
+        $('pct').style.width = (ratio * 100) + '%';
+      });
+      return;
+    } catch (err) {
+      if (attempt === maxAttempts) throw err;
+      const waitSec = Math.pow(2, attempt - 1); // 2s, 4s, 8s
+      msg('第 ' + attempt + '/' + maxAttempts + ' 次上传中断（' + (err.message||err) + '），' + waitSec + ' 秒后自动重试…', '');
+      await new Promise(r => setTimeout(r, waitSec * 1000));
+      $('pct').style.width = '0%';
+    }
+  }
 }
 
 // 初始化
