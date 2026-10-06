@@ -97,6 +97,41 @@ function originReached(res, body) {
   return false;
 }
 
+/**
+ * 把失败归类。这三种情况处置完全不同，绝不能混为一谈：
+ *
+ *   worker-crash  5xx 且响应体形如 "error code: 1101"  → 请求已经到达 Worker，
+ *                 是 Worker 自己的代码抛了异常。
+ *                 ⚠️ 典型误区是把它当成「边缘拦了 WebDAV 动词」——但边缘拦截
+ *                    只影响 PROPFIND/MKCOL 这类自定义动词，不会影响 GET/OPTIONS；
+ *                    而且边缘的拦截页是 HTML/403，不会是 1101。
+ *   edge-block    403/405 且响应里没有任何 Worker 标记     → 边缘/WAF 拦截。
+ *   unknown       归不了类，如实报告，不猜。
+ */
+function classifyFailure(res, body) {
+  const text = (body ?? '').slice(0, 2000);
+  // Cloudflare 的 1101 错误页有两种形态：纯文本 "error code: 1101"，
+  // 以及 HTML 的 <span class="cf-error-code">1101</span>。两种都要认。
+  const cfCode =
+    text.match(/error code:\s*(\d+)/)?.[1] ??
+    text.match(/cf-error-code">\s*(\d+)/)?.[1] ??
+    text.match(/Worker threw exception/i) ? '1101' : undefined;
+
+  if (res.status >= 500 && cfCode) {
+    return {
+      kind: 'worker-crash',
+      detail: `Worker 运行时异常（Cloudflare ${cfCode}）—— 请求已到达 Worker，是代码抛异常，不是边缘拦截`,
+    };
+  }
+  if (res.status === 403 || res.status === 405) {
+    return {
+      kind: 'edge-block',
+      detail: `HTTP ${res.status} 且响应里没有 Worker 的任何标记 —— 疑似边缘/WAF 拦截`,
+    };
+  }
+  return { kind: 'unknown', detail: `HTTP ${res.status}，无法归类` };
+}
+
 function countResponses(xml) {
   return (xml.match(/<D:response>/g) ?? []).length;
 }
@@ -114,6 +149,7 @@ function hasStatus(xml, code) {
 async function probeVerbs() {
   const verbs = ['OPTIONS', 'PROPFIND', 'PROPPATCH', 'MKCOL', 'COPY', 'MOVE', 'LOCK', 'UNLOCK', 'DELETE', 'PUT'];
   const blocked = [];
+  const crashed = [];
 
   for (const verb of verbs) {
     let res;
@@ -127,16 +163,21 @@ async function probeVerbs() {
       continue;
     }
 
-    const reached = originReached(res, body);
-    if (!reached) {
-      record('动词放行', verb, 'fail',
-        `HTTP ${res.status}，但响应里没有本 Worker 的标记 —— 极可能是被 Cloudflare 边缘拦截`);
-      blocked.push(verb);
+    if (!originReached(res, body)) {
+      const verdict = classifyFailure(res, body);
+      if (verdict.kind === 'worker-crash') {
+        // Worker 自己崩了，这个动词通没通已经无从谈起 —— 先记 crash，不记 blocked
+        record('动词放行', verb, 'fail', verdict.detail);
+        crashed.push(verdict.detail);
+      } else {
+        record('动词放行', verb, 'fail', verdict.detail);
+        blocked.push(verb);
+      }
     } else {
       record('动词放行', verb, 'pass', `HTTP ${res.status}（已到达源站）`);
     }
   }
-  return blocked;
+  return { blocked, crashed };
 }
 
 // ── B. Depth 语义 ─────────────────────────────────────────────────────
@@ -434,16 +475,46 @@ async function main() {
   if (authHeader) console.log(`${C.dim}使用 Basic 认证${C.reset}`);
   console.log('='.repeat(74));
 
-  // 先确认目标活着
+  // ── 预检：Worker 本身是否活着 ──────────────────────────────────────
+  // /health 不碰 D1 也不碰任何绑定，是判断「Worker 能否正常响应」最干净的探针。
+  // 如果它就崩了，后面所有 WebDAV 检查都无意义，直接停下并指明方向。
+  let ping;
+  let pingBody = '';
   try {
-    const ping = await req('./', { method: 'OPTIONS' });
-    await ping.text().catch(() => {});
+    ping = await req('../health', { method: 'GET' });
+    pingBody = await ping.text().catch(() => '');
   } catch (err) {
     console.error(`${C.red}无法连接 ${args.url}：${err.message}${C.reset}`);
     process.exit(1);
   }
 
-  await probeVerbs();
+  if (!ping.ok) {
+    const verdict = classifyFailure(ping, pingBody);
+    console.log('');
+    console.log(`${C.red}✘ Worker 本身没有正常响应，WebDAV 检查已跳过。${C.reset}`);
+    console.log('');
+    console.log(`  /health → ${verdict.detail}`);
+    console.log('');
+    if (verdict.kind === 'worker-crash') {
+      console.log('这不是「边缘拦了 WebDAV 动词」——边缘只拦 PROPFIND/MKCOL 这类自定义动词，');
+      console.log('不会影响 GET/OPTIONS，而且边缘拦截页是 HTML/403，不会是 1101。');
+      console.log('真实原因：Worker 自己的代码抛了异常。');
+      console.log('');
+      console.log('拿真实堆栈：');
+      console.log('  Dashboard → Workers & Pages → webooks → Logs → Live，然后访问一次站点');
+      console.log('本地复现对照：');
+      console.log('  npm install && npm run db:migrate:local && npm run dev');
+    } else if (verdict.kind === 'edge-block') {
+      console.log('边缘/WAF 拦截了 /health。先查该域名的 WAF 规则与 Bot Fight Mode。');
+    } else {
+      console.log('无法归类，请手工核对 /health 的响应。');
+    }
+    console.log('');
+    console.log('='.repeat(74));
+    process.exit(1);
+  }
+
+  const { blocked, crashed } = await probeVerbs();
   await probeDepth();
   await probeConformance();
   await probeExpectContinue();
@@ -473,8 +544,14 @@ async function main() {
     console.log(`${C.red}失败项：${C.reset}`);
     for (const f of fails) console.log(`  ❌ [${f.group}] ${f.name} — ${f.detail}`);
     console.log('');
-    console.log('若失败集中在「动词放行」，说明 Cloudflare 边缘没有把该动词转发到 Worker。');
-    console.log('这是本项目最大的未知数，需要据此调整方案（例如把写入收敛到 POST + 预签名直传）。');
+    if (crashed.length > 0) {
+      console.log(`${C.red}主因判定：Worker 运行时异常（不是边缘拦截）。${C.reset}`);
+      console.log('所有动词都返回 5xx，包括 GET/OPTIONS。');
+      console.log('边缘只会拦自定义动词，不会这样。去 Dashboard → webooks → Logs → Live 看真实堆栈。');
+    } else if (blocked.length > 0) {
+      console.log('主因判定：Cloudflare 边缘没有把这些动词转发到 Worker。');
+      console.log('这是本项目最大的未知数，需要据此调整方案（例如把写入收敛到 POST + 预签名直传）。');
+    }
   }
   process.exit(fails.length > 0 ? 1 : 0);
 }
