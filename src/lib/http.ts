@@ -31,6 +31,14 @@ export function textResponse(status: number, message: string, headers: HeadersIn
   });
 }
 
+/** JSON 响应助手（上传 API 用） */
+export function jsonResponse(data: unknown, status = 200, headers: HeadersInit = {}): Response {
+  return new Response(JSON.stringify(data), {
+    status,
+    headers: { 'content-type': 'application/json; charset=utf-8', ...headers },
+  });
+}
+
 export function methodNotAllowed(allow: string): Response {
   return textResponse(405, 'Method Not Allowed', { allow });
 }

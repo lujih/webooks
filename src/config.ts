@@ -12,6 +12,22 @@ export interface Env {
   R2_PUBLIC_BASE: string;
   /** 保护 /api/admin/* 的令牌；未设置时所有 admin 接口返回 404 */
   ADMIN_TOKEN?: string;
+  /** Turnstile 公钥（前端 widget 用），来自 Dashboard */
+  TURNSTILE_SITE_KEY?: string;
+  /** Turnstile 私钥（服务端 siteverify 用），必须是 secret */
+  TURNSTILE_SECRET?: string;
+  /** R2 API 凭据：Access Key ID，用于签发预签名 URL */
+  R2_ACCESS_KEY_ID?: string;
+  /** R2 API 凭据：Secret Access Key，用于签名（必须是 secret） */
+  R2_SECRET_ACCESS_KEY?: string;
+  /** Cloudflare Account ID，用于构造 S3 端点 */
+  R2_ACCOUNT_ID?: string;
+  /** R2 桶名（预签名 URL 里的 bucket） */
+  R2_BUCKET_NAME?: string;
+  /** 单文件大小上限（字节），默认 200 MiB */
+  UPLOAD_MAX_BYTES?: string;
+  /** 每个 IP 每天允许的上传次数 */
+  UPLOAD_DAILY_QUOTA?: string;
   MAX_ENTRIES?: string;
   PROPFIND_TTL?: string;
   DEPTH_INFINITY?: string;

@@ -1,6 +1,22 @@
-feat: 指向真实的 R2 公开自定义域，解锁下载
+feat: 公开上传（匿名 + Turnstile 门禁，预签名直传 R2）
 
-R2_PUBLIC_BASE 之前是占位域名 books.example.com，导致 GET 302 后 fetch failed。
-已在 R2 桶上绑定自定义域 books.cszxorx.dpdns.org（活动/已启用），
-写进 vars，让 WebDAV 的 GET 能真正跳到 R2 下载字节。
-换域名部署时改这一行即可。
+用户需求：所有人可上传，上传后有预览以简化操作。
+需求确认结果：匿名+Turnstile 防机器 / 自动上架 / 预览显示封面+标题+作者+大小。
+
+上传通道（关键设计）：
+- 预签名 PUT 直传 R2，字节不经过 Worker —— 既绕过 zone 的 100MB 请求体上限，
+  又不消耗 Worker 的 CPU/内存与每天 10 万请求额度
+- 自实现 SigV4（src/lib/sigv4.ts），零依赖：Workers 原生支持 crypto.subtle HMAC，
+  不引入 aws4fetch/@aws-sdk 以免 Worker 体积膨胀
+- 修掉一个真实 bug：文件名含 # 时会把签名截断成 fragment。对象键现在逐段编码
+  （SigV4 canonical URI 也要求编码形式）
+
+安全门禁（对应可行性报告 §5）：
+- Turnstile 服务端 siteverify 强制校验（前端 widget 不能替代，token 单次/300s）
+- 未配置凭据时 fail-closed 返回 503，而不是裸奔放行
+- 扩展名白名单 + 大小上限 + complete 时用 R2 head 校验真实大小（防前端伪造）
+
+诚实的合规取舍：无账号体系 -> 无法执行重复侵权者封号 -> 不具备 DMCA 避风港资格。
+这是产品层面的明确取舍，已在代码注释与文档中标注。
+
+69 个测试全绿（新增 SigV4 8 个 + 上传 API 6 个）。

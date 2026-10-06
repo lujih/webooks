@@ -9,8 +9,10 @@
  */
 
 import { handleAdmin } from './api/admin';
+import { handleUploadComplete, handleUploadInit } from './api/upload';
 import { settings, type Env, type Settings } from './config';
 import { textResponse } from './lib/http';
+import { uploadHtml } from './upload-page';
 import { handleDav } from './webdav';
 
 export default {
@@ -20,6 +22,18 @@ export default {
 
     if (path === '/health') {
       return Response.json({ ok: true, service: 'webooks' });
+    }
+
+    // 上传通道（在 settings() 之前：上传即使没配 R2_PUBLIC_BASE 也应给出明确错误）
+    if (path === '/api/upload/init') {
+      return handleUploadInit(request, env);
+    }
+    if (path === '/api/upload/complete') {
+      return handleUploadComplete(request, env);
+    }
+    // 上传页用的 Turnstile 公钥（只暴露公钥，不暴露私钥）
+    if (path === '/api/turnstile-config') {
+      return Response.json({ siteKey: env.TURNSTILE_SITE_KEY ?? null });
     }
 
     let cfg: Settings;
@@ -54,6 +68,14 @@ export default {
           'content-type': 'text/html; charset=utf-8',
           'cache-control': 'public, max-age=3600',
         },
+      });
+    }
+
+    // 上传页（需要 Turnstile 公钥才能工作）
+    if (path === '/upload' || path === '/upload/') {
+      return new Response(uploadHtml(env.TURNSTILE_SITE_KEY ?? ''), {
+        status: 200,
+        headers: { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' },
       });
     }
 
