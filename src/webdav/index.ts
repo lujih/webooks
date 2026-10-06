@@ -5,10 +5,21 @@ import { letterBucket, resolveNode, type DavNode } from '../lib/collections';
 import { deleteBook, findBookByLeaf, rebuildBuckets, upsertBook } from '../lib/db';
 import { methodNotAllowed, shortId, textResponse } from '../lib/http';
 import { preferContentType, deriveMetadata, sanitiseLeafName } from '../lib/metadata';
+import { checkPreconditions } from '../lib/preconditions';
 import { bookCacheTargets, purgeEntries } from '../lib/cache';
 import { collectDavEntries, handlePropfind, type Entry } from './propfind';
+import { escapeXml } from '../lib/xml';
 
 const ALLOW = 'OPTIONS, GET, HEAD, PROPFIND, PUT, DELETE';
+
+/**
+ * DAV 合规等级头（RFC 4918 §18）：
+ *   1 = Class 1（无锁）
+ *   2 = Class 2（支持 LOCK/UNLOCK）—— 本服务是只读库，不支持
+ *   3 = 符合 RFC 4918 全部要求
+ * 只宣告我们真的做到了的等级，虚报会让客户端做出错误假设。
+ */
+const DAV_HEADER = '1, 3';
 
 export async function handleDav(
   request: Request,
@@ -23,8 +34,7 @@ export async function handleDav(
       status: 200,
       headers: {
         allow: ALLOW,
-        // Class 1：明确声明不支持 LOCK，客户端会退回无锁模式
-        dav: '1',
+        dav: DAV_HEADER,
         'ms-author-via': 'DAV',
       },
     });
@@ -43,18 +53,50 @@ export async function handleDav(
     case 'DELETE':
       return handleDelete(env, node);
     case 'MKCOL':
+      // RFC 5689 Extended MKCOL 也不支持：本服务的集合是虚拟视图（由 D1 派生），
+      // 客户端无法真正创建目录。用 405 + Allow 明确告知可用动词。
       return textResponse(405, 'Collections are virtual and cannot be created with MKCOL', { allow: ALLOW });
     case 'MOVE':
     case 'COPY':
-      return textResponse(501, 'MOVE/COPY not implemented in Phase 0', { allow: ALLOW });
+      return davErrorResponse(501, `${method} is not implemented (read-mostly library)`, ALLOW);
     case 'LOCK':
     case 'UNLOCK':
-      return textResponse(501, 'LOCK/UNLOCK not implemented (WebDAV Class 1)', { allow: ALLOW });
+      // 未宣告 Class 2 时按 RFC 4918 §10.2 返回 501，并带上
+      // <D:supported-lock/> 说明不支持任何锁类型 —— 否则客户端会一直重试。
+      return davErrorResponse(501, 'LOCK/UNLOCK is not supported (WebDAV Class 1)', ALLOW, 'supported-lock');
     case 'PROPPATCH':
-      return textResponse(403, 'Properties are read-only', { allow: ALLOW });
+      // RFC 4918 §14：只读属性必须用 DAV 错误体明确拒绝，
+      // 不能返回纯文本 —— 部分客户端解析失败后会当作服务端故障。
+      return davErrorResponse(403, 'Properties are read-only', ALLOW, 'cannot-modify-protected-property');
     default:
       return methodNotAllowed(ALLOW);
   }
+}
+
+/**
+ * 合规的 DAV 错误响应。
+ *
+ * RFC 4918 §16 定义了 <D:error> 预置元素（如 <D:cannot-modify-protected-property/>、
+ * <D:supported-lock/>），要求用 application/xml 返回。返回纯文本会让部分客户端
+ * 把它当成 5xx 传输故障反复重试，而不是理解为「服务端明确拒绝该操作」。
+ */
+function davErrorResponse(
+  status: number,
+  message: string,
+  allow: string,
+  precondition?: string,
+): Response {
+  const inner = precondition ? `<D:${precondition}/>` : '';
+  const xml =
+    `<?xml version="1.0" encoding="utf-8"?>\n` +
+    `<D:error xmlns:D="DAV:">${inner}<D:responsedescription>${escapeXml(message)}</D:responsedescription></D:error>`;
+  return new Response(xml, {
+    status,
+    headers: {
+      'content-type': 'application/xml; charset=utf-8',
+      allow,
+    },
+  });
 }
 
 // ── 读 ──────────────────────────────────────────────────────────────────
@@ -171,6 +213,14 @@ async function handlePut(request: Request, env: Env, node: DavNode): Promise<Res
   const r2Key = `books/${id}`;
   // 客户端给泛型类型（如 text/plain、application/octet-stream）时以扩展名为准
   const contentType = preferContentType(request.headers.get('content-type'), meta.contentType);
+
+  // 条件请求（RFC 9110 §13.1）：在**写入之前**判定，否则会把别人的书覆盖掉。
+  // 同步客户端依赖 If-None-Match: * 做到「仅新建、不覆盖」，服务端必须配合。
+  const currentEtag = existing?.etag ? `"${existing.etag}"` : null;
+  const precondition = checkPreconditions(request.headers, currentEtag);
+  if (!precondition.ok) {
+    return textResponse(412, `Precondition Failed: ${precondition.reason}`, { allow: ALLOW });
+  }
 
   // 直接流式落 R2，绝不把 body 读进内存（isolate 上限 128MB）
   const object = await env.BUCKET.put(r2Key, request.body, {

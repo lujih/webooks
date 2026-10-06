@@ -53,10 +53,14 @@ beforeEach(async () => {
 // ── OPTIONS / 协议声明 ──────────────────────────────────────────────────
 
 describe('OPTIONS', () => {
-  it('声明 WebDAV Class 1 且不声明 LOCK', async () => {
+  it('宣告 DAV: 1, 3（Class 1 + 符合 RFC 4918，不含 2）', async () => {
     const res = await dav('/', { method: 'OPTIONS' });
     expect(res.status).toBe(200);
-    expect(res.headers.get('dav')).toBe('1'); // Class 1：明确不含 2
+    // RFC 4918 §18: 1=Class1, 2=Class2(有锁), 3=符合 RFC4918 全部要求
+    const davHeader = res.headers.get('dav') ?? '';
+    expect(davHeader).toContain('1');
+    expect(davHeader).toContain('3');
+    expect(davHeader).not.toMatch(/(^|[\s,])2([\s,]|$)/); // 明确不宣告有锁
     expect(res.headers.get('allow')).toContain('PROPFIND');
     expect(res.headers.get('allow')).not.toContain('LOCK');
     expect(res.headers.get('ms-author-via')).toBe('DAV');
@@ -338,5 +342,94 @@ describe('admin 鉴权', () => {
     expect(json.totalBooks).toBe(2);
     // 目录总数是预算模型的关键输入，必须远低于 200
     expect(json.directoryCount).toBeLessThan(200);
+  });
+});
+
+// ── 条件请求（RFC 9110 §13.1）—— 防误覆盖 ──────────────────────────────
+
+describe('条件请求防止误覆盖', () => {
+  // 每个用例自建文件：beforeEach 会重置库，状态不能跨用例共享
+  const name = '__precond_test.epub';
+  const put = (body: string, headers: Record<string, string> = {}) =>
+    dav(`/recent/${name}`, { method: 'PUT', body, headers });
+
+  it('If-None-Match: * 在目标不存在时放行（201）', async () => {
+    const res = await put('first', { 'if-none-match': '*' });
+    expect(res.status).toBe(201);
+  });
+
+  it('If-None-Match: * 在目标已存在时拒绝（412），且不覆盖内容', async () => {
+    await put('first', { 'if-none-match': '*' });
+
+    const res = await put('SHOULD-NOT-OVERWRITE', { 'if-none-match': '*' });
+    expect(res.status).toBe(412);
+
+    // 关键：内容不能被改掉
+    const head = await dav(`/recent/${name}`, { method: 'HEAD' });
+    expect(head.headers.get('content-length')).toBe('5'); // 'first' 的长度
+  });
+
+  it('If-Match 用真实 ETag 可覆盖（204）', async () => {
+    await put('first');
+    const head = await dav(`/recent/${name}`, { method: 'HEAD' });
+    const etag = head.headers.get('etag');
+    expect(etag).toBeTruthy();
+
+    const res = await put('second-longer', { 'if-match': etag as string });
+    expect(res.status).toBe(204);
+    const after = await dav(`/recent/${name}`, { method: 'HEAD' });
+    expect(after.headers.get('content-length')).toBe(String('second-longer'.length));
+  });
+
+  it('If-Match 用错误 ETag 拒绝（412），内容不变', async () => {
+    await put('first');
+    const res = await put('nope-longer', { 'if-match': '"totally-wrong"' });
+    expect(res.status).toBe(412);
+    const head = await dav(`/recent/${name}`, { method: 'HEAD' });
+    expect(head.headers.get('content-length')).toBe('5');
+  });
+
+  it('无条件 PUT 仍可覆盖（204），保持向后兼容', async () => {
+    await put('first');
+    const res = await put('third');
+    expect(res.status).toBe(204);
+  });
+
+  it('目标不存在时 If-Match 一律拒绝（412）', async () => {
+    const res = await put('brand-new', { 'if-match': '*' });
+    expect(res.status).toBe(412);
+  });
+});
+
+// ── DAV 错误体合规（RFC 4918 §16）────────────────────────────────────────
+
+describe('DAV 错误体', () => {
+  it('PROPPATCH 返回 <D:error> 且带 cannot-modify-protected-property', async () => {
+    const res = await dav('/recent/', {
+      method: 'PROPPATCH',
+      headers: { 'content-type': 'application/xml' },
+      body: '<?xml version="1.0"?><D:propertyupdate xmlns:D="DAV:"><D:set><D:prop><D:x/></D:prop></D:set></D:propertyupdate>',
+    });
+    expect(res.status).toBe(403);
+    expect(res.headers.get('content-type')).toContain('xml');
+    const body = await res.text();
+    expect(body).toContain('<D:error');
+    expect(body).toContain('cannot-modify-protected-property');
+  });
+
+  it('LOCK 返回 <D:error> 且带 supported-lock（告知客户端不支持任何锁）', async () => {
+    const res = await dav('/recent/', { method: 'LOCK', body: '<D:lockinfo xmlns:D="DAV:"/>' });
+    expect(res.status).toBe(501);
+    const body = await res.text();
+    expect(body).toContain('<D:error');
+    expect(body).toContain('supported-lock');
+  });
+
+  it('MOVE/COPY 返回合规的 DAV 错误体', async () => {
+    for (const method of ['MOVE', 'COPY']) {
+      const res = await dav('/recent/', { method });
+      expect(res.status).toBe(501);
+      expect(await res.text()).toContain('<D:error');
+    }
   });
 });

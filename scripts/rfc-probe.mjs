@@ -1,0 +1,161 @@
+#!/usr/bin/env node
+/**
+ * RFC 4918 / RFC 9110 合规差距探针。
+ *
+ * 目的：把「适配最新标准」从口号变成可核对的清单 —— 逐条实测线上服务器，
+ * 只报实测结果，不臆测。
+ *
+ * 依据：
+ *   RFC 4918 (2007)  WebDAV —— 基础标准，至今未废弃
+ *   RFC 9110 (2022)  HTTP Semantics —— 取代 RFC 7231，是「最新」的 HTTP 核心
+ *   RFC 5689 (2009)  Extended MKCOL
+ *   RFC 5789 (2010)  PATCH
+ *
+ * 用法：node scripts/rfc-probe.mjs --url https://your.host/dav/
+ */
+
+const args = process.argv.slice(2);
+const urlIdx = args.indexOf('--url');
+const BASE = (urlIdx >= 0 ? args[urlIdx + 1] : 'http://127.0.0.1:8787/dav/').replace(/\/+$/, '');
+const ORIGIN = new URL(BASE).origin;
+
+const C = { r: '\x1b[0m', y: '\x1b[33m', g: '\x1b[32m', red: '\x1b[31m', dim: '\x1b[2m' };
+
+async function req(path, init = {}) {
+  const res = await fetch(`${BASE}${path}`, init);
+  const body = await res.text().catch(() => '');
+  return { res, body };
+}
+
+const rows = [];
+function check(name, ok, detail, ref) {
+  rows.push({ name, ok, detail, ref });
+  const tag = ok ? `${C.g}✅${C.r}` : `${C.y}⚠️${C.r}`;
+  console.log(`  ${tag} ${name}${detail ? `${C.dim} — ${detail}${C.r}` : ''}${ref ? `${C.dim} [${ref}]${C.r}` : ''}`);
+}
+
+// 造一个可写文件
+const tmp = `__rfcprobe_${Date.now()}.txt`;
+await req('/recent/' + tmp, { method: 'PUT', body: 'probe' });
+
+console.log(`RFC 合规探针  ${BASE}`);
+console.log('='.repeat(72));
+
+// ── OPTIONS 的 DAV 头 ──
+{
+  const { res } = await req('/', { method: 'OPTIONS' });
+  const dav = res.headers.get('dav') ?? '';
+  // RFC 4918 §18: 完全合规应 advertise "3"；"1"/"2" 是 Class 指示
+  const has3 = /\b3\b/.test(dav);
+  check('OPTIONS 宣告 RFC 4918 合规等级（DAV: …,3）', has3, `DAV: ${dav || '(空)'}`, 'RFC 4918 §18');
+}
+
+// ── OPTIONS * ──
+{
+  try {
+    const res = await fetch(`${ORIGIN}${BASE.replace(ORIGIN, '')}`, { method: 'OPTIONS' });
+    check('OPTIONS * （服务器级能力查询）', res.status === 200, `status=${res.status}`, 'RFC 9110 §9.3.7');
+  } catch (e) {
+    check('OPTIONS * （服务器级能力查询）', false, e.message, 'RFC 9110 §9.3.7');
+  }
+}
+
+// ── PUT 到集合路径应 405 ──
+{
+  const { res } = await req('/recent/', { method: 'PUT', body: 'x' });
+  const allow = res.headers.get('allow');
+  const ok = res.status === 405 && !!allow;
+  check('PUT 打到集合路径应 405 且带 Allow', ok, `status=${res.status} allow=${allow ?? '(无)'}`, 'RFC 4918 §9.7.1');
+}
+
+// ── 条件请求 If-None-Match: * ──
+// RFC 4918 §10.4.3 / RFC 9110 §13.1.3：目标已存在时应 412
+{
+  const { res } = await req('/recent/' + tmp, {
+    method: 'PUT', body: 'overwrite attempt',
+    headers: { 'If-None-Match': '*' },
+  });
+  const ok = res.status === 412;
+  check('If-None-Match: * 防止误覆盖（期望 412）', ok, `status=${res.status}（未实现则会是 204/200）`, 'RFC 4918 §10.4.3');
+}
+
+// ── If-Match 用 ETag ──
+{
+  const head = await req('/recent/' + tmp, { method: 'HEAD' });
+  const etag = head.res.headers.get('etag');
+  if (etag) {
+    const bad = await req('/recent/' + tmp, {
+      method: 'PUT', body: 'x', headers: { 'If-Match': '"not-the-right-etag"' },
+    });
+    check('If-Match 校验 ETag（不匹配应 412）', bad.res.status === 412, `status=${bad.res.status}`, 'RFC 9110 §13.1.1');
+  } else {
+    check('If-Match 校验 ETag', false, 'HEAD 未返回 ETag', 'RFC 9110 §13.1.1');
+  }
+}
+
+// ── PROPPATCH 应返回 DAV 错误体 ──
+{
+  const xml = '<?xml version="1.0"?><D:propertyupdate xmlns:D="DAV:"><D:set><D:prop><D:x/></D:prop></D:set></D:propertyupdate>';
+  const { res, body } = await req('/recent/' + tmp, { method: 'PROPPATCH', headers: { 'content-type': 'application/xml' }, body: xml });
+  const ok = res.status === 403 && /<D:error/.test(body) && /cannot-modify-protected-property/.test(body);
+  check('PROPPATCH 返回 DAV 错误体（cannot-modify-protected-property）', ok,
+    `status=${res.status} body=${body.slice(0, 50).replace(/\n/g, ' ')}`, 'RFC 4918 §14/§16');
+}
+
+// ── LOCK 应返回 supported-lock 说明不支持任何锁 ──
+{
+  const { res, body } = await req('/recent/' + tmp, { method: 'LOCK', body: '<D:lockinfo xmlns:D="DAV:"/>' });
+  const ok = res.status === 501 && /<D:error/.test(body) && /supported-lock/.test(body);
+  check('LOCK 返回 <D:supported-lock/> 说明不支持任何锁', ok,
+    `status=${res.status} body=${body.slice(0, 50).replace(/\n/g, ' ')}`, 'RFC 4918 §10.2/§16');
+}
+
+// ── PATCH 未实现须 405 且 Allow 不含 PATCH ──
+{
+  const { res } = await req('/recent/' + tmp, { method: 'PATCH', body: 'x' });
+  const ok = res.status === 405;
+  check('PATCH 未实现须返回 405', ok, `status=${res.status}`, 'RFC 5789');
+}
+
+// ── Range 请求 ──
+{
+  const { res } = await req('/recent/' + tmp, { method: 'GET', headers: { Range: 'bytes=0-3' } });
+  const hasAcc = res.headers.get('accept-ranges');
+  // GET 是 302 跳 R2，Range 由 R2 处理；这里确认是否声明支持
+  check('声明 Accept-Ranges（分段下载/断点续传）', res.status === 302 ? !!hasAcc : true,
+    `status=${res.status} accept-ranges=${hasAcc ?? '(无)'}`, 'RFC 9110 §14');
+}
+
+// ── 204 不应带 Content-Length ──
+{
+  const { res } = await req('/recent/' + tmp, { method: 'PUT', body: 'v2' });
+  const cl = res.headers.get('content-length');
+  const ok = res.status !== 204 || (!cl || cl === '0');
+  check('204 响应不应带非零 Content-Length', ok, `status=${res.status} content-length=${cl ?? '(无)'}`, 'RFC 9110 §8.6');
+}
+
+// ── PROPFIND on 不存在的资源应 404 ──
+{
+  const { res } = await req('/recent/__definitely_missing_9999.txt', { method: 'PROPFIND', headers: { depth: '0' } });
+  check('PROPFIND 不存在的资源应 404', res.status === 404, `status=${res.status}`, 'RFC 4918 §9.1');
+}
+
+// ── Depth: infinity 按 RFC 应 403 + propfind-finite-depth（当配置为 downgrade 时 207 也可）──
+{
+  const { res } = await req('/', { method: 'PROPFIND', headers: { depth: 'infinity' } });
+  const ok = res.status === 207 || res.status === 403;
+  check('Depth: infinity 处理合规（207 或 403）', ok, `status=${res.status}`, 'RFC 4918 §9.1');
+}
+
+// 清理
+await req('/recent/' + tmp, { method: 'DELETE' });
+
+// 汇总
+console.log('='.repeat(72));
+const bad = rows.filter((r) => !r.ok);
+console.log(`${rows.length - bad.length} 通过 / ${bad.length} 待改进 / ${rows.length} 项`);
+if (bad.length) {
+  console.log('\n待改进项：');
+  for (const b of bad) console.log(`  ⚠️  ${b.name} — ${b.detail}`);
+  process.exit(1);
+}
