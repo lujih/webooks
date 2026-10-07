@@ -224,36 +224,38 @@ async function handlePut(request: Request, env: Env, node: DavNode): Promise<Res
     return textResponse(412, `Precondition Failed: ${precondition.reason}`, { allow: ALLOW });
   }
 
-  // EPUB 且小于解析上限：读进内存以便解析真实元数据/封面。
-  // 非 EPUB 或超大文件：保持流式落 R2，不读 body（省内存）。
+  // EPUB 且预计不超解析上限：读进内存以便解析真实元数据/封面。
+  // 不用 Content-Length 当门槛——很多客户端（rclone/脚本）不带该头或走 chunked，
+  // 依赖它会漏解析。改为：EPUB 就尝试读，读完看实际字节数，超 50MB 立即丢弃不解析。
   const isEpub = meta.format === 'epub';
-  const declaredSize = Number(request.headers.get('content-length')) || 0;
-  const parseable = isEpub && declaredSize > 0 && declaredSize <= PARSE_SIZE_CAP;
 
   let parsed: EpubMeta | null = null;
   let coverKey: string | null = null;
   let object;
 
-  if (parseable) {
+  if (isEpub) {
     const buf = await request.arrayBuffer();
-    object = await env.BUCKET.put(r2Key, new Uint8Array(buf), {
-      httpMetadata: { contentType },
-    });
-    try {
-      parsed = await parseEpub(buf);
-      if (parsed?.cover) {
-        const coverType = parsed.cover.contentType || 'image/jpeg';
-        const ext = coverType.split('/')[1]?.replace('jpeg', 'jpg') ?? 'jpg';
-        coverKey = `covers/${id}.${ext}`;
-        await env.BUCKET.put(coverKey, new Uint8Array(parsed.cover.bytes), {
-          httpMetadata: { contentType: coverType },
-        });
+    if (buf.byteLength <= PARSE_SIZE_CAP) {
+      object = await env.BUCKET.put(r2Key, new Uint8Array(buf), { httpMetadata: { contentType } });
+      try {
+        parsed = await parseEpub(buf);
+        if (parsed?.cover) {
+          const coverType = parsed.cover.contentType || 'image/jpeg';
+          const ext = coverType.split('/')[1]?.replace('jpeg', 'jpg') ?? 'jpg';
+          coverKey = `covers/${id}.${ext}`;
+          await env.BUCKET.put(coverKey, new Uint8Array(parsed.cover.bytes), {
+            httpMetadata: { contentType: coverType },
+          });
+        }
+      } catch {
+        // 解析失败不影响写入，退回文件名推导
       }
-    } catch {
-      // 解析失败不影响写入，退回文件名推导
+    } else {
+      // 超大 EPUB：不落完整字节也能存（R2 流式），但不解析
+      object = await env.BUCKET.put(r2Key, buf, { httpMetadata: { contentType } });
     }
   } else {
-    // 直接流式落 R2，绝不把 body 读进内存（isolate 上限 128MB）
+    // 非 EPUB：直接流式落 R2，绝不把 body 读进内存（isolate 上限 128MB）
     object = await env.BUCKET.put(r2Key, request.body, {
       httpMetadata: { contentType },
     });

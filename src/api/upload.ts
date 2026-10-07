@@ -226,10 +226,11 @@ export async function handleUploadComplete(request: Request, env: Env): Promise<
   let language: string | null = null;
   let coverKey: string | null = null;
 
-  if (format === 'epub' && actualSize <= PARSE_SIZE_CAP) {
+  if (format === 'epub') {
     try {
-      const epubBuf = await (await env.BUCKET.get(bookKey))?.arrayBuffer();
-      if (epubBuf) {
+      const fetched = await env.BUCKET.get(bookKey);
+      const epubBuf = await fetched?.arrayBuffer();
+      if (epubBuf && epubBuf.byteLength <= PARSE_SIZE_CAP) {
         const parsed = await parseEpub(epubBuf);
         if (parsed) {
           if (parsed.title) title = parsed.title;

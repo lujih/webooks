@@ -190,7 +190,8 @@ function bookEntry(collection: CollectionId, bucket: string, book: BookRow): Ent
       : `/${collection}/${book.leaf_name}`,
     isCollection: false,
     meta: {
-      displayName: book.leaf_name,
+      // 解析过 EPUB 时用真实书名/作者，否则退回文件名
+      displayName: book.title || book.leaf_name,
       lastModified: book.updated_at,
       created: book.created_at,
       etag: `"${book.etag ?? book.id}"`,
