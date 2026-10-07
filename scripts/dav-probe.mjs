@@ -419,10 +419,14 @@ function rawExpectContinue({ host, port, secure, path, authHeader: auth, body })
           socket.write(body);
         }
       }
-      if (sentBody && /\r\n\r\n/.test(buffer) && !/^HTTP\/1\.1 100/.test(buffer.split('\r\n\r\n')[0])) {
-        const statusLine = buffer.slice(0, buffer.indexOf('\r\n'));
+      // 找最终响应：跳过可能存在的 100 中间响应（后面还有真正的最终状态）
+      const blocks = buffer.split(/\r\n\r\n/);
+      // 100 响应本身后面紧跟最终响应；把 100 段落滤掉，取最后一个完整块
+      const finalBlock = [...blocks].reverse().find((b) => /^HTTP\/1\.[01]\s+\d{3}/.test(b));
+      if (finalBlock && sentBody && Number(finalBlock.split(' ')[1]) !== 100) {
+        const statusLine = finalBlock.split('\r\n')[0];
         const code = Number(statusLine.split(' ')[1]);
-        finish({ ok: true, sawContinue, status: code, statusLine });
+        if (Number.isFinite(code) && code !== 100) finish({ ok: true, sawContinue, status: code, statusLine });
       }
     });
 
@@ -455,12 +459,16 @@ async function probeExpectContinue() {
   }
   if (!r.sawContinue) {
     record('Expect: 100-continue', 'PUT 握手', 'warn',
-      `服务器未发 100 Continue，但最终仍返回 ${r.status} —— 客户端会白等 1 秒，litmus http 套件可能仍会判失败`);
+      `服务器未发 100 Continue，但最终仍返回 ${r.status} —— 客户端会白等 1 秒`);
   } else {
     record('Expect: 100-continue', 'PUT 握手', 'pass', `收到 100 Continue，最终 ${r.status}`);
   }
+  // 最终状态必须是 201/204（201 新建 / 204 覆盖）。
+  // 100 是中间响应（informational），不是最终结果，之前误把它当最终响应。
   if (r.status !== 201 && r.status !== 204) {
     record('Expect: 100-continue', 'PUT 结果', 'warn', `最终状态码 ${r.status}，期望 201/204`);
+  } else {
+    record('Expect: 100-continue', 'PUT 结果', 'pass', `最终 ${r.status}`);
   }
   // 清理
   await req('./recent/', { method: 'PROPFIND', headers: { depth: '1' } }).catch(() => {});
