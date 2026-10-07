@@ -21,11 +21,13 @@ export interface BookRow {
   created_at: string;
   updated_at: string;
   status: string;
+  cover_key: string | null;
+  description: string | null;
 }
 
 const BOOK_COLUMNS = `id, leaf_name, title, author, language, format, content_type, size,
   sha256, r2_key, etag, title_letter, author_letter, format_bucket, published_at,
-  created_at, updated_at, status`;
+  created_at, updated_at, status, cover_key, description`;
 
 /** 导航页数据源：桶 + 计数。行数 ≤ 28，非常便宜。 */
 export async function listBucketTotals(
@@ -133,6 +135,8 @@ export interface UpsertBookInput {
   authorLetter: string;
   formatBucket: string;
   publishedAt: string | null;
+  coverKey?: string | null;
+  description?: string | null;
   status?: string;
 }
 
@@ -142,8 +146,8 @@ export function upsertBookStatement(db: D1Database, b: UpsertBookInput): D1Prepa
     .prepare(
       `INSERT INTO books (id, leaf_name, title, author, language, format, content_type, size,
          sha256, r2_key, etag, title_letter, author_letter, format_bucket, published_at,
-         created_at, updated_at, status)
-       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+          cover_key, description, created_at, updated_at, status)
+       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
        ON CONFLICT(id) DO UPDATE SET
          leaf_name = excluded.leaf_name,
          title = excluded.title,
@@ -165,6 +169,7 @@ export function upsertBookStatement(db: D1Database, b: UpsertBookInput): D1Prepa
     .bind(
       b.id, b.leafName, b.title, b.author, b.language, b.format, b.contentType, b.size,
       b.sha256, b.r2Key, b.etag, b.titleLetter, b.authorLetter, b.formatBucket, b.publishedAt,
+      b.coverKey ?? null, b.description ?? null,
       now, now, b.status ?? 'published',
     );
 }

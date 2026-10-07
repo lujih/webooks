@@ -29,10 +29,14 @@ export function uploadHtml(turnstileSiteKey: string): string {
   .card.show{display:block}
   .row{display:flex;gap:1rem;align-items:flex-start}
   .cover{width:88px;height:120px;flex:0 0 auto;border:1px solid var(--bd);border-radius:6px;object-fit:cover;background:#f4f4f5;display:flex;align-items:center;justify-content:center;color:var(--mut);font-size:.75rem;text-align:center;overflow:hidden}
+  .cover img{width:100%;height:100%;object-fit:cover;display:block}
+  .cover-empty{padding:6px;word-break:break-word}
   .meta{flex:1;min-width:0}
   .fname{font-weight:600;word-break:break-all}
   .kv{color:var(--mut);font-size:.9rem;margin-top:.35rem}
   .kv b{color:#3f3f46;font-weight:600}
+  .kv.parsed{margin-top:.6rem;padding-top:.5rem;border-top:1px dashed var(--bd)}
+  .badge{display:inline-block;font-size:.7rem;font-weight:600;padding:.1rem .45rem;border-radius:999px;background:#e8f1ff;color:var(--ac);margin-bottom:.25rem}
   .bar{height:8px;background:#ececee;border-radius:999px;overflow:hidden;margin-top:.9rem}
   .bar>i{display:block;height:100%;width:0;background:var(--ac);transition:width .15s}
   .msg{margin-top:.9rem;font-size:.92rem;display:none}
@@ -61,12 +65,16 @@ export function uploadHtml(turnstileSiteKey: string): string {
 
 <div class="card" id="card">
   <div class="row">
-    <div class="cover" id="cover">无封面</div>
+    <div class="cover" id="cover"><div class="cover-empty">无封面</div></div>
     <div class="meta">
       <div class="fname" id="fname"></div>
       <div class="kv">类型：<b id="ftype"></b></div>
       <div class="kv">大小：<b id="fsize"></b></div>
-      <div class="kv" id="derived" hidden>识别书名：<b id="ftitle"></b> · 作者：<b id="fauthor"></b></div>
+      <div class="kv" id="derived" hidden>书名：<b id="ftitle"></b> · 作者：<b id="fauthor"></b></div>
+      <div class="kv parsed" id="parsed" hidden>
+        <span class="badge" id="parsedBadge">已解析 EPUB</span>
+        真实书名：<b id="ptitle"></b><br>真实作者：<b id="pauthor"></b>
+      </div>
     </div>
   </div>
   <div class="bar" id="bar"><i id="pct"></i></div>
@@ -112,6 +120,8 @@ function derive(name){
 function preview(f){
   picked = f;
   $('card').classList.add('show');
+  // 清掉上一次上传留下的「已解析」区
+  $('parsed').hidden = true;
   $('fname').textContent = f.name;
   $('fsize').textContent = fmtSize(f.size);
   const d = derive(f.name);
@@ -121,8 +131,8 @@ function preview(f){
   $('fauthor').textContent = d.author || '（未识别）';
   // 图片类给真实预览，其余给占位
   const cov = $('cover');
-  if(/^image\\//.test(f.type)){ const url=URL.createObjectURL(f); cov.innerHTML='<img src="'+url+'" style="width:100%;height:100%;object-fit:cover">'; }
-  else { cov.textContent = d.ext.toUpperCase() || '无封面'; }
+  if(/^image\//.test(f.type)){ const url=URL.createObjectURL(f); cov.innerHTML='<img src="'+url+'" style="width:100%;height:100%;object-fit:cover">'; }
+  else { cov.innerHTML='<div class="cover-empty">'+ (d.ext.toUpperCase() || '无封面') +'</div>'; }
   $('go').disabled = false;
   setStep(1);
 }
@@ -180,7 +190,16 @@ $('go').onclick = async () => {
     if(!done.ok) throw new Error(done.json.error || ('HTTP '+done.status));
     markStep(3);
 
-    msg('✅ 上传成功：《'+done.json.title+'》已上架', 'ok');
+    // 展示服务器解析出的真实封面与元数据（EPUB 且 < 50MB 时 available）
+    const j = done.json;
+    if (j.coverUrl) {
+      $('cover').innerHTML = '<img src="'+j.coverUrl+'" style="width:100%;height:100%;object-fit:cover" alt="cover">';
+      $('parsed').hidden = false;
+      $('ptitle').textContent = j.title || '—';
+      $('pauthor').textContent = j.author || '（未识别）';
+      $('parsedBadge').textContent = '已解析 EPUB 封面';
+    }
+    msg('✅ 上传成功：《'+(j.title||j.leafName)+'》已上架', 'ok');
     $('pct').style.width='100%';
   }catch(e){
     const detail = e.message||String(e);

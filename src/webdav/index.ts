@@ -2,13 +2,15 @@
 
 import type { Env, Settings } from '../config';
 import { letterBucket, resolveNode, type DavNode } from '../lib/collections';
-import { deleteBook, findBookByLeaf, rebuildBuckets, upsertBook } from '../lib/db';
+import { deleteBook, findBookByLeaf, rebuildBuckets } from '../lib/db';
 import { methodNotAllowed, shortId, textResponse } from '../lib/http';
 import { preferContentType, deriveMetadata, sanitiseLeafName } from '../lib/metadata';
 import { checkPreconditions } from '../lib/preconditions';
+import { parseEpub, PARSE_SIZE_CAP, type EpubMeta } from '../lib/epub';
 import { bookCacheTargets, purgeEntries } from '../lib/cache';
 import { collectDavEntries, handlePropfind, type Entry } from './propfind';
 import { escapeXml } from '../lib/xml';
+import { listBooks, upsertBook } from '../lib/db';
 
 const ALLOW = 'OPTIONS, GET, HEAD, PROPFIND, PUT, DELETE';
 
@@ -222,27 +224,61 @@ async function handlePut(request: Request, env: Env, node: DavNode): Promise<Res
     return textResponse(412, `Precondition Failed: ${precondition.reason}`, { allow: ALLOW });
   }
 
-  // 直接流式落 R2，绝不把 body 读进内存（isolate 上限 128MB）
-  const object = await env.BUCKET.put(r2Key, request.body, {
-    httpMetadata: { contentType },
-  });
+  // EPUB 且小于解析上限：读进内存以便解析真实元数据/封面。
+  // 非 EPUB 或超大文件：保持流式落 R2，不读 body（省内存）。
+  const isEpub = meta.format === 'epub';
+  const declaredSize = Number(request.headers.get('content-length')) || 0;
+  const parseable = isEpub && declaredSize > 0 && declaredSize <= PARSE_SIZE_CAP;
+
+  let parsed: EpubMeta | null = null;
+  let coverKey: string | null = null;
+  let object;
+
+  if (parseable) {
+    const buf = await request.arrayBuffer();
+    object = await env.BUCKET.put(r2Key, new Uint8Array(buf), {
+      httpMetadata: { contentType },
+    });
+    try {
+      parsed = await parseEpub(buf);
+      if (parsed?.cover) {
+        const coverType = parsed.cover.contentType || 'image/jpeg';
+        const ext = coverType.split('/')[1]?.replace('jpeg', 'jpg') ?? 'jpg';
+        coverKey = `covers/${id}.${ext}`;
+        await env.BUCKET.put(coverKey, new Uint8Array(parsed.cover.bytes), {
+          httpMetadata: { contentType: coverType },
+        });
+      }
+    } catch {
+      // 解析失败不影响写入，退回文件名推导
+    }
+  } else {
+    // 直接流式落 R2，绝不把 body 读进内存（isolate 上限 128MB）
+    object = await env.BUCKET.put(r2Key, request.body, {
+      httpMetadata: { contentType },
+    });
+  }
+
+  const title = parsed?.title ?? meta.title;
+  const author = parsed?.author ?? meta.author;
 
   await upsertBook(env.DB, {
     id,
     leafName,
-    title: meta.title,
-    author: meta.author,
-    language: null,
+    title,
+    author,
+    language: parsed?.language ?? null,
     format: meta.format,
     contentType,
     size: object?.size ?? 0,
     sha256: null, // Phase 1：Queue consumer 计算哈希并校验墓碑表
     r2Key,
     etag: object?.etag ?? null,
-    titleLetter: letterBucket(meta.title),
-    authorLetter: letterBucket(meta.author ?? meta.title),
+    titleLetter: letterBucket(title),
+    authorLetter: letterBucket(author ?? title),
     formatBucket: meta.format,
     publishedAt: new Date().toISOString(),
+    coverKey,
   });
 
   // 分桶计数重建。全表聚合在写入频率低时开销可接受；
@@ -254,8 +290,8 @@ async function handlePut(request: Request, env: Env, node: DavNode): Promise<Res
   await purgeEntries(
     bookCacheTargets({
       leafName,
-      titleLetter: letterBucket(meta.title),
-      authorLetter: letterBucket(meta.author ?? meta.title),
+      titleLetter: letterBucket(title),
+      authorLetter: letterBucket(author ?? title),
       formatBucket: meta.format,
     }),
   );

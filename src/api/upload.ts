@@ -22,6 +22,7 @@ import { deriveMetadata, preferContentType } from '../lib/metadata';
 import { rebuildBuckets, upsertBook } from '../lib/db';
 import { shortId } from '../lib/http';
 import { createPresignedPutUrl } from '../lib/sigv4';
+import { parseEpub, PARSE_SIZE_CAP } from '../lib/epub';
 import { jsonResponse, textResponse } from '../lib/http';
 
 const SITEVERIFY = 'https://challenges.cloudflare.com/turnstile/v0/siteverify';
@@ -219,13 +220,42 @@ export async function handleUploadComplete(request: Request, env: Env): Promise<
   });
   await env.BUCKET.delete(key);
 
-  const title = meta.title;
+  // ── EPUB 解析：用文件内部的权威元数据 + 封面图，取代文件名的猜测 ──
+  let title = meta.title;
+  let author = meta.author;
+  let language: string | null = null;
+  let coverKey: string | null = null;
+
+  if (format === 'epub' && actualSize <= PARSE_SIZE_CAP) {
+    try {
+      const epubBuf = await (await env.BUCKET.get(bookKey))?.arrayBuffer();
+      if (epubBuf) {
+        const parsed = await parseEpub(epubBuf);
+        if (parsed) {
+          if (parsed.title) title = parsed.title;
+          if (parsed.author) author = parsed.author;
+          language = parsed.language;
+          if (parsed.cover) {
+            const coverType = parsed.cover.contentType || 'image/jpeg';
+            const ext = coverType.split('/')[1]?.replace('jpeg', 'jpg') ?? 'jpg';
+            coverKey = `covers/${bookKey.slice('books/'.length)}.${ext}`;
+            await env.BUCKET.put(coverKey, new Uint8Array(parsed.cover.bytes), {
+              httpMetadata: { contentType: coverType },
+            });
+          }
+        }
+      }
+    } catch {
+      // 解析失败不影响上架：退回文件名推导，封面留空
+    }
+  }
+
   await upsertBook(env.DB, {
     id: bookKey.slice('books/'.length),
     leafName: safeName,
     title,
-    author: meta.author,
-    language: null,
+    author,
+    language,
     format,
     contentType,
     size: actualSize,
@@ -233,18 +263,23 @@ export async function handleUploadComplete(request: Request, env: Env): Promise<
     r2Key: bookKey,
     etag: head.etag,
     titleLetter: letterBucket(title),
-    authorLetter: letterBucket(meta.author ?? title),
+    authorLetter: letterBucket(author ?? title),
     formatBucket: format,
     publishedAt: new Date().toISOString(),
+    coverKey,
   });
   await rebuildBuckets(env.DB);
 
   return jsonResponse({
     ok: true,
     title,
-    author: meta.author,
+    author,
+    language,
     format,
     size: actualSize,
     leafName: safeName,
+    // 封面绝对 URL：上传页立刻可预览
+    coverUrl: coverKey ? `${env.R2_PUBLIC_BASE}/${coverKey}` : null,
+    parsed: format === 'epub' && actualSize <= PARSE_SIZE_CAP,
   });
 }

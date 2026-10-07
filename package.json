@@ -13,6 +13,7 @@
     "budget": "node scripts/budget.mjs",
     "check:dav": "node scripts/dav-probe.mjs",
     "check:size": "node scripts/size-probe.mjs",
+    "check:rfc": "node scripts/rfc-probe.mjs",
     "db:migrate:local": "wrangler d1 migrations apply DB --local",
     "db:migrate": "wrangler d1 migrations apply DB --remote",
     "deploy:cloudflare": "wrangler deploy && wrangler d1 migrations apply DB --remote",
