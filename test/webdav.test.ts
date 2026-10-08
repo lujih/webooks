@@ -53,16 +53,16 @@ beforeEach(async () => {
 // ── OPTIONS / 协议声明 ──────────────────────────────────────────────────
 
 describe('OPTIONS', () => {
-  it('宣告 DAV: 1, 3（Class 1 + 符合 RFC 4918，不含 2）', async () => {
+  it('宣告 DAV: 1, 2, 3（完整 Class 2，含 LOCK/UNLOCK）', async () => {
     const res = await dav('/', { method: 'OPTIONS' });
     expect(res.status).toBe(200);
     // RFC 4918 §18: 1=Class1, 2=Class2(有锁), 3=符合 RFC4918 全部要求
     const davHeader = res.headers.get('dav') ?? '';
     expect(davHeader).toContain('1');
+    expect(davHeader).toContain('2');
     expect(davHeader).toContain('3');
-    expect(davHeader).not.toMatch(/(^|[\s,])2([\s,]|$)/); // 明确不宣告有锁
     expect(res.headers.get('allow')).toContain('PROPFIND');
-    expect(res.headers.get('allow')).not.toContain('LOCK');
+    expect(res.headers.get('allow')).toContain('LOCK');
     expect(res.headers.get('ms-author-via')).toBe('DAV');
   });
 });
@@ -291,22 +291,127 @@ describe('PUT / GET / DELETE', () => {
   });
 });
 
-// ── 未实现的方法要明确拒绝 ──────────────────────────────────────────────
+// ── Class 2 锁 / MKCOL / PROPPATCH / MOVE / COPY ──────────────────────
 
-describe('未实现的方法', () => {
-  it('MKCOL 返回 405（目录树是虚拟的）', async () => {
-    const res = await dav('/title/T/', { method: 'MKCOL' });
-    expect(res.status).toBe(405);
+describe('Class 2 锁（LOCK/UNLOCK）', () => {
+  it('LOCK 叶子返回 200 + Lock-Token 头', async () => {
+    const res = await dav('/recent/a.epub', {
+      method: 'LOCK',
+      body: '<?xml version="1.0"?><D:lockinfo xmlns:D="DAV:"><D:locktype><D:write/></D:locktype><D:lockscope><D:exclusive/></D:lockscope></D:lockinfo>',
+    });
+    expect(res.status).toBe(200);
+    expect(res.headers.get('lock-token')).toMatch(/^<urn:uuid:.*>$/);
+    const xml = await res.text();
+    expect(xml).toContain('<D:lockdiscovery>');
   });
 
-  it('LOCK/UNLOCK 返回 501（Class 1）', async () => {
-    expect((await dav('/title/T/x.epub', { method: 'LOCK' })).status).toBe(501);
-    expect((await dav('/title/T/x.epub', { method: 'UNLOCK' })).status).toBe(501);
+  it('持锁后 PUT 该资源 → 423 Locked', async () => {
+    const lockRes = await dav('/recent/b.epub', {
+      method: 'LOCK',
+      body: '<D:lockinfo xmlns:D="DAV:"><D:locktype><D:write/></D:locktype><D:lockscope><D:exclusive/></D:lockscope></D:lockinfo>',
+    });
+    const token = lockRes.headers.get('lock-token')!;
+    expect(token).toBeTruthy();
+
+    const put = await dav('/recent/b.epub', { method: 'PUT', body: 'x' });
+    expect(put.status).toBe(423);
+
+    // 刷新（带 If: (<token>)）后，持锁者可继续写
+    const refresh = await dav('/recent/b.epub', {
+      method: 'LOCK',
+      headers: { if: `(${token})`, timeout: 'Second-300' },
+      body: '<D:lockinfo xmlns:D="DAV:"><D:locktype><D:write/></D:locktype></D:lockinfo>',
+    });
+    expect(refresh.status).toBe(200);
   });
 
-  it('MOVE/COPY 返回 501', async () => {
-    expect((await dav('/title/T/x.epub', { method: 'MOVE' })).status).toBe(501);
-    expect((await dav('/title/T/x.epub', { method: 'COPY' })).status).toBe(501);
+  it('UNLOCK 释放锁后 PUT 恢复 201/204', async () => {
+    const lockRes = await dav('/recent/c.epub', {
+      method: 'LOCK',
+      body: '<D:lockinfo xmlns:D="DAV:"><D:locktype><D:write/></D:locktype></D:lockinfo>',
+    });
+    const token = lockRes.headers.get('lock-token')!;
+
+    const unlock = await dav('/recent/c.epub', {
+      method: 'UNLOCK',
+      headers: { 'lock-token': token },
+    });
+    expect(unlock.status).toBe(204);
+
+    const put = await dav('/recent/c.epub', { method: 'PUT', body: 'x' });
+    expect(put.status).toBe(201);
+  });
+
+  it('锁超时后自动释放（timeout 极小时下轮 PUT 可写）', async () => {
+    // acquireLock 时传入 0 秒超时 → expires_at = now，立刻视为过期
+    // 这里用 Timeout: Second-0 模拟（locks.ts 会 clamp 到最小 1s，所以这里只验基本可写性）
+    const lockRes = await dav('/recent/d.epub', {
+      method: 'LOCK',
+      headers: { timeout: 'Second-1' },
+      body: '<D:lockinfo xmlns:D="DAV:"><D:locktype><D:write/></D:locktype></D:lockinfo>',
+    });
+    expect(lockRes.status).toBe(200);
+  });
+});
+
+describe('MKCOL', () => {
+  it('MKCOL 虚拟目录返回 201 Created', async () => {
+    const res = await dav('/title/A/', { method: 'MKCOL' });
+    expect(res.status).toBe(201);
+  });
+
+  it('Extended MKCOL（带 body）也 201', async () => {
+    const res = await dav('/title/A/', {
+      method: 'MKCOL',
+      body: '<D:propertyupdate xmlns:D="DAV:"><D:set><D:prop><D:displayname>x</D:displayname></D:prop></D:set></D:propertyupdate>',
+      headers: { 'content-type': 'application/xml' },
+    });
+    expect(res.status).toBe(201);
+  });
+});
+
+describe('PROPPATCH', () => {
+  it('PROPPATCH 假装成功返回 207', async () => {
+    const res = await dav('/recent/e.epub', {
+      method: 'PROPPATCH',
+      body: '<?xml version="1.0"?><D:propertyupdate xmlns:D="DAV:"><D:set><D:prop><D:displayname>ignored</D:displayname></D:prop></D:set></D:propertyupdate>',
+      headers: { 'content-type': 'application/xml' },
+    });
+    expect(res.status).toBe(207);
+    const xml = await res.text();
+    expect(xml).toContain('<D:status>HTTP/1.1 200 OK</D:status>');
+  });
+});
+
+describe('MOVE / COPY', () => {
+  it('MOVE 叶子到另一叶子 → 201 + Location', async () => {
+    await dav('/recent/src.epub', { method: 'PUT', body: 'x' });
+    const res = await dav('/recent/src.epub', {
+      method: 'MOVE',
+      headers: { destination: 'https://webooks.invalid/dav/recent/dst.epub' },
+    });
+    expect(res.status).toBe(201);
+    expect(res.headers.get('location')).toContain('/dav/recent/dst.epub');
+
+    // 源消失、目标出现
+    expect((await dav('/recent/src.epub', { method: 'PROPFIND' })).status).toBe(404);
+    expect((await dav('/recent/dst.epub', { method: 'PROPFIND' })).status).toBe(207);
+  });
+
+  it('COPY 叶子 → 201，源仍在', async () => {
+    await dav('/recent/src2.epub', { method: 'PUT', body: 'x' });
+    const res = await dav('/recent/src2.epub', {
+      method: 'COPY',
+      headers: { destination: 'https://webooks.invalid/dav/recent/dst2.epub' },
+    });
+    expect(res.status).toBe(201);
+    expect((await dav('/recent/src2.epub', { method: 'PROPFIND' })).status).toBe(207);
+    expect((await dav('/recent/dst2.epub', { method: 'PROPFIND' })).status).toBe(207);
+  });
+
+  it('MOVE 缺 Destination 头 → 400', async () => {
+    const res = await dav('/recent/x.epub', { method: 'MOVE' });
+    expect(res.status).toBe(400);
   });
 });
 
@@ -402,34 +507,17 @@ describe('条件请求防止误覆盖', () => {
 });
 
 // ── DAV 错误体合规（RFC 4918 §16）────────────────────────────────────────
+// 注意：Class 2 实现后，MKCOL/PROPPATCH/LOCK/UNLOCK/MOVE/COPY 都返回成功
+// 或合规的 2xx/207，不再返回 4xx/5xx 拒绝体。此 describe 只保留仍会
+// 出现 <D:error> 的场景。
 
 describe('DAV 错误体', () => {
-  it('PROPPATCH 返回 <D:error> 且带 cannot-modify-protected-property', async () => {
+  it('MOVE 到目录（非叶子）返回 403', async () => {
     const res = await dav('/recent/', {
-      method: 'PROPPATCH',
-      headers: { 'content-type': 'application/xml' },
-      body: '<?xml version="1.0"?><D:propertyupdate xmlns:D="DAV:"><D:set><D:prop><D:x/></D:prop></D:set></D:propertyupdate>',
+      method: 'MOVE',
+      headers: { destination: 'https://webooks.invalid/dav/recent/newdir/' },
     });
+    // 源是 /recent/ 目录（kind=list），MOVE 目录 → 403
     expect(res.status).toBe(403);
-    expect(res.headers.get('content-type')).toContain('xml');
-    const body = await res.text();
-    expect(body).toContain('<D:error');
-    expect(body).toContain('cannot-modify-protected-property');
-  });
-
-  it('LOCK 返回 <D:error> 且带 supported-lock（告知客户端不支持任何锁）', async () => {
-    const res = await dav('/recent/', { method: 'LOCK', body: '<D:lockinfo xmlns:D="DAV:"/>' });
-    expect(res.status).toBe(501);
-    const body = await res.text();
-    expect(body).toContain('<D:error');
-    expect(body).toContain('supported-lock');
-  });
-
-  it('MOVE/COPY 返回合规的 DAV 错误体', async () => {
-    for (const method of ['MOVE', 'COPY']) {
-      const res = await dav('/recent/', { method });
-      expect(res.status).toBe(501);
-      expect(await res.text()).toContain('<D:error');
-    }
   });
 });

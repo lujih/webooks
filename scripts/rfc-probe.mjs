@@ -45,9 +45,10 @@ console.log('='.repeat(72));
 {
   const { res } = await req('/', { method: 'OPTIONS' });
   const dav = res.headers.get('dav') ?? '';
-  // RFC 4918 §18: 完全合规应 advertise "3"；"1"/"2" 是 Class 指示
+  // RFC 4918 §18: 完全合规应宣告 "1, 2, 3"（含 Class 2 LOCK）
+  const has2 = /\b2\b/.test(dav);
   const has3 = /\b3\b/.test(dav);
-  check('OPTIONS 宣告 RFC 4918 合规等级（DAV: …,3）', has3, `DAV: ${dav || '(空)'}`, 'RFC 4918 §18');
+  check('OPTIONS 宣告 RFC 4918 完整等级（DAV: 1, 2, 3）', has2 && has3, `DAV: ${dav || '(空)'}`, 'RFC 4918 §18');
 }
 
 // ── OPTIONS * ──
@@ -93,21 +94,45 @@ console.log('='.repeat(72));
   }
 }
 
-// ── PROPPATCH 应返回 DAV 错误体 ──
+// ── PROPPATCH 兼容层：假装成功（回 207，避免客户端无限重试）──
 {
-  const xml = '<?xml version="1.0"?><D:propertyupdate xmlns:D="DAV:"><D:set><D:prop><D:x/></D:prop></D:set></D:propertyupdate>';
+  const xml = '<?xml version="1.0"?><D:propertyupdate xmlns:D="DAV:"><D:set><D:prop><D:displayname>x</D:displayname></D:prop></D:set></D:propertyupdate>';
   const { res, body } = await req('/recent/' + tmp, { method: 'PROPPATCH', headers: { 'content-type': 'application/xml' }, body: xml });
-  const ok = res.status === 403 && /<D:error/.test(body) && /cannot-modify-protected-property/.test(body);
-  check('PROPPATCH 返回 DAV 错误体（cannot-modify-protected-property）', ok,
-    `status=${res.status} body=${body.slice(0, 50).replace(/\n/g, ' ')}`, 'RFC 4918 §14/§16');
+  const ok = res.status === 207 && /<D:status>HTTP\/1\.1 200 OK/.test(body);
+  check('PROPPATCH 返回 207 成功（兼容层，避免客户端重试）', ok,
+    `status=${res.status} body=${body.slice(0, 60).replace(/\n/g, ' ')}`, 'RFC 4918 §9.2 兼容层');
 }
 
-// ── LOCK 应返回 supported-lock 说明不支持任何锁 ──
+// ── LOCK 应宣告 Class 2 并返回 200 + Lock-Token ──
 {
-  const { res, body } = await req('/recent/' + tmp, { method: 'LOCK', body: '<D:lockinfo xmlns:D="DAV:"/>' });
-  const ok = res.status === 501 && /<D:error/.test(body) && /supported-lock/.test(body);
-  check('LOCK 返回 <D:supported-lock/> 说明不支持任何锁', ok,
-    `status=${res.status} body=${body.slice(0, 50).replace(/\n/g, ' ')}`, 'RFC 4918 §10.2/§16');
+  const { res, body } = await req('/recent/' + tmp, {
+    method: 'LOCK',
+    body: '<?xml version="1.0"?><D:lockinfo xmlns:D="DAV:"><D:locktype><D:write/></D:locktype><D:lockscope><D:exclusive/></D:lockscope></D:lockinfo>',
+  });
+  const token = res.headers.get('lock-token');
+  const ok = res.status === 200 && !!token && /<D:lockdiscovery>/.test(body);
+  check('LOCK 返回 200 + Lock-Token（Class 2 已实现）', ok,
+    `status=${res.status} lock-token=${token ?? '(无)'}`, 'RFC 4918 §9.10');
+
+  // 刷新（带 If 头）
+  if (token) {
+    const refresh = await req('/recent/' + tmp, {
+      method: 'LOCK',
+      headers: { if: `(${token})`, timeout: 'Second-300' },
+      body: '<D:lockinfo xmlns:D="DAV:"><D:locktype><D:write/></D:locktype></D:lockinfo>',
+    });
+    check('LOCK 刷新（If: <token>）返回 200', refresh.status === 200,
+      `status=${refresh.status}`, 'RFC 4918 §9.10.2');
+    // 释放
+    await req('/recent/' + tmp, { method: 'UNLOCK', headers: { 'lock-token': token } });
+  }
+}
+
+// ── MKCOL 应接受虚拟目录创建（客户端挂载兼容性）──
+{
+  const { res } = await req('/title/A/', { method: 'MKCOL' });
+  const ok = res.status === 201;
+  check('MKCOL 虚拟目录返回 201 Created（客户端挂载兼容）', ok, `status=${res.status}`, 'RFC 4918 §9.3 兼容层');
 }
 
 // ── PATCH 未实现须 405 且 Allow 不含 PATCH ──
