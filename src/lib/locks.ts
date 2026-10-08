@@ -71,7 +71,35 @@ export async function acquireLock(
 ): Promise<{ lock: LockRow; isRefresh: boolean }> {
   const now = nowIso();
   const expires = isoPlusSeconds(now, opts.timeoutSec);
-  const token = opts.refreshToken ?? newLockToken();
+
+  // 刷新：资源上已有同 token 的活锁 → 直接更新超时（不重新创建）
+  if (opts.refreshToken) {
+    const existing = await db
+      .prepare(`SELECT token FROM locks WHERE token = ? AND resource = ?`)
+      .bind(opts.refreshToken, opts.resource)
+      .first<{ token: string }>();
+    if (existing) {
+      await db
+        .prepare(
+          `UPDATE locks SET expires_at = ?, timeout_sec = ? WHERE token = ?`,
+        )
+        .bind(expires, opts.timeoutSec, opts.refreshToken)
+        .run();
+      return {
+        lock: {
+          token: opts.refreshToken,
+          resource: opts.resource,
+          owner: opts.owner ?? null,
+          type: opts.type,
+          depth: opts.depth,
+          timeoutSec: opts.timeoutSec,
+          createdAt: now,
+          expiresAt: expires,
+        },
+        isRefresh: true,
+      };
+    }
+  }
 
   // 冲突判定：资源上存在「过期前的活锁」且类型不兼容
   const live = await db
@@ -88,7 +116,8 @@ export async function acquireLock(
     .first<{ token: string; type: string }>();
 
   // 共享锁互斥：两个 exclusive 锁、一个 exclusive + 任意 shared 都冲突
-  if (live && live.token !== token) {
+  const token = newLockToken();
+  if (live) {
     // 抛冲突，让调用方决定 423 / 409
     const err = new Error('LOCK_CONFLICT') as Error & { lockConflict: boolean; liveToken?: string };
     err.lockConflict = true;
@@ -106,7 +135,6 @@ export async function acquireLock(
          type = excluded.type,
          depth = excluded.depth,
          timeout_sec = excluded.timeout_sec,
-         created_at = CASE WHEN excluded.token = ? THEN locks.created_at ELSE excluded.created_at END,
          expires_at = excluded.expires_at`,
     )
     .bind(
@@ -118,7 +146,6 @@ export async function acquireLock(
       opts.timeoutSec,
       now,
       expires,
-      token,
     )
     .run();
 

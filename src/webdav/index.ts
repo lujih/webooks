@@ -129,9 +129,11 @@ async function handleLock(request: Request, env: Env, davPath: string): Promise<
   const timeoutSec = parseTimeoutHeader(request.headers.get('timeout'));
   const owner = body.match(/<D:owner>([\s\S]*?)<\/D:owner>/i)?.[1]?.trim() ?? null;
 
-  // 刷新：If 头带 lock-token
+  // 刷新：If 头带 lock-token。RFC 4918 §9.10.2：If: (<token>) 表示刷新。
+  // token 形如 <urn:uuid:xxx>，If 头是 ( <token> )。
   const ifHeader = request.headers.get('if');
-  const ifToken = ifHeader?.match(/<urn:uuid:[^>]+>/)?.[0] ?? null;
+  // 从 If: (<urn:uuid:...>) 里提取 token（最内层第一个 <...>）
+  const ifToken = ifHeader?.match(/<urn:uuid:[0-9a-f-]+>/i)?.[0] ?? null;
 
   // RFC 4918 §9.10.2: 如果资源已被另一个 exclusive 锁持有，刷新自己的锁 OK，新建则 423
   try {
