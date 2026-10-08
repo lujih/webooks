@@ -34,9 +34,16 @@ function check(name, ok, detail, ref) {
   console.log(`  ${tag} ${name}${detail ? `${C.dim} — ${detail}${C.r}` : ''}${ref ? `${C.dim} [${ref}]${C.r}` : ''}`);
 }
 
-// 造一个可写文件
-const tmp = `__rfcprobe_${Date.now()}.txt`;
-await req('/recent/' + tmp, { method: 'PUT', body: 'probe' });
+// ── 造一个可写文件 ──
+{
+  const tmpRes = await req('/recent/' + tmp, { method: 'PUT', body: 'probe' });
+  if (tmpRes.res.status !== 201 && tmpRes.res.status !== 204) {
+    // 环境不健康（503 = D1 未迁移 / 1101 = Worker 崩）—— 早期退出，避免 20 条误导
+    console.error(`\n  ✘ PUT ${tmp} 返回 ${tmpRes.res.status}，环境不健康，停止后续检查。`);
+    console.error(`    若 503：D1 表未建好，先跑 db:migrate\n    若 1101：Worker 崩溃，查 Workers Logs`);
+    process.exit(2);
+  }
+}
 
 console.log(`RFC 合规探针  ${BASE}`);
 console.log('='.repeat(72));
@@ -116,15 +123,18 @@ console.log('='.repeat(72));
 
   // 刷新（带 If 头）
   if (token) {
-    const refresh = await req('/recent/' + tmp, {
+    const refreshRes = await req('/recent/' + tmp, {
       method: 'LOCK',
       headers: { if: `(${token})`, timeout: 'Second-300' },
       body: '<D:lockinfo xmlns:D="DAV:"><D:locktype><D:write/></D:locktype></D:lockinfo>',
     });
-    check('LOCK 刷新（If: <token>）返回 200', refresh.status === 200,
-      `status=${refresh.status}`, 'RFC 4918 §9.10.2');
+    check('LOCK 刷新（If: <token>）返回 200', refreshRes.res.status === 200,
+      `status=${refreshRes.res.status ?? '(undefined)'}`, 'RFC 4918 §9.10.2');
     // 释放
-    await req('/recent/' + tmp, { method: 'UNLOCK', headers: { 'lock-token': token } });
+    const unlockRes = await req('/recent/' + tmp, { method: 'UNLOCK', headers: { 'lock-token': token } });
+    if (unlockRes.res.status !== 204) {
+      console.log(`    ${C.dim}（UNLOCK 返回 ${unlockRes.res.status}，见上）${C.r}`);
+    }
   }
 }
 
