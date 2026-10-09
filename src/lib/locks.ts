@@ -101,30 +101,16 @@ export async function acquireLock(
     }
   }
 
-  // 冲突判定：资源上存在「过期前的活锁」且类型不兼容
-  const live = await db
-    .prepare(
-      `SELECT token, type FROM locks
-        WHERE resource = ? AND expires_at > ?
-        AND (
-          (? = 'exclusive' AND type = 'exclusive')
-          OR (? = 'shared' AND type = 'exclusive')
-        )
-        LIMIT 1`,
-    )
-    .bind(opts.resource, now, opts.type, opts.type)
-    .first<{ token: string; type: string }>();
-
-  // 共享锁互斥：两个 exclusive 锁、一个 exclusive + 任意 shared 都冲突
-  const token = newLockToken();
-  if (live) {
-    // 抛冲突，让调用方决定 423 / 409
+  // 冲突判定：资源 r 被锁（自身或祖先目录锁）且类型不兼容 → 冲突
+  const blocking = await liveLockForResource(db, opts.resource);
+  if (blocking) {
     const err = new Error('LOCK_CONFLICT') as Error & { lockConflict: boolean; liveToken?: string };
     err.lockConflict = true;
-    err.liveToken = live.token;
+    err.liveToken = blocking.token;
     throw err;
   }
 
+  const token = newLockToken();
   await db
     .prepare(
       `INSERT INTO locks (token, resource, owner, type, depth, timeout_sec, created_at, expires_at)
@@ -168,13 +154,90 @@ export async function releaseLock(db: D1Database, token: string): Promise<void> 
   await db.prepare(`DELETE FROM locks WHERE token = ?`).bind(token).run();
 }
 
+/**
+ * 取当前所有未过期活锁（PROPFIND 注入 lockdiscovery 用）。
+ *
+ * 为什么不用 IN 列表逐路径查：
+ *   · D1/SQLite 对单条 prepare 的绑定参数数有上限（本地 workerd 默认 999），
+ *     一个 200 条目目录 + expires_at 就 201 参数，接近上限，放宽条目后必炸
+ *   · 活锁数量远小于条目数（挂载瞬间才建，TTL 300s），全量读一把最安全
+ *
+ * 调用方拿到 Map<resource, LockRow> 后，按「路径自身或任意祖先目录」匹配
+ * 到具体条目（见 liveLockForResource 的 SQL 语义）。
+ */
+export async function allLiveLocks(db: D1Database): Promise<Map<string, LockRow>> {
+  const out = new Map<string, LockRow>();
+  const { results } = await db
+    .prepare(`SELECT * FROM locks WHERE expires_at > ?`)
+    .bind(nowIso())
+    .all<Record<string, unknown>>();
+  for (const row of results ?? []) {
+    out.set(row.resource as string, {
+      token: row.token as string,
+      resource: row.resource as string,
+      owner: (row.owner as string | null) ?? null,
+      type: row.type as 'exclusive' | 'shared',
+      depth: row.depth as string,
+      timeoutSec: row.timeout_sec as number,
+      createdAt: row.created_at as string,
+      expiresAt: row.expires_at as string,
+    });
+  }
+  return out;
+}
+
+/**
+ * 给定一组条目路径，返回每个路径上「自身或祖先目录」的活锁。
+ * 在 allLiveLocks 的结果上做内存前缀匹配（O(条目 × 锁数)，两者都小）。
+ */
+export function matchLocksToPaths(
+  locks: Map<string, LockRow>,
+  paths: string[],
+): Map<string, LockRow> {
+  const out = new Map<string, LockRow>();
+  if (locks.size === 0) return out;
+  for (const p of paths) {
+    // 命中：锁 resource === p（自身）或锁 resource 是 p 的祖先目录（带尾斜杠前缀）
+    let hit: LockRow | undefined;
+    for (const lock of locks.values()) {
+      const r = lock.resource;
+      if (r === p || p.startsWith(r.endsWith('/') ? r : r + '/')) {
+        // 取最新过期的那条（最相关的锁）
+        if (!hit || lock.expiresAt > hit.expiresAt) hit = lock;
+      }
+    }
+    if (hit) out.set(p, hit);
+  }
+  return out;
+}
+
+/**
+ * Depth:1 集合锁的继承判定：资源 r 是否被「r 自身或任意祖先目录」上的活锁覆盖。
+ * 一条 SQL 搞定（锁的 resource 路径前缀匹配），避免应用层逐层查 D1。
+ */
 export async function liveLockForResource(
   db: D1Database,
   resource: string,
 ): Promise<LockRow | null> {
+  const now = nowIso();
   const row = await db
-    .prepare(`SELECT * FROM locks WHERE resource = ? AND expires_at > ? ORDER BY expires_at DESC LIMIT 1`)
-    .bind(resource, nowIso())
+    .prepare(
+      // 资源 r 被锁的判定：
+      //   (1) r 自身有锁          resource = ?
+      //   (2) r 的任意祖先目录有 Depth:1/infinity 锁
+      //       祖先目录锁的 resource 形如 '/recent/'（带尾斜杠）或 '/'
+      //       子资源 '/recent/child.epub' 应以该目录串为前缀
+      `SELECT * FROM locks
+        WHERE (
+             resource = ?
+             OR (? LIKE resource || '%' AND resource LIKE '%/')
+             OR resource = '/'
+        )
+        AND expires_at > ?
+        ORDER BY (CASE WHEN resource = ? THEN 0 ELSE 1 END) ASC, expires_at DESC
+        LIMIT 1`,
+    )
+    .bind(resource, resource, now, resource)
     .first<Record<string, unknown>>();
   if (!row) return null;
   return {
@@ -192,12 +255,16 @@ export async function liveLockForResource(
 /** 把锁渲染成 DAV 头里要的 lockdiscovery XML 片段 */
 export function lockDiscoveryXml(lock: LockRow, requestHref: string): string {
   const ownerXml = lock.owner ? `<D:owner>${escapeOwner(lock.owner)}</D:owner>` : '';
+  const scope = lock.type === 'shared' ? 'shared' : 'exclusive';
+  const lockType = lock.type === 'shared' ? 'read' : 'write';
+  const depth = lock.depth === '1' || lock.depth === '0' ? lock.depth : 'infinity';
   return (
-    `<D:lockdiscovery><D:lock><D:lockscope><D:exclusive/></D:lockscope>` +
-    `<D:locktype><D:write/></D:locktype>` +
-    `<D:depth>${lock.depth}</D:depth>` +
+    `<D:lockdiscovery><D:lock>` +
+    `<D:lockscope><D:${scope}/></D:lockscope>` +
+    `<D:locktype><D:${lockType}/></D:locktype>` +
+    `<D:depth>${depth}</D:depth>` +
     `<D:timeout>Second-${lock.timeoutSec}</D:timeout>` +
-    `<D:locktoken><D:locktoken-${lock.type}>${lock.token}</D:locktoken-${lock.type}></D:locktoken>` +
+    `<D:locktoken><D:locktoken><D:href>${escapeOwner(lock.token)}</D:href></D:locktoken>` +
     ownerXml +
     `</D:lock></D:lockdiscovery>`
   );

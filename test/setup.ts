@@ -27,5 +27,5 @@ export async function clearDavCache(paths: string[]): Promise<void> {
 }
 
 export async function resetLibrary(): Promise<void> {
-  await testEnv.DB.exec('DELETE FROM books; DELETE FROM buckets;');
+  await testEnv.DB.exec('DELETE FROM books; DELETE FROM buckets; DELETE FROM locks;');
 }

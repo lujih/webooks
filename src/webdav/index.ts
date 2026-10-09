@@ -15,7 +15,6 @@ import {
   releaseLock,
   lockDiscoveryXml,
 } from '../lib/locks';
-import { multistatusResponse } from '../lib/http';
 import { collectDavEntries, handlePropfind, type Entry } from './propfind';
 import { escapeXml } from '../lib/xml';
 
@@ -147,9 +146,10 @@ async function handleLock(request: Request, env: Env, davPath: string): Promise<
     });
 
     const lockXml = lockDiscoveryXml({ ...lock, createdAt: lock.createdAt, expiresAt: lock.expiresAt }, davPath);
-    const lockDiscovery = `<D:lockdiscovery>${lockXml}</D:lockdiscovery>`;
-    const status = isRefresh ? 200 : 200; // 刷新和新建都回 200 + Lock-Token
-    return new Response(lockDiscovery, {
+    // RFC 4918 §9.10.4：LOCK 成功响应体是 <D:prop> 里的 <D:lockdiscovery>，
+    // 不是裸的 <D:lockdiscovery>。裸的会让客户端解析失败。
+    const status = 200;
+    return new Response(lockXml, {
       status,
       headers: {
         'content-type': 'application/xml; charset=utf-8',
@@ -400,13 +400,15 @@ async function handleGet(
     // 关键：302 跳到 R2 公开自定义域。
     // 下载字节完全不过 Worker —— 不占 CPU/内存，也不会被 100MB 请求体上限卡住；
     // R2 出网本来就免费，还能被 CDN 缓存。
-    return new Response(null, {
-      status: 302,
-      headers: {
-        location: `${cfg.r2PublicBase}/${encodeR2Key(book.r2_key)}`,
-        'cache-control': 'no-store',
-      },
-    });
+    const headers: Record<string, string> = {
+      location: `${cfg.r2PublicBase}/${encodeR2Key(book.r2_key)}`,
+      'cache-control': 'no-store',
+      'accept-ranges': 'bytes',
+    };
+    // 断点续传：客户端带 Range 时，把 Range 透传到 R2 的 Location。
+    // 302 跟随方（curl/浏览器）会原样转发 Range 给目标，R2 支持 Range 返回 206。
+    // 这里显式声明 Accept-Ranges 让客户端知道支持分段。
+    return new Response(null, { status: 302, headers });
   }
 
   // 目录：给浏览器一个简单的 HTML 列表，并让 CDN 缓存，重复浏览不消耗 Worker 请求。

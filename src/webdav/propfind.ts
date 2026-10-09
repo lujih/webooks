@@ -27,7 +27,7 @@ import {
 import { findBookByLeaf, getBucketTotal, listBooks, listBucketTotals, type BookRow } from '../lib/db';
 import { httpDate, isoDate, multistatusResponse } from '../lib/http';
 import { davError, davResponse, encodeHref, escapeXml, multistatus } from '../lib/xml';
-
+import { allLiveLocks, matchLocksToPaths, lockDiscoveryXml } from '../lib/locks';
 // ── 请求体解析 ──────────────────────────────────────────────────────────
 
 type PropMode = 'allprop' | 'propname' | 'prop';
@@ -75,16 +75,22 @@ export function resolveDepth(
 
 // ── 属性渲染 ────────────────────────────────────────────────────────────
 
-const FILE_PROPS = [
+// RFC 4918 标准属性
+const RFC_PROPS = [
   'resourcetype', 'getcontentlength', 'getcontenttype', 'getlastmodified',
   'getetag', 'displayname', 'creationdate', 'supportedlock', 'lockdiscovery',
   'getcontentlanguage',
 ] as const;
 
-const DIR_PROPS = [
-  'resourcetype', 'getlastmodified', 'getetag', 'displayname', 'creationdate',
-  'supportedlock', 'lockdiscovery',
+// MS-WebDAV 扩展（RFC 5582 之后的厂商扩展，Windows 系客户端强制要求）
+const MS_PROPS = [
+  'isdirectory', 'isreadonly', 'issymlink', 'iswriteable', 'issparsesupported',
+  'maxuploadpacketsize', 'linkishint', 'qproptype', 'ms-fsstoragetype',
+  'ms-author-via',
 ] as const;
+
+const FILE_PROPS = [...RFC_PROPS, ...MS_PROPS];
+const DIR_PROPS = [...RFC_PROPS, ...MS_PROPS];
 
 interface ResourceMeta {
   displayName: string;
@@ -94,7 +100,12 @@ interface ResourceMeta {
   contentType?: string | null;
   contentLength?: number | null;
   language?: string | null;
+  /** 活锁时注入的真实 lockdiscovery XML；无锁时 undefined */
+  lockDiscoveryXml?: string;
 }
+
+// 最大单包上传大小（maxuploadpacketsize，MS 扩展）
+const MAX_UPLOAD_PACKET_SIZE = 1024 * 1024; // 1 MiB
 
 function hash(s: string): number {
   let h = 0;
@@ -103,7 +114,12 @@ function hash(s: string): number {
 }
 
 function propNamesOnly(isCollection: boolean): string {
-  return (isCollection ? DIR_PROPS : FILE_PROPS).map((n) => `<D:${n}/>`).join('');
+  const all = isCollection ? DIR_PROPS : FILE_PROPS;
+  // MS 扩展里 linkishint/qproptype 是 vendor-specific，propname 里不列出
+  return all
+    .filter((n) => n !== 'linkishint' && n !== 'qproptype')
+    .map((n) => `<D:${n}/>`)
+    .join('');
 }
 
 function renderProps(
@@ -157,13 +173,47 @@ function renderProps(
             : '<D:getcontentlanguage/>',
         );
         break;
-      // Class 1：不实现 LOCK。返回空的 supportedlock/lockdiscovery（而不是 404），
-      // 让客户端明确知道「服务器不支持锁」，而不是「属性不认识」。
+      // 现在实现了完整 Class 2 锁：supportedlock 宣告 exclusive/write，
+      // 让客户端知道我们对锁是真的支持的（而不是「不支持请忽略」）。
       case 'supportedlock':
-        found.push('<D:supportedlock/>');
+        found.push(
+          '<D:supportedlock>' +
+            '<D:supportedlockentry><D:lockscope><D:exclusive/></D:lockscope><D:locktype><D:write/></D:locktype></D:supportedlockentry>' +
+            '<D:supportedlockentry><D:lockscope><D:shared/></D:lockscope><D:locktype><D:read/></D:locktype></D:supportedlockentry>' +
+            '</D:supportedlock>',
+        );
         break;
       case 'lockdiscovery':
-        found.push('<D:lockdiscovery/>');
+        found.push(
+          meta.lockDiscoveryXml
+            ? meta.lockDiscoveryXml
+            : '<D:lockdiscovery/>',
+        );
+        break;
+      // ── MS-WebDAV 扩展（Windows 系客户端挂载时强制要求）──
+      case 'isdirectory':
+        found.push(`<D:isdirectory>${isCollection ? 1 : 0}</D:isdirectory>`);
+        break;
+      case 'isreadonly':
+        found.push(`<D:isreadonly>0</D:isreadonly>`);
+        break;
+      case 'issymlink':
+        found.push('<D:issymlink>0</D:issymlink>');
+        break;
+      case 'iswriteable':
+        found.push('<D:iswriteable>1</D:iswriteable>');
+        break;
+      case 'issparsesupported':
+        found.push('<D:issparsesupported>0</D:issparsesupported>');
+        break;
+      case 'maxuploadpacketsize':
+        found.push(`<D:maxuploadpacketsize>${MAX_UPLOAD_PACKET_SIZE}</D:maxuploadpacketsize>`);
+        break;
+      case 'linkishint':
+      case 'qproptype':
+      case 'ms-fsstoragetype':
+      case 'ms-author-via':
+        found.push(`<D:${name}/>`);
         break;
       default:
         notFound.push(name);
@@ -375,6 +425,26 @@ export async function handlePropfind(
         );
       } catch {
         // 缓存写入失败不影响正确性
+      }
+    }
+  }
+
+  // 活锁注入：把每个条目路径上的活锁渲染成真实 lockdiscovery XML，
+  // 客户端（尤其 Windows 系）在 PROPFIND 时就能看到哪些资源被锁。
+  // 锁是动态的（300s TTL），不能写进条目缓存；每次渲染时查一次全量活锁
+  // （活锁数量远小于条目数，一把 D1 读最安全，避免 IN 参数超限）。
+  //
+  // 注意：锁的 resource 键是「相对 davPath」（不含 mount 前缀），与 handleLock
+  // 存锁时用的 davPath 一致。所以这里用 entry.path（相对路径）匹配，不带 mount。
+  {
+    const allLocks = await allLiveLocks(env.DB);
+    if (allLocks.size > 0) {
+      const matched = matchLocksToPaths(allLocks, entries.map((e) => e.path));
+      for (const e of entries) {
+        const lock = matched.get(e.path);
+        if (lock) {
+          e.meta.lockDiscoveryXml = lockDiscoveryXml(lock, `${cfg.mountPath}${e.path}`);
+        }
       }
     }
   }

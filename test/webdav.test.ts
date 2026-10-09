@@ -169,8 +169,9 @@ describe('PROPFIND', () => {
 
     const res = await propfind('/title/A/', '1');
     const xml = await res.text();
-    // self + 200 本书 + 1 个"第 2 页"目录
-    expect(Number(res.headers.get('x-dav-entries'))).toBe(202);
+    // self + MAX_ENTRIES 本书 + 1 个"第 2 页"目录
+    const MAX = 200; // config.ts 里 HARD_MAX_ENTRIES / 默认值
+    expect(Number(res.headers.get('x-dav-entries'))).toBe(MAX + 2);
     expect(xml).toContain('<D:href>/dav/title/A/2/</D:href>');
     expect(xml).not.toContain('<D:href>/dav/title/A/2/3/</D:href>');
 
