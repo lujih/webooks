@@ -128,7 +128,7 @@ async function main() {
       body: '<?xml version="1.0"?><D:lockinfo xmlns:D="DAV:"><D:locktype><D:write/></D:locktype><D:lockscope><D:exclusive/></D:lockscope><D:depth>infinity</D:depth></D:lockinfo>',
     });
     lockToken = res.headers.get('lock-token');
-    const ok = res.status === 200 && !!lockToken && res.body.includes('<D:lockdiscovery>');
+    const ok = res.status === 200 && !!lockToken && body.includes('<D:lockdiscovery>');
     record(ok, 'LOCK 根（Depth:infinity）→ 200 + Lock-Token',
       `status=${res.status} token=${lockToken ?? '(无)'}`, 'RFC 4918 §9.10');
   }
