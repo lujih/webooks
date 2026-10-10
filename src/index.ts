@@ -12,6 +12,7 @@ import { handleAdmin } from './api/admin';
 import { handleUploadComplete, handleUploadInit } from './api/upload';
 import { settings, type Env, type Settings } from './config';
 import { textResponse } from './lib/http';
+import { indexHtml } from './home-page';
 import { uploadHtml } from './upload-page';
 import { handleDav } from './webdav';
 
@@ -62,7 +63,7 @@ export default {
     }
 
     if (path === '/' || path === '') {
-      return new Response(indexHtml(cfg), {
+      return new Response(indexHtml(cfg.mountPath, cfg.r2PublicBase), {
         status: 200,
         headers: {
           'content-type': 'text/html; charset=utf-8',
@@ -108,31 +109,3 @@ async function guarded(run: () => Promise<Response>): Promise<Response> {
   }
 }
 
-function indexHtml(cfg: Settings): string {
-  const mount = `${cfg.mountPath}/`;
-  return `<!doctype html>
-<html lang="zh-CN"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>webooks</title>
-<style>
-  body{font:16px/1.7 system-ui,-apple-system,"Segoe UI",sans-serif;max-width:44rem;margin:3rem auto;padding:0 1rem;color:#1a1a1a}
-  h1{font-size:1.3rem}
-  code,pre{background:#f4f4f5;border-radius:4px;font-size:.9em}
-  code{padding:.15em .4em}
-  pre{padding:.8rem 1rem;overflow-x:auto}
-  li{margin:.3rem 0}
-</style></head>
-<body>
-<h1>webooks</h1>
-<p>Cloudflare Workers Free + R2 上的 WebDAV 电子书库。</p>
-<ul>
-  <li>WebDAV 端点：<a href="${mount}"><code>${mount}</code></a></li>
-  <li>健康检查：<code>/health</code></li>
-</ul>
-<p>客户端挂载建议用 rclone，并把目录缓存拉长以节省每日请求额度：</p>
-<pre><code>rclone mount webooks: /mnt/books \\
-  --dir-cache-time 24h --poll-interval 0 --vfs-cache-mode off</code></pre>
-<p>注意：WebDAV 每个请求都会消耗 Workers Free 每天 100,000 次的额度。
-能讲 S3 的客户端（rclone、脚本）请直接连 R2 的 S3 端点，那样是 0 次 Worker 请求。</p>
-</body></html>`;
-}
