@@ -7,6 +7,11 @@ dist/
 .dev.vars
 .wrangler/state/
 
+# 构建/截图产物（本地验证用，不入库）
+.dryrun/
+shots/
+home-preview.png
+
 # 编辑器
 .vscode/
 .idea/

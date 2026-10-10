@@ -26,7 +26,17 @@ export interface EpubMeta {
   cover: { bytes: ArrayBuffer; contentType: string } | null;
 }
 
-const COVER_CAP = 2 * 1024 * 1024; // 封面图 > 2MB 时放弃（避免 R2 存大图 + 列表页拉大图）
+/**
+ * 封面体积上限。
+ *
+ * 实测教训：原设 2MB 导致真实书被误判为「无封面」——中文网文导出工具常把封面
+ * 存成 2.5–3MB 的高清 PNG。丢掉封面比多存几 MB 的代价大得多（封面是书架页的
+ * 核心视觉），所以放宽到 8MB，覆盖绝大多数真实情况。
+ *
+ * 页面重量由浏览页控制：`<img loading="lazy">` + 固定小尺寸显示，
+ * 只有滚动进视口的封面才会真正下载。典型 EPUB 封面 50–500KB，实际可接受。
+ */
+const COVER_CAP = 8 * 1024 * 1024;
 
 /** 容器名有大小写/前缀差异（`META-INF/` vs `Meta-inf/`），按「不区分大小写」匹配 */
 function findEntry(
@@ -101,26 +111,53 @@ export async function parseEpub(buf: ArrayBuffer): Promise<EpubMeta | null> {
   const author = xmlText(opf, 'dc:creator') ?? xmlText(opf, 'creator');
   const language = xmlText(opf, 'dc:language') ?? xmlText(opf, 'language');
 
-  // 封面：优先 EPUB3 的 <meta property="ebooks:cover">；再回退到 item properties="cover-image"
+  // 封面：三条线索按可靠性依次尝试
+  //   1. EPUB2 最常用：<meta name="cover" content="<item-id>"/>
+  //      —— 真实世界绝大多数 EPUB（Calibre / Sigil / 各类导出工具）走这条
+  //   2. EPUB3 正式写法：<item properties="cover-image"/>
+  //   3. 部分工具：<meta property="ebooks:cover"><item-id></meta>
   let coverId: string | null = null;
-  const metaCover = opf.match(
-    /<meta[^>]*property\s*=\s*"ebooks:cover"[^>]*>([\w-]+)<\/meta>/i,
-  );
-  if (metaCover) coverId = stripTags(metaCover[1] ?? '');
 
-  const itemRe = /<item\b([^>]*)>/gi;
+  // (1) EPUB2 <meta name="cover" content="cover-img"/>
+  const metaNameCover = opf.match(
+    /<meta[^>]*\bname\s*=\s*"cover"[^>]*\bcontent\s*=\s*"([^"]+)"/i,
+  );
+  if (metaNameCover) coverId = metaNameCover[1]!.trim();
+
+  // (3) <meta property="ebooks:cover">id</meta>
+  if (!coverId) {
+    const metaPropCover = opf.match(
+      /<meta[^>]*property\s*=\s*"ebooks:cover"[^>]*>([\w-]+)<\/meta>/i,
+    );
+    if (metaPropCover) coverId = stripTags(metaPropCover[1] ?? '');
+  }
+
+  // 遍历 manifest：命中 coverId 的 item，或 (2) 带 properties="cover-image" 的 item
+  const itemRe = /<item\b([^>]*?)\/?>/gi;
   let mItem: RegExpExecArray | null;
   let itemAttrs: string | null = null;
+  let propsAttrs: string | null = null;
+  let propsId: string | null = null;
   while ((mItem = itemRe.exec(opf)) !== null) {
     const attrs = mItem[1] ?? '';
     const id = attrs.match(/\bid\s*=\s*"([^"]+)"/i)?.[1] ?? null;
-    if (id && id === coverId) { itemAttrs = attrs; break; }
-    const props = attrs.match(/\bproperties\s*=\s*"([^"]+)"/i)?.[1] ?? '';
-    if (/cover-image/.test(props)) {
-      coverId = id;
+    // 精确命中 meta 声明的封面 id
+    if (coverId && id === coverId) {
       itemAttrs = attrs;
       break;
     }
+    // 记下 cover-image 属性作为回退（EPUB3），继续找精确命中
+    if (!propsAttrs) {
+      const props = attrs.match(/\bproperties\s*=\s*"([^"]+)"/i)?.[1] ?? '';
+      if (/(^|\s)cover-image(\s|$)/.test(props)) {
+        propsAttrs = attrs;
+        propsId = id;
+      }
+    }
+  }
+  if (!itemAttrs && propsAttrs) {
+    itemAttrs = propsAttrs;
+    coverId = propsId;
   }
 
   let cover: EpubMeta['cover'] = null;

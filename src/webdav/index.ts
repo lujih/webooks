@@ -16,6 +16,7 @@ import {
   lockDiscoveryXml,
 } from '../lib/locks';
 import { collectDavEntries, handlePropfind, type Entry } from './propfind';
+import { renderBrowsePage } from '../browse-page';
 import { escapeXml } from '../lib/xml';
 
 const ALLOW = 'OPTIONS, GET, HEAD, PROPFIND, PROPPATCH, MKCOL, LOCK, UNLOCK, PUT, DELETE, COPY, MOVE';
@@ -444,45 +445,7 @@ function encodeR2Key(key: string): string {
 }
 
 export function renderHtmlIndex(davPath: string, entries: Entry[], mountPath: string): string {
-  const rows = entries
-    .filter((e) => e.path !== davPath)
-    .map((e) => {
-      const label = e.isCollection ? `${e.meta.displayName}/` : e.meta.displayName;
-      const size = e.isCollection ? '' : ` <span class="sz">${formatSize(e.meta.contentLength ?? 0)}</span>`;
-      return `<li><a href="${escapeAttr(`${mountPath}${e.path}`)}">${escapeAttr(label)}</a>${size}</li>`;
-    })
-    .join('\n');
-
-  return `<!doctype html>
-<html lang="zh-CN"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>${escapeAttr(davPath)} — webooks</title>
-<style>
-  body{font:15px/1.6 system-ui,-apple-system,"Segoe UI",sans-serif;max-width:52rem;margin:2rem auto;padding:0 1rem;color:#1a1a1a}
-  h1{font-size:1.05rem;font-weight:600;border-bottom:1px solid #e5e5e5;padding-bottom:.5rem;word-break:break-all}
-  ul{list-style:none;padding:0}li{padding:.15rem 0}
-  a{color:#0b62d0;text-decoration:none}a:hover{text-decoration:underline}
-  .sz{color:#999;font-size:.85em}
-  footer{margin-top:2rem;color:#888;font-size:.85rem}
-</style></head>
-<body>
-<h1>${escapeAttr(davPath)}</h1>
-<ul>${rows}</ul>
-<footer>WebDAV 端点 <code>/dav/</code> · 客户端挂载建议用 rclone（见 README）</footer>
-</body></html>`;
-}
-
-function formatSize(bytes: number): string {
-  if (bytes < 1024) return `${bytes} B`;
-  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
-  if (bytes < 1024 * 1024 * 1024) return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
-  return `${(bytes / 1024 / 1024 / 1024).toFixed(2)} GB`;
-}
-
-function escapeAttr(s: string): string {
-  return s.replace(/[&<>"']/g, (c) =>
-    ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c] as string,
-  );
+  return renderBrowsePage(davPath, entries, mountPath);
 }
 
 // ── 写 ──────────────────────────────────────────────────────────────────
@@ -534,8 +497,14 @@ async function handlePut(request: Request, env: Env, node: DavNode, davPath: str
             httpMetadata: { contentType: coverType },
           });
         }
-      } catch {
-        // 解析失败不影响写入，退回文件名推导
+      } catch (err) {
+        // 解析失败不影响写入，退回文件名推导。但要留痕，否则「有封面却判无封面」
+        // 这类问题会静默消失（真实踩过：封面 inflate 失败被空 catch 吞掉）。
+        console.error('[epub-parse] failed', {
+          leafName,
+          bytes: buf.byteLength,
+          err: err instanceof Error ? `${err.name}: ${err.message}` : String(err),
+        });
       }
     } else {
       // 超大 EPUB：不落完整字节也能存（R2 流式），但不解析

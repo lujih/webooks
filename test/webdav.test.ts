@@ -3,7 +3,7 @@
 import { SELF } from 'cloudflare:test';
 import { beforeEach, describe, expect, it } from 'vitest';
 import { letterBucket } from '../src/lib/collections';
-import { rebuildBuckets, upsertBookStatement } from '../src/lib/db';
+import { rebuildBuckets, upsertBook, upsertBookStatement } from '../src/lib/db';
 import { deriveMetadata } from '../src/lib/metadata';
 import { clearDavCache, resetLibrary, testEnv } from './setup';
 
@@ -48,6 +48,68 @@ async function seed(leafNames: string[]): Promise<void> {
 beforeEach(async () => {
   await resetLibrary();
   await clearDavCache(ALL_PATHS);
+});
+
+// ── 回归：upsert 必须更新 cover_key / description ────────────────────────
+// 真实踩过：ON CONFLICT DO UPDATE 漏了 cover_key，导致「覆盖上传」一本书后
+// 新解析出的封面永不出现在 D1（R2 里封面对象明明已经写好）。
+
+describe('upsertBook 的覆盖语义', () => {
+  const base = (over: Record<string, unknown> = {}) => ({
+    id: 'bk-1',
+    leafName: 'a.epub',
+    title: '甲',
+    author: null,
+    language: null,
+    format: 'epub',
+    contentType: 'application/epub+zip',
+    size: 10,
+    sha256: null,
+    r2Key: 'books/bk-1',
+    etag: 'e1',
+    titleLetter: 'O',
+    authorLetter: 'O',
+    formatBucket: 'epub',
+    publishedAt: new Date().toISOString(),
+    ...over,
+  });
+
+  it('新建时写入 cover_key', async () => {
+    await upsertBook(testEnv.DB, base({ coverKey: 'covers/bk-1.jpg' }) as never);
+    const row = await testEnv.DB.prepare('SELECT cover_key FROM books WHERE id = ?')
+      .bind('bk-1').first<{ cover_key: string | null }>();
+    expect(row?.cover_key).toBe('covers/bk-1.jpg');
+  });
+
+  it('覆盖时也要更新 cover_key（不能保留旧值）', async () => {
+    await upsertBook(testEnv.DB, base({ coverKey: null }) as never);
+    let row = await testEnv.DB.prepare('SELECT cover_key FROM books WHERE id = ?')
+      .bind('bk-1').first<{ cover_key: string | null }>();
+    expect(row?.cover_key).toBeNull();
+
+    // 同一 id 再写一次，这次带上了封面
+    await upsertBook(testEnv.DB, base({ coverKey: 'covers/bk-1.png' }) as never);
+    row = await testEnv.DB.prepare('SELECT cover_key FROM books WHERE id = ?')
+      .bind('bk-1').first<{ cover_key: string | null }>();
+    expect(row?.cover_key).toBe('covers/bk-1.png');
+  });
+
+  it('覆盖时也要更新 description', async () => {
+    await upsertBook(testEnv.DB, base({ description: null }) as never);
+    await upsertBook(testEnv.DB, base({ description: '新简介' }) as never);
+    const row = await testEnv.DB.prepare('SELECT description FROM books WHERE id = ?')
+      .bind('bk-1').first<{ description: string | null }>();
+    expect(row?.description).toBe('新简介');
+  });
+
+  it('覆盖时标题/作者也被更新（基本前提）', async () => {
+    await upsertBook(testEnv.DB, base({ title: '旧名', author: '旧作者' }) as never);
+    await upsertBook(testEnv.DB, base({ title: '新名', author: '新作者' }) as never);
+    const row = await testEnv.DB.prepare('SELECT title, author FROM books WHERE id = ?')
+      .bind('bk-1').first<{ title: string; author: string | null }>();
+    expect(row?.title).toBe('新名');
+    expect(row?.author).toBe('新作者');
+  });
 });
 
 // ── OPTIONS / 协议声明 ──────────────────────────────────────────────────

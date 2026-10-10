@@ -95,7 +95,10 @@ describe('/upload 页面', () => {
     expect(res.status).toBe(200);
     expect(res.headers.get('content-type')).toContain('text/html');
     const html = await res.text();
-    expect(html).toContain('上传书籍');
+    expect(html).toContain('上架一本书');
     expect(html).toContain('/api/upload/init');
+    // 拖放区必须键盘可达（role=button + tabindex）
+    expect(html).toContain('id="drop"');
+    expect(html).toContain('role="button"');
   });
 });

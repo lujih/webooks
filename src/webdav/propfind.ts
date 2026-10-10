@@ -102,6 +102,10 @@ interface ResourceMeta {
   language?: string | null;
   /** 活锁时注入的真实 lockdiscovery XML；无锁时 undefined */
   lockDiscoveryXml?: string;
+  /** 浏览器目录页用的展示字段（不参与 WebDAV 协议，只在 HTML 渲染时读） */
+  author?: string | null;
+  coverUrl?: string | null;
+  format?: string | null;
 }
 
 // 最大单包上传大小（maxuploadpacketsize，MS 扩展）
@@ -232,7 +236,7 @@ export interface Entry {
   meta: ResourceMeta;
 }
 
-function bookEntry(collection: CollectionId, bucket: string, book: BookRow): Entry {
+function bookEntry(collection: CollectionId, bucket: string, book: BookRow, r2PublicBase: string): Entry {
   const def = COLLECTIONS[collection];
   return {
     path: def.bucketed
@@ -248,6 +252,10 @@ function bookEntry(collection: CollectionId, bucket: string, book: BookRow): Ent
       contentType: book.content_type,
       contentLength: book.size,
       language: book.language,
+      // 浏览器目录页展示用（WebDAV 客户端不读这些）
+      author: book.author,
+      format: book.format_bucket || book.format,
+      coverUrl: book.cover_key ? `${r2PublicBase}/${book.cover_key}` : null,
     },
   };
 }
@@ -312,7 +320,7 @@ export async function collectDavEntries(
       if (depth === 0) return entries;
 
       const books = await listBooks(env.DB, node.collection, node.bucket, offset, cfg.maxEntries);
-      for (const book of books) entries.push(bookEntry(node.collection, node.bucket, book));
+      for (const book of books) entries.push(bookEntry(node.collection, node.bucket, book, cfg.r2PublicBase));
 
       // 分页子目录只在第 1 页列出：/title/A/2/ 是 /title/A/ 的子节点，
       // 它自己的子节点只有书 —— 否则第 2 页会列出一个指向自己的「第 2 页」。
@@ -335,7 +343,7 @@ export async function collectDavEntries(
       if (!book) return null;
       // 叶子按 leaf_name 全局唯一查找，因此对路径宽容：
       // 即使客户端 PUT 到的桶与书的实际分桶不一致，也能取到文件。
-      return [bookEntry(node.collection, node.bucket, book)];
+      return [bookEntry(node.collection, node.bucket, book, cfg.r2PublicBase)];
     }
 
     default:

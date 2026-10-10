@@ -1,1 +1,0 @@
-This folder contains the built output assets for the worker "webooks" generated at 2026-10-09T16:00:03.150Z.

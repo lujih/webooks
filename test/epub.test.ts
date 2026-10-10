@@ -203,4 +203,62 @@ describe('parseEpub', () => {
     const meta = await parseEpub(zip);
     expect(meta!.title).toBe('三国 卷一');
   });
+
+  // ── 回归：真实 EPUB 暴露的两个封面提取缺陷 ──────────────────────────
+
+  it('EPUB2 写法 <meta name="cover" content="id"> 也能提取封面', async () => {
+    // 真实世界绝大多数 EPUB（Calibre/Sigil/各类导出工具）只写这个，不写
+    // properties="cover-image"。之前只认 EPUB3 两种写法，导致有封面却判为无封面。
+    const opfEpub2 = `<?xml version="1.0" encoding="UTF-8"?>
+<package xmlns="http://www.idpf.org/2007/opf" version="2.0" unique-identifier="uid">
+  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/">
+    <dc:title>旧格式书</dc:title>
+    <dc:creator>某作者</dc:creator>
+    <meta name="cover" content="cover-img"/>
+  </metadata>
+  <manifest>
+    <item href="cover.jpg" id="cover-img" media-type="image/jpeg"/>
+    <item href="ch1.xhtml" id="ch1" media-type="application/xhtml+xml"/>
+  </manifest>
+</package>`;
+    const zip = buildZip([
+      ['META-INF/container.xml', CONTAINER],
+      ['OEBPS/content.opf', opfEpub2],
+      ['OEBPS/cover.jpg', tinyJpeg()],
+    ]);
+    const meta = await parseEpub(zip);
+    expect(meta!.title).toBe('旧格式书');
+    expect(meta!.cover).not.toBeNull();
+    expect(meta!.cover!.contentType).toBe('image/jpeg');
+    expect(meta!.cover!.bytes.byteLength).toBe(tinyJpeg().byteLength);
+  });
+
+  it('封面 > 2MB（真实现象）不再被丢弃', async () => {
+    // 实测教训：中文网文导出工具常把封面存成 2.5–3MB 高清 PNG，
+    // 旧的 2MB 上限会把它们误判为「无封面」。
+    const bigCover = new Uint8Array(3 * 1024 * 1024);
+    bigCover.set(tinyJpeg(), 0);
+    const zip = buildZip([
+      ['META-INF/container.xml', CONTAINER],
+      ['OEBPS/content.opf', OPF],
+      ['OEBPS/images/cover.jpg', bigCover],
+    ]);
+    const meta = await parseEpub(zip);
+    expect(meta!.cover).not.toBeNull();
+    expect(meta!.cover!.bytes.byteLength).toBe(bigCover.byteLength);
+  });
+
+  it('自闭合 <item ... /> 与带空格的 properties 也能匹配', async () => {
+    const opfSelfClose = OPF.replace(
+      '<item id="cover" href="images/cover.jpg" media-type="image/jpeg" properties="cover-image"/>',
+      '<item id="cover" href="images/cover.jpg" media-type="image/jpeg" properties="cover-image" />',
+    );
+    const zip = buildZip([
+      ['META-INF/container.xml', CONTAINER],
+      ['OEBPS/content.opf', opfSelfClose],
+      ['OEBPS/images/cover.jpg', tinyJpeg()],
+    ]);
+    const meta = await parseEpub(zip);
+    expect(meta!.cover).not.toBeNull();
+  });
 });

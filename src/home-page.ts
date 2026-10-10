@@ -13,6 +13,8 @@
  * 所有链接指向 WebDAV 目录树与上传页，保持与后端路由一致。
  */
 
+import { themeCss } from './lib/theme';
+
 export function indexHtml(mountPath: string, r2PublicBase: string | null): string {
   const mount = `${mountPath}/`;
   const shelves = [
@@ -43,55 +45,8 @@ export function indexHtml(mountPath: string, r2PublicBase: string | null): strin
 <title>webooks · 公共电子书库</title>
 <meta name="description" content="webooks —— 架在 Cloudflare Workers Free + R2 上的开放 WebDAV 电子书库。任何人都可以上传、浏览、下载。">
 <style>
-  :root{
-    --ink:#0e0c0a;          /* 墨黑 */
-    --ink2:#1a1714;         /* 柜木 */
-    --paper:#f3ead8;        /* 纸 */
-    --paper-dim:#cfc4ad;    /* 旧纸 */
-    --glow:#ffb44d;         /* 琥珀烛光 */
-    --glow-deep:#d97a1a;
-    --line:rgba(255,180,77,.18);
-    --serif:"Songti SC","STSong","SimSun","Noto Serif SC",serif;
-    --sans:-apple-system,"PingFang SC","Microsoft YaHei","Segoe UI",sans-serif;
-  }
-  *{box-sizing:border-box;margin:0}
-  html{scroll-behavior:smooth}
-  body{
-    min-height:100vh;
-    font-family:var(--sans);
-    color:var(--paper);
-    background:
-      radial-gradient(120% 80% at 50% -10%, #241d15 0%, transparent 55%),
-      radial-gradient(90% 60% at 85% 110%, #1d1710 0%, transparent 60%),
-      var(--ink);
-    position:relative;
-    overflow-x:hidden;
-  }
-  /* 纸张噪点 + 烛光呼吸 */
-  body::before{
-    content:"";position:fixed;inset:0;z-index:0;pointer-events:none;
-    background-image:
-      repeating-linear-gradient(0deg,rgba(255,255,255,.012) 0 1px,transparent 1px 3px),
-      repeating-linear-gradient(90deg,rgba(255,255,255,.01) 0 1px,transparent 1px 3px);
-    mix-blend-mode:screen;
-  }
-  body::after{
-    content:"";position:fixed;z-index:0;pointer-events:none;
-    width:60vmax;height:60vmax;left:50%;top:-18vmax;
-    transform:translateX(-50%);
-    background:radial-gradient(circle,rgba(255,170,60,.14) 0%,transparent 62%);
-    filter:blur(30px);
-    animation:breathe 7s ease-in-out infinite;
-  }
-  @keyframes breathe{0%,100%{opacity:.55;transform:translateX(-50%) scale(1)}50%{opacity:.9;transform:translateX(-50%) scale(1.06)}}
-
-  .wrap{position:relative;z-index:1;max-width:56rem;margin:0 auto;padding:4.5rem 1.4rem 3rem}
-
-  /* ── 载入浮现 ── */
-  .reveal{opacity:0;transform:translateY(14px);animation:up .7s cubic-bezier(.2,.7,.2,1) forwards}
-  @keyframes up{to{opacity:1;transform:none}}
-
-  /* ── 顶栏 ── */
+${themeCss()}
+  /* 顶栏 */
   header{display:flex;align-items:baseline;gap:.8rem;flex-wrap:wrap}
   .mark{font-family:var(--serif);font-size:1.15rem;letter-spacing:.35em;color:var(--glow)}
   .mark b{font-weight:400}
@@ -194,20 +149,9 @@ export function indexHtml(mountPath: string, r2PublicBase: string | null): strin
     position:absolute;left:0;top:.1em;
     font-family:var(--serif);color:var(--glow);font-size:.95rem;letter-spacing:.05em;
   }
-  .howto code{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:.85em;background:rgba(255,180,77,.1);color:var(--glow);padding:.12em .45em;border-radius:3px}
+  .howto code{font-family:var(--mono);font-size:.85em;background:rgba(255,180,77,.1);color:var(--glow);padding:.12em .45em;border-radius:var(--r1)}
 
-  /* ── 页脚 ── */
-  footer{margin-top:3.4rem;padding-top:1.4rem;border-top:1px solid var(--line);display:flex;flex-wrap:wrap;gap:.6rem 1.4rem;font-size:.78rem;color:var(--paper-dim)}
-  footer a{color:var(--paper-dim);text-decoration:none;border-bottom:1px dotted rgba(207,196,173,.4)}
-  footer a:hover{color:var(--glow);border-color:var(--glow)}
-  .lamps{display:inline-flex;gap:.4rem}
-  .lamps i{width:6px;height:6px;border-radius:50%;background:var(--glow);box-shadow:0 0 8px var(--glow);animation:flicker 3s ease-in-out infinite}
-  .lamps i:nth-child(2){animation-delay:.6s}.lamps i:nth-child(3){animation-delay:1.3s}
-  @keyframes flicker{0%,100%{opacity:.5}50%{opacity:1}}
-
-  @media (prefers-reduced-motion:reduce){
-    .reveal,.shelf,.howto li,body::after,.lamps i{animation:none!important;opacity:1!important;transform:none!important}
-  }
+  /* ── 响应式 ── */
   @media (max-width:520px){
     .shelves{grid-template-columns:1fr 1fr}
     .spine{width:40px;height:56px;font-size:1.25rem}
@@ -249,13 +193,13 @@ ${shelfHtml}
     </ol>
   </section>
 
-  <footer class="reveal" style="animation-delay:1s">
+  <footer class="site-foot reveal" style="animation-delay:1s">
     <span class="lamps" aria-hidden="true"><i></i><i></i><i></i></span>
     <span>webooks · 免费层 · 匿名开放 · 无审核自动上架</span>
     <a href="/health">健康检查</a>
-    <a href="/upload">上传页</a>
+    <a href="/upload">上架一本</a>
     ${r2PublicBase ? `<a href="${r2PublicBase}">R2 直链</a>` : ''}
-    <span style="margin-left:auto;font-family:var(--serif);letter-spacing:.1em">100,000 req/day 免费额度</span>
+    <span style="margin-left:auto;font-family:var(--serif);letter-spacing:.08em">100,000 req/day</span>
   </footer>
 
 </div>

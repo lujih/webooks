@@ -163,6 +163,11 @@ export function upsertBookStatement(db: D1Database, b: UpsertBookInput): D1Prepa
          author_letter = excluded.author_letter,
          format_bucket = excluded.format_bucket,
          published_at = excluded.published_at,
+         -- cover_key / description 必须一起更新：否则「覆盖上传」一本书后，
+         -- 新解析出的封面与简介永远不会写进去（真实踩过：重传带封面的 EPUB，
+         -- R2 里封面对象已存在，但 D1 行的 cover_key 始终保持旧值 null）。
+         cover_key = excluded.cover_key,
+         description = excluded.description,
          updated_at = excluded.updated_at,
          status = excluded.status`,
     )
