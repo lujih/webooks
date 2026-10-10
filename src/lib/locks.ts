@@ -10,8 +10,9 @@
  *   · 不做 If 条件里的 (locktoken) 精确匹配 —— 我们只对「持锁者刷新」放行，
  *     其他写一律 423。真正的「带 If: (<token>) 写他人资源」场景在只读浏览
  *     + 单用户上传的模型里不会出现。
- *   · 不做锁继承（shared 锁挂在集合上覆盖子资源）—— 我们的目录是虚拟视图，
- *     客户端对目录加锁基本是「防并发上传同名文件」，按资源路径精确锁即可。
+ *   · 锁继承：Depth:1/infinity 的目录锁覆盖其子资源（祖先目录前缀匹配），
+ *     但根锁 `/` 的 Infinity 语义是「锁整个库」—— 对公共库这是可用性陷阱，
+ *     故根锁只做精确匹配（不覆盖子资源），除非显式 Depth:1。
  */
 
 export interface LockRow {
@@ -201,8 +202,9 @@ export function matchLocksToPaths(
     let hit: LockRow | undefined;
     for (const lock of locks.values()) {
       const r = lock.resource;
-      if (r === p || p.startsWith(r.endsWith('/') ? r : r + '/')) {
-        // 取最新过期的那条（最相关的锁）
+      // 精确匹配自身；或目录锁（尾斜杠、非根）的前缀匹配
+      const isAncestor = r !== '/' && r.endsWith('/') && p.startsWith(r);
+      if (r === p || isAncestor) {
         if (!hit || lock.expiresAt > hit.expiresAt) hit = lock;
       }
     }
@@ -213,7 +215,11 @@ export function matchLocksToPaths(
 
 /**
  * Depth:1 集合锁的继承判定：资源 r 是否被「r 自身或任意祖先目录」上的活锁覆盖。
- * 一条 SQL 搞定（锁的 resource 路径前缀匹配），避免应用层逐层查 D1。
+ *
+ * 可用性问题（已踩过）：根锁 `/`（Depth:infinity）会前缀匹配整个库，
+ * 任意客户端对根加个锁就锁死全站上传。故：
+ *   · 根锁 `/` 仅精确匹配根本身，不覆盖子资源
+ *   · 目录锁（尾斜杠路径）按前缀覆盖其子树（Depth:1 语义）
  */
 export async function liveLockForResource(
   db: D1Database,
@@ -222,16 +228,10 @@ export async function liveLockForResource(
   const now = nowIso();
   const row = await db
     .prepare(
-      // 资源 r 被锁的判定：
-      //   (1) r 自身有锁          resource = ?
-      //   (2) r 的任意祖先目录有 Depth:1/infinity 锁
-      //       祖先目录锁的 resource 形如 '/recent/'（带尾斜杠）或 '/'
-      //       子资源 '/recent/child.epub' 应以该目录串为前缀
       `SELECT * FROM locks
         WHERE (
              resource = ?
-             OR (? LIKE resource || '%' AND resource LIKE '%/')
-             OR resource = '/'
+             OR (? LIKE resource || '%' AND resource != '/' AND resource LIKE '%/')
         )
         AND expires_at > ?
         ORDER BY (CASE WHEN resource = ? THEN 0 ELSE 1 END) ASC, expires_at DESC

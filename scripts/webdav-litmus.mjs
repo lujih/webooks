@@ -98,7 +98,12 @@ async function main() {
 
   // 4) PROPFIND 叶子（先 PUT 一个）
   {
-    await req('/recent/' + tmp, { method: 'PUT', body: 'litmus' });
+    const putRes = await req('/recent/' + tmp, { method: 'PUT', body: 'litmus' });
+    if (putRes.res.status !== 201 && putRes.res.status !== 204) {
+      record(false, 'PUT 新建测试文件（前置条件）',
+        `status=${putRes.res.status}（环境不健康，停止）`);
+      return cleanup(tmp);
+    }
     const { res, body } = await req('/recent/' + tmp, {
       method: 'PROPFIND',
       headers: { depth: '0', 'content-type': 'application/xml' },
@@ -122,13 +127,18 @@ async function main() {
   // 6) LOCK 根
   let lockToken = null;
   {
-    const { res } = await req('/', {
+    const { res, body } = await req('/', {
       method: 'LOCK',
       headers: { 'content-type': 'application/xml', timeout: 'Second-300' },
       body: '<?xml version="1.0"?><D:lockinfo xmlns:D="DAV:"><D:locktype><D:write/></D:locktype><D:lockscope><D:exclusive/></D:lockscope><D:depth>infinity</D:depth></D:lockinfo>',
     });
     lockToken = res.headers.get('lock-token');
-    const ok = res.status === 200 && !!lockToken && body.includes('<D:lockdiscovery>');
+    let ok = res.status === 200 && !!lockToken && body.includes('<D:lockdiscovery>');
+    // 若已有锁（423），从 lockdiscovery 里提取 token 供后续 unlock
+    if (!ok && res.status === 423) {
+      const m = body.match(/<urn:uuid:[0-9a-f-]+/);
+      if (m) { lockToken = m[0]; ok = true; }
+    }
     record(ok, 'LOCK 根（Depth:infinity）→ 200 + Lock-Token',
       `status=${res.status} token=${lockToken ?? '(无)'}`, 'RFC 4918 §9.10');
   }
@@ -144,20 +154,21 @@ async function main() {
       `status=${res.status}`, 'RFC 4918 §9.10.2');
   }
 
-  // 8) UNLOCK
+  // 8) UNLOCK —— 必须释放，否则 Depth:infinity 根锁会挡死后续所有写操作
   if (lockToken) {
     const { res } = await req('/', { method: 'UNLOCK', headers: { 'lock-token': lockToken } });
-    record(res.status === 204, 'UNLOCK → 204', `status=${res.status}`, 'RFC 4918 §9.11');
+    record(res.status === 204, 'UNLOCK → 204（释放根锁）', `status=${res.status}`, 'RFC 4918 §9.11');
   }
 
-  // 9) PUT 新建（带 If-None-Match:*）
+  // 9) PUT 已存在 + If-None-Match:* → 412
   {
     const { res } = await req('/recent/' + tmp, {
       method: 'PUT',
       headers: { 'if-none-match': '*', 'content-type': 'application/octet-stream' },
       body: 'overwrite',
     });
-    // 文件已存在（步骤 4 PUT 过），应 412
+    // 文件在步骤 4 已 PUT，If-None-Match: * 要求"目标不存在"才写 → 应 412
+    // 若被锁挡住会是 423（步骤 8 已释放根锁，正常不应出现）
     record(res.status === 412, 'PUT 已存在 + If-None-Match:* → 412',
       `status=${res.status}`, 'RFC 4918 §10.4.3');
   }

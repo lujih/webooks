@@ -41,13 +41,16 @@
   // database_name / database_id / bucket_name 填回来。
   "r2_buckets": [
     {
-      "binding": "BUCKET"
+      "binding": "BUCKET",
+      "bucket_name": "webooks-bucket"
     }
   ],
 
   "d1_databases": [
     {
       "binding": "DB",
+      "database_name": "webooks-db",
+      "database_id": "b0edfbd4-f6f1-468f-abb8-481dda7b1721",
       "migrations_dir": "migrations"
     }
   ]

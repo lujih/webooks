@@ -58,9 +58,9 @@ export async function handleDav(
     case 'HEAD':
       return handleGet(env, cfg, node, davPath, method === 'HEAD');
     case 'PUT':
-      return handleLockedWrite(() => handlePut(request, env, node, davPath), env, davPath);
+      return handleLockedWrite(request, () => handlePut(request, env, node, davPath), env, davPath);
     case 'DELETE':
-      return handleLockedWrite(() => handleDelete(env, node, davPath), env, davPath);
+      return handleLockedWrite(request, () => handleDelete(env, node, davPath), env, davPath);
     case 'MKCOL':
       return handleMkcol(request, env, node, davPath);
     case 'MOVE':
@@ -80,11 +80,23 @@ export async function handleDav(
 
 // ── Class 2 锁 ─────────────────────────────────────────────────────────
 
-async function handleLockedWrite(run: () => Promise<Response>, env: Env, davPath: string): Promise<Response> {
-  // 只有「写」类方法受锁约束。PUT / DELETE 在资源上存在活锁（且不是本请求自己刷新）时 423。
+async function handleLockedWrite(
+  request: Request,
+  run: () => Promise<Response>,
+  env: Env,
+  davPath: string,
+): Promise<Response> {
+  // 只有「写」类方法受锁约束。PUT / DELETE 在资源上存在活锁时 423，
+  // 但带 If: (<token>) 的「刷新/持锁者写」放行（RFC 4918 §9.10.1.4 / §10.5）。
   // 读路径（GET/HEAD/PROPFIND）不受锁约束 —— 锁只挡写，不挡读。
   const lock = await liveLockForResource(env.DB, davPath);
   if (lock) {
+    // 提取 If 头里的 lock-token；与活锁 token 匹配 → 持锁者，放行
+    const ifHeader = request.headers.get('if');
+    const ifTokens: string[] = ifHeader ? (ifHeader.match(/<urn:uuid:[0-9a-f-]+>/gi) ?? []) : [];
+    if (ifTokens.includes(lock.token)) {
+      return run();
+    }
     return lockConflictResponse(lock, davPath);
   }
   return run();
@@ -180,8 +192,12 @@ async function handleUnlock(request: Request, env: Env, davPath: string): Promis
   // RFC 4918 §9.11
   const tokenHeader = request.headers.get('lock-token');
   if (!tokenHeader) {
-    // owner-authorized unlock（§9.11.2）：无 Lock-Token 头时允许
-    await releaseLock(env.DB, davPath);
+    // owner-authorized unlock（§9.11.2）：无 Lock-Token 头时，
+    // 释放「该 davPath 自身」上的锁（精确匹配，不做祖先继承）。
+    // 不能用 liveLockForResource（它会匹配祖先锁），否则根锁会误删。
+    const own = await env.DB.prepare(`SELECT token FROM locks WHERE resource = ? ORDER BY expires_at DESC LIMIT 1`)
+      .bind(davPath).first<{ token: string }>();
+    if (own) await releaseLock(env.DB, own.token);
     return new Response(null, { status: 204 });
   }
   // 带 token 必须与资源锁匹配
