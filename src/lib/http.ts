@@ -88,12 +88,15 @@ const HTML_HEADERS: Record<string, string> = {
     "default-src 'none'",
     "img-src 'self' data: https:",
     "style-src 'self' 'unsafe-inline'",
-    // challenges.cloudflare.com = Turnstile 验证码
-    // static.cloudflareinsights.com = Cloudflare 自家 Web Analytics（边缘会自动注入，
-    //   不允许的话控制台会多一条 CSP 报错，对排障是纯噪音）
+    // script-src：
+    //   challenges.cloudflare.com      = Turnstile 验证码
+    //   static.cloudflareinsights.com  = Cloudflare 自家 Web Analytics（边缘自动注入）
     "script-src 'self' 'unsafe-inline' https://challenges.cloudflare.com https://static.cloudflareinsights.com",
     "frame-src https://challenges.cloudflare.com",
-    "connect-src 'self' https://challenges.cloudflare.com https://cloudflareinsights.com",
+    // connect-src：**必须包含 R2 的 S3 端点**。
+    // 上传是「浏览器拿预签名 URL 直传 R2」，不走本站；漏掉它会让上传被 CSP 拦掉，
+    // 而且报错发生在 XHR 上，看起来像「上传失败」而不是「策略拦截」（真实踩过）。
+    "connect-src 'self' https://challenges.cloudflare.com https://cloudflareinsights.com https://*.r2.cloudflarestorage.com",
     "font-src 'self'",
     "base-uri 'none'",
     "form-action 'none'",

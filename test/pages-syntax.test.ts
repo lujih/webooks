@@ -97,4 +97,26 @@ describe('页面内联脚本语法自检', () => {
       expect(html, label).not.toContain('${');
     }
   });
+
+  it('CSP 必须允许上传所需的 R2 直传端点', async () => {
+    // 真实事故：CSP 的 connect-src 漏掉 R2 的 S3 端点，导致「浏览器直传 R2」
+    // 被静默拦掉 —— 报错发生在 XHR 上，看起来像上传功能坏了，很难定位。
+    const res = await SELF.fetch(`${ORIGIN}/upload`, { headers: { accept: 'text/html' } });
+    const csp = res.headers.get('content-security-policy') ?? '';
+    expect(csp).toContain('connect-src');
+    expect(csp).toContain('r2.cloudflarestorage.com');
+    // 顺便确认 Turnstile 与统计脚本也在白名单里
+    expect(csp).toContain('challenges.cloudflare.com');
+    expect(csp).toContain('static.cloudflareinsights.com');
+  });
+
+  it('上传页在失败后会重置人机验证（否则重试必定 403）', async () => {
+    // Turnstile 令牌是一次性的；失败后不重置，用户再点只会拿到 403，
+    // 看起来像"坏了"，实际是令牌已被消费。
+    const res = await SELF.fetch(`${ORIGIN}/upload`, { headers: { accept: 'text/html' } });
+    const html = await res.text();
+    const code = inlineScripts(html).join('\n');
+    expect(code).toContain('turnstile.reset');
+    expect(code).toContain('turnstileToken = null');
+  });
 });

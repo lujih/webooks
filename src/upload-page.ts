@@ -299,9 +299,16 @@ $('go').onclick = async () => {
   }catch(e){
     const detail = e.message||String(e);
     // 连接类错误在公网上传很常见，明确告诉用户可以重试，而不是让他以为坏了
-    const retryable = /中断|超时|ERR_|网络/.test(detail);
+    const retryable = /中断|超时|ERR_|网络|CSP|Content Security|blocked/.test(detail);
     msg('❌ ' + detail + (retryable ? '（大文件在弱网下中断属常见情况，再点一次「开始上传」即可）' : ''), 'err');
-    $('go').disabled=false;
+    // 关键：Turnstile 令牌是**一次性**的，上一次 init 已经把它消费掉了。
+    // 不重置的话，用户再点一次只会拿到 403 turnstile-failed，看起来像"坏了"，
+    // 实际是令牌已被用掉（真实踩过：CSP 拦掉上传后重试永远 403）。
+    turnstileToken = null;
+    if (window.turnstile && typeof window.turnstile.reset === 'function') {
+      try { window.turnstile.reset(); } catch {}
+    }
+    $('go').disabled = true; // 等新的令牌回来再启用（callback 里会解除）
   }
 };
 
@@ -312,8 +319,13 @@ function putToR2(url, blob, contentType, onProgress){
     xhr.open('PUT', url, true);
     if(contentType) xhr.setRequestHeader('Content-Type', contentType);
     xhr.upload.onprogress = (e) => { if(e.lengthComputable && onProgress) onProgress(e.loaded/e.total); };
-    xhr.onload = () => { if(xhr.status>=200&&xhr.status<300) resolve(); else reject(new Error('R2 直传失败 HTTP '+xhr.status)); };
-    xhr.onerror = () => reject(new Error('网络中断'));
+    xhr.onload = () => { if(xhr.status>=200&&xhr.status<300) resolve(); else reject(new Error('R2 直传被拒绝 HTTP '+xhr.status)); };
+    // onerror 拿不到具体原因（CSP 拦截、插件拦截、断网都会走到这里），
+    // 所以给一条能实际解决问题的提示，而不是笼统的「网络中断」。
+    xhr.onerror = () => reject(new Error(
+      '上传请求未能发出：可能是广告拦截插件拦了 r2.cloudflarestorage.com，'
+      + '或浏览器安全策略/公司防火墙拦截。可尝试关闭本站的拦截插件后重试，或换个浏览器'
+    ));
     xhr.ontimeout = () => reject(new Error('上传超时'));
     xhr.send(blob);
   });
