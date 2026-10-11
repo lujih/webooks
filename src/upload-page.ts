@@ -223,7 +223,10 @@ function preview(f){
   $('fauthor').textContent = d.author || '（未识别）';
   // 图片类给真实预览，其余给占位
   const cov = $('cover');
-  if(/^image\//.test(f.type)){ const url=URL.createObjectURL(f); cov.innerHTML='<img src="'+url+'" style="width:100%;height:100%;object-fit:cover">'; }
+  // 注意：这里是 TS 模板字符串，正则里的转义反斜杠会被模板字符串吃掉，
+  // 生成出语法非法的正则（连续两个斜杠），整段脚本解析失败、上传页彻底失效（真实事故）。
+  // 改用 startsWith，从根上避开反斜杠转义陷阱。
+  if(f.type.startsWith('image/')){ const url=URL.createObjectURL(f); cov.innerHTML='<img src="'+url+'" style="width:100%;height:100%;object-fit:cover">'; }
   else { cov.innerHTML='<div class="cover-empty">'+ (d.ext.toUpperCase() || '无封面') +'</div>'; }
   $('go').disabled = false;
   setStep(1);

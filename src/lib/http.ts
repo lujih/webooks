@@ -88,9 +88,12 @@ const HTML_HEADERS: Record<string, string> = {
     "default-src 'none'",
     "img-src 'self' data: https:",
     "style-src 'self' 'unsafe-inline'",
-    "script-src 'self' 'unsafe-inline' https://challenges.cloudflare.com",
+    // challenges.cloudflare.com = Turnstile 验证码
+    // static.cloudflareinsights.com = Cloudflare 自家 Web Analytics（边缘会自动注入，
+    //   不允许的话控制台会多一条 CSP 报错，对排障是纯噪音）
+    "script-src 'self' 'unsafe-inline' https://challenges.cloudflare.com https://static.cloudflareinsights.com",
     "frame-src https://challenges.cloudflare.com",
-    "connect-src 'self' https://challenges.cloudflare.com",
+    "connect-src 'self' https://challenges.cloudflare.com https://cloudflareinsights.com",
     "font-src 'self'",
     "base-uri 'none'",
     "form-action 'none'",
