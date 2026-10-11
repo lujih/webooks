@@ -13,6 +13,7 @@ import { handleUploadComplete, handleUploadInit } from './api/upload';
 import { settings, type Env, type Settings } from './config';
 import { textResponse, withSecurityHeaders } from './lib/http';
 import { indexHtml } from './home-page';
+import { adminHtml } from './admin-page';
 import { uploadHtml } from './upload-page';
 import { handleDav } from './webdav';
 
@@ -31,6 +32,7 @@ export default {
 function wantsHtml(request: Request): boolean {
   const path = new URL(request.url).pathname;
   if (path === '/' || path === '' || path === '/upload' || path === '/upload/') return true;
+  if (path === '/admin' || path === '/admin/') return true;
   const accept = request.headers.get('accept') ?? '';
   return request.method === 'GET' && accept.includes('text/html');
 }
@@ -96,6 +98,18 @@ async function route(request: Request, env: Env): Promise<Response> {
       return new Response(uploadHtml(env.TURNSTILE_SITE_KEY ?? ''), {
         status: 200,
         headers: { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' },
+      });
+    }
+
+    // 管理后台（页面本身不含任何数据，真正的数据接口在 /api/admin/* 后面）
+    if (path === '/admin' || path === '/admin/') {
+      return new Response(adminHtml(), {
+        status: 200,
+        headers: {
+          'content-type': 'text/html; charset=utf-8',
+          // 后台绝不能进任何共享缓存
+          'cache-control': 'no-store, private',
+        },
       });
     }
 

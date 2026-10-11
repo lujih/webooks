@@ -19,6 +19,10 @@ export default defineConfig({
           PROPFIND_TTL: '300',
           DEPTH_INFINITY: 'downgrade',
           ADMIN_TOKEN: 'test-token',
+          // 破坏性操作口令：测试里设为非空，才能验证「没口令就删不掉」
+          WRITE_TOKEN: 'test-write-token',
+          MAX_UPLOAD_BYTES: '1048576', // 1 MiB，方便测 413
+          DAILY_WRITE_QUOTA: '0', // 测试里关掉节流，避免互相干扰
           TEST_MIGRATIONS: migrations,
         },
       },

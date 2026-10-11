@@ -21,6 +21,7 @@ const cfg = (over: Partial<Settings> = {}): Settings => ({
   depthInfinity: 'downgrade',
   maxUploadBytes: 200 * 1024 * 1024,
   dailyWriteQuota: 300,
+  writeToken: null,
   ...over,
 });
 

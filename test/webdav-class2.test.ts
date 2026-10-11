@@ -10,7 +10,11 @@ import { clearDavCache, resetLibrary, testEnv } from './setup';
 const ORIGIN = 'https://webooks.test';
 
 function dav(path: string, init: RequestInit = {}): Promise<Response> {
-  return SELF.fetch(`${ORIGIN}/dav${path}`, init);
+  // 以「已授权客户端」身份发请求；「没口令会被拒」见 test/security.test.ts
+  return SELF.fetch(`${ORIGIN}/dav${path}`, {
+    ...init,
+    headers: { authorization: 'Bearer test-write-token', ...(init.headers as Record<string, string> | undefined) },
+  });
 }
 
 async function seed(leafNames: string[]): Promise<void> {

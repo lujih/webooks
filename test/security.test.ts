@@ -169,6 +169,192 @@ describe('Content-Type 注入防护（存储层）', () => {
   });
 });
 
+describe('破坏性操作的写口令保护', () => {
+  /** 不带任何凭据的原始请求（path 为完整路径，含 /dav 前缀） */
+  function anon(path: string, init: RequestInit = {}): Promise<Response> {
+    // redirect: 'manual' —— 否则 fetch 会跟随 GET 叶子的 302 跳到 R2 公开域
+    return SELF.fetch(`${ORIGIN}${path}`, { redirect: 'manual', ...init });
+  }
+  /** 带正确口令 */
+  function auth(path: string, init: RequestInit = {}): Promise<Response> {
+    return SELF.fetch(`${ORIGIN}${path}`, {
+      redirect: 'manual',
+      ...init,
+      headers: { authorization: 'Bearer test-write-token', ...(init.headers as Record<string, string> | undefined) },
+    });
+  }
+  const put = (body = 'x'): RequestInit => ({
+    method: 'PUT',
+    headers: { 'content-type': 'application/epub+zip' },
+    body,
+  });
+
+  it('新书上传保持匿名可用（不能误伤核心功能）', async () => {
+    const res = await anon('/dav/recent/newbook.epub', put());
+    expect([201, 204]).toContain(res.status);
+  });
+
+  it('覆盖已有书：无口令 → 401，且有 WWW-Authenticate（客户端才会弹密码框）', async () => {
+    await auth('/dav/recent/existing.epub', put());
+    const res = await anon('/dav/recent/existing.epub', put('replaced'));
+    expect(res.status).toBe(401);
+    expect(res.headers.get('www-authenticate')).toContain('Basic');
+  });
+
+  it('覆盖已有书：带口令 → 204', async () => {
+    await auth('/dav/recent/existing2.epub', put());
+    const res = await auth('/dav/recent/existing2.epub', put('replaced'));
+    expect(res.status).toBe(204);
+  });
+
+  it('带 If-None-Match: * 的「只新建」请求无需口令（它不会改动任何东西）', async () => {
+    await auth('/dav/recent/guard.epub', put());
+    const res = await anon('/dav/recent/guard.epub', {
+      ...put('nope'),
+      headers: { 'content-type': 'application/epub+zip', 'if-none-match': '*' },
+    });
+    expect(res.status).toBe(412); // 已存在 → 前置条件失败，而不是 401
+  });
+
+  it('删除：无口令 → 401，且书仍然在', async () => {
+    await auth('/dav/recent/keepme.epub', put());
+    const del = await anon('/dav/recent/keepme.epub', { method: 'DELETE' });
+    expect(del.status).toBe(401);
+    const still = await anon('/dav/recent/keepme.epub', { method: 'PROPFIND', headers: { depth: '0' } });
+    expect(still.status).toBe(207);
+  });
+
+  it('删除：带口令 → 204，书消失', async () => {
+    await auth('/dav/recent/deleteme.epub', put());
+    const del = await auth('/dav/recent/deleteme.epub', { method: 'DELETE' });
+    expect(del.status).toBe(204);
+    const gone = await anon('/dav/recent/deleteme.epub', { method: 'PROPFIND', headers: { depth: '0' } });
+    expect(gone.status).toBe(404);
+  });
+
+  it('改名（MOVE）：无口令 → 401', async () => {
+    await auth('/dav/recent/moveme.epub', put());
+    const res = await anon('/dav/recent/moveme.epub', {
+      method: 'MOVE',
+      headers: { destination: `${ORIGIN}/dav/recent/renamed.epub` },
+    });
+    expect(res.status).toBe(401);
+  });
+
+  it('口令错误 → 401（且不能靠长度差异绕过）', async () => {
+    await auth('/dav/recent/len.epub', put());
+    for (const bad of ['wrong', 'test-write-toke', 'test-write-tokenX']) {
+      const res = await SELF.fetch(`${ORIGIN}/dav/recent/len.epub`, {
+        ...put('x'),
+        headers: { 'content-type': 'application/epub+zip', authorization: `Bearer ${bad}` },
+      });
+      expect(res.status, bad).toBe(401);
+    }
+  });
+
+  it('Basic 认证也接受（WebDAV 客户端用这种方式）', async () => {
+    await auth('/dav/recent/basic.epub', put());
+    const b64 = btoa('anyuser:test-write-token');
+    const res = await SELF.fetch(`${ORIGIN}/dav/recent/basic.epub`, {
+      ...put('via basic'),
+      headers: { 'content-type': 'application/epub+zip', authorization: `Basic ${b64}` },
+    });
+    expect(res.status).toBe(204);
+  });
+
+  it('读操作完全不受口令影响（挂载后能正常浏览）', async () => {
+    const created = await auth('/dav/recent/readable.epub', put());
+    expect([201, 204]).toContain(created.status);
+
+    // 目录列表可匿名读取
+    const pf = await anon('/dav/recent/', { method: 'PROPFIND', headers: { depth: '1' } });
+    expect(pf.status).toBe(207);
+
+    // 叶子可匿名下载（302 → R2 公开域）
+    const get = await anon('/dav/recent/readable.epub', { method: 'GET' });
+    expect(get.status).toBe(302);
+    expect(get.headers.get('location')).toContain('/books/');
+
+    // 元数据可匿名读取
+    const head = await anon('/dav/recent/readable.epub', { method: 'HEAD' });
+    expect(head.status).toBe(200);
+    expect(head.headers.get('accept-ranges')).toBe('bytes');
+  });
+});
+
+describe('管理后台 API', () => {
+  it('无 token 一律 403/404', async () => {
+    for (const p of ['/api/admin/books', '/api/admin/stats']) {
+      const res = await SELF.fetch(`${ORIGIN}${p}`);
+      expect([403, 404]).toContain(res.status);
+    }
+  });
+
+  it('带 token 可列出书并返回安全状态', async () => {
+    await SELF.fetch(`${ORIGIN}/dav/recent/adminlist.epub`, {
+      method: 'PUT',
+      headers: { 'content-type': 'application/epub+zip', authorization: 'Bearer test-write-token' },
+      body: 'x',
+    });
+    const res = await SELF.fetch(`${ORIGIN}/api/admin/books`, {
+      headers: { authorization: 'Bearer test-token' },
+    });
+    expect(res.status).toBe(200);
+    const json = (await res.json()) as {
+      total: number; books: Array<{ leafName: string }>;
+      security: Array<{ key: string; ok: boolean }>;
+    };
+    expect(json.total).toBeGreaterThan(0);
+    expect(json.books.some((b) => b.leafName === 'adminlist.epub')).toBe(true);
+    // 安全状态里必须能看到写口令已启用
+    expect(json.security.find((s) => s.key === 'writeToken')?.ok).toBe(true);
+  });
+
+  it('带 token 可批量删除（同时清理 R2 对象）', async () => {
+    await SELF.fetch(`${ORIGIN}/dav/recent/todelete.epub`, {
+      method: 'PUT',
+      headers: { 'content-type': 'application/epub+zip', authorization: 'Bearer test-write-token' },
+      body: 'x',
+    });
+    const res = await SELF.fetch(`${ORIGIN}/api/admin/delete`, {
+      method: 'POST',
+      headers: { authorization: 'Bearer test-token', 'content-type': 'application/json' },
+      body: JSON.stringify({ leafNames: ['todelete.epub'] }),
+    });
+    expect(res.status).toBe(200);
+    const json = (await res.json()) as { deletedCount: number; deleted: string[] };
+    expect(json.deletedCount).toBe(1);
+    expect(json.deleted).toContain('todelete.epub');
+
+    const row = await testEnv.DB.prepare('SELECT id FROM books WHERE leaf_name = ?')
+      .bind('todelete.epub').first();
+    expect(row).toBeNull();
+  });
+
+  it('删除不存在的书不报错，只在 missing 里列出', async () => {
+    const res = await SELF.fetch(`${ORIGIN}/api/admin/delete`, {
+      method: 'POST',
+      headers: { authorization: 'Bearer test-token', 'content-type': 'application/json' },
+      body: JSON.stringify({ leafNames: ['never-existed.epub'] }),
+    });
+    expect(res.status).toBe(200);
+    const json = (await res.json()) as { deletedCount: number; missing: string[] };
+    expect(json.deletedCount).toBe(0);
+    expect(json.missing).toContain('never-existed.epub');
+  });
+
+  it('/admin 页面可访问，且不带任何敏感数据', async () => {
+    const res = await SELF.fetch(`${ORIGIN}/admin`);
+    expect(res.status).toBe(200);
+    expect(res.headers.get('content-type')).toContain('text/html');
+    // 后台页面绝不能进共享缓存
+    expect(res.headers.get('cache-control')).toContain('no-store');
+    const html = await res.text();
+    expect(html).not.toContain('test-token');
+    expect(html).not.toContain('test-write-token');
+  });
+});
+
 describe('过期锁清扫', () => {  it('sweepExpiredLocks 删除过期行、保留活锁', async () => {
     const past = new Date(Date.now() - 60_000).toISOString();
     const future = new Date(Date.now() + 60_000).toISOString();

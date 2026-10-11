@@ -229,33 +229,126 @@ WebDAV 上传。这不是安全漏洞（fail-closed 行为正确），但影响�
 
 ---
 
-## 七、验证方式（可复现）
+## 七、第二次审计：滥用防护（防恶意上传/删除）
+
+第一次审计解决的是「技术漏洞」。用户追问「防恶意上传」后，新增
+`scripts/abuse-probe.mjs` 做业务层滥用检查，发现**破坏面**问题并修复。
+
+### 发现的问题
+
+| 问题 | 实测 | 影响 |
+|---|---|---|
+| **任何人可删除任意书** | `DELETE` → 204（无需凭据） | 一个脚本就能把整个书库删光 |
+| **任何人可覆盖任意书** | 同名 `PUT` → 204 | 别人的书能被换成任意内容 |
+| **任何人可改名（MOVE）** | → 201 | 书能被移走/改乱 |
+| WebDAV 上传无人机验证 | `PUT` → 201 | 网页上传有 Turnstile，WebDAV 通道没有 |
+| 无管理后台 | `/api/admin/*` → 404 | 出事时没有批量处置工具 |
+| `UPLOAD_DAILY_QUOTA` 是死代码 | 从未被引用 | 配额实际不存在（第一次审计已修） |
+
+### 修复：分级权限
+
+核心思路 —— **「上传」和「删除」是两件事**：
+
+```
+读（PROPFIND / GET / HEAD）        完全匿名  ← 保持开放
+新增书（PUT 到不存在的文件名）      完全匿名  ← 保持「所有人都能上传」
+删除（DELETE）                     需要口令
+改名（MOVE）                       需要口令
+覆盖已有书（PUT 到已存在的文件名）   需要口令
+```
+
+技术实现（`src/lib/auth.ts`）：
+
+- 新增 `WRITE_TOKEN` 共享口令，支持三种携带方式以覆盖各类客户端：
+  - `Authorization: Bearer <token>` —— 脚本 / 现代客户端
+  - `Authorization: Basic <base64(任意用户名:口令)>` —— WebDAV 客户端标准做法
+  - `X-Write-Token: <token>` —— 便于 curl 调试
+- 未通过时返回 **401 + `WWW-Authenticate: Basic`**（而不是 403）——
+  WebDAV 客户端看到 401 才会弹密码框让用户输入；403 只会显示「拒绝访问」
+- 口令用**常量时间比较**，避免响应时间侧信道
+- **例外**：带 `If-None-Match: *` 的请求语义上是「只新建不覆盖」，
+  即使同名文件存在也只会返回 412，不产生任何改动，因此无需口令
+  （否则会误伤 rclone 等同步客户端的标准行为）
+
+**未配置 `WRITE_TOKEN` 时**：不保护（保持向后兼容），但管理后台会**红色告警**，
+明确写出「任何人都能删光书库」。
+
+### 新增：管理后台 `/admin`
+
+面向不懂技术的站长，一屏看清两件事：
+
+1. **安全防护状态** — 六个指示灯（删除口令 / 后台口令 / 人机验证 /
+   上传通道 / 大小上限 / 写入节流），每个都带一句人话说明。
+   这是「不懂网络安全也能判断站点是否安全」的关键设计。
+2. **全部藏书列表** — 搜索、多选、批量删除（同时清理 R2 对象与封面，
+   并让读者侧目录缓存立即失效）。
+
+安全细节：
+- 口令只存 `sessionStorage`，**不写 Cookie** → 天然免 CSRF
+- 页面本身不含任何数据，真实数据在 `/api/admin/*` 后面逐次鉴权
+- 响应 `Cache-Control: no-store, private`，绝不进共享缓存
+- 所有来自服务端的数据（书名可能是任意的）都经 `esc()` 转义后再插入 DOM
+- `/api/admin/*` 未配置 `ADMIN_TOKEN` 时 fail-closed（整体 404）
+
+### 实测结果
+
+```
+滥用防护探针    修复前：6 项安全 / 6 项注意 / 0 风险
+                修复后：12 项安全 / 3 项注意 / 0 风险
+
+线上逐项验证：
+  匿名上传新书        → 201   ✅ 保持开放
+  匿名删除            → 401 + WWW-Authenticate  ✅ 已挡住
+  带口令删除          → 204   ✅ 功能正常
+  匿名覆盖已有书      → 401   ✅ 已挡住
+  带口令覆盖          → 204   ✅ 功能正常
+  匿名改名            → 401   ✅ 已挡住
+  /api/admin/books 无 token → 403  ✅
+  /api/admin/books 有 token → 200  ✅
+  /admin 页面         → 200   ✅
+```
+
+### 剩余 3 项「注意」（设计取舍，非漏洞）
+
+| 项 | 说明 |
+|---|---|
+| WebDAV 无人机验证 | 匿名开放上传的固有代价。已用「每日写入次数」节流缓解（减速带） |
+| 可执行文件可伪装成 .epub | 文件以 `application/epub+zip` 提供，浏览器只下载不执行；但下载者用阅读器打开理论上可能触发解析器漏洞。**服务端病毒扫描未做**（免费层无此能力） |
+| 节流为尽力而为 | Cache API 按数据中心计数，非硬限制。要硬限制需 Durable Object + 账号体系 |
+
+---
+
+## 八、验证方式（可复现）
 
 ```bash
-# 1. 安全自查（34 项；--write-test 会写入并自动清理一个临时文件）
+# 1. 技术安全自查（34 项；--write-test 会写入并自动清理一个临时文件）
 node scripts/security-probe.mjs --url https://webooks.cszxorx.dpdns.org --write-test
 
-# 2. WebDAV 协议合规（15 步完整挂载握手）
+# 2. 滥用防护自查（15 项；--token 用于自动清理测试文件）
+node scripts/abuse-probe.mjs --url https://webooks.cszxorx.dpdns.org/dav --token "$WRITE_TOKEN"
+
+# 3. WebDAV 协议合规（15 步完整挂载握手）
 node scripts/webdav-litmus.mjs --url https://webooks.cszxorx.dpdns.org/dav/
 
-# 3. RFC 4918 / 9110 合规
+# 4. RFC 4918 / 9110 合规
 node scripts/rfc-probe.mjs --url https://webooks.cszxorx.dpdns.org/dav/
 
-# 4. 配色对比度（WCAG）
+# 5. 配色对比度（WCAG）
 node scripts/contrast-check.mjs
 
-# 5. 单元与端到端测试（133 例，含 18 例安全回归）
+# 6. 单元与端到端测试（148 例，含 30 例安全回归）
 npx vitest run
 ```
 
 ### 修复验证结果
 ```
-类型检查          tsc exit 0
-全量测试          133 passed (8 files)
-安全探针          34/34 通过，0 项待处理
-WebDAV litmus     15/15 步通过
-配色对比度        全部达标（文本 8.5:1–16.3:1，均为 AAA）
-构建体积          126.5 KiB / gzip 38.4 KiB
+类型检查           tsc exit 0
+全量测试           148 passed (8 files)
+技术安全探针       34/34 通过，0 项待处理
+滥用防护探针       12 项安全 / 3 项注意 / 0 项风险
+WebDAV litmus      15/15 步通过
+配色对比度         全部达标（文本 8.5:1–16.3:1，均为 AAA）
+构建体积           约 130 KiB / gzip 约 40 KiB
 ```
 
 ### 漏洞验证痕迹已清理

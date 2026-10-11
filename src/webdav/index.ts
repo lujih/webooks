@@ -17,6 +17,7 @@ import {
   lockDiscoveryXml,
 } from '../lib/locks';
 import { allowWrite } from '../lib/throttle';
+import { hasWriteToken, unauthorizedResponse } from '../lib/auth';
 import { collectDavEntries, handlePropfind, type Entry } from './propfind';
 import { renderBrowsePage } from '../browse-page';
 import { escapeXml } from '../lib/xml';
@@ -63,12 +64,16 @@ export async function handleDav(
     case 'PUT':
       return handleLockedWrite(request, () => handlePut(request, env, node, davPath, cfg), env, davPath);
     case 'DELETE':
+      // 删除是破坏性操作：需要共享口令。读与新增保持匿名。
+      if (!hasWriteToken(request, cfg.writeToken)) return unauthorizedResponse();
       return handleLockedWrite(request, () => handleDelete(env, node, davPath), env, davPath);
     case 'MKCOL':
       return handleMkcol(request, env, node, davPath);
     case 'MOVE':
+      if (!hasWriteToken(request, cfg.writeToken)) return unauthorizedResponse();
       return handleMoveCopy(request, env, cfg, node, davPath, true);
     case 'COPY':
+      // COPY 不破坏原书，但会新增文件，走与 PUT 相同的节流即可，不额外要口令
       return handleMoveCopy(request, env, cfg, node, davPath, false);
     case 'LOCK':
       return handleLock(request, env, davPath);
@@ -483,6 +488,16 @@ async function handlePut(request: Request, env: Env, node: DavNode, davPath: str
 
   const meta = deriveMetadata(leafName);
   const existing = await findBookByLeaf(env.DB, leafName);
+
+  // 覆盖已有书 = 破坏性操作（会改掉别人上传的内容），需要口令。
+  // 「新书上传」保持完全匿名 —— 这是产品的核心诉求，不能被误伤。
+  // 注意：带 If-None-Match: * 的请求语义上就是「只新建不覆盖」，
+  // 即使同名文件存在也只会返回 412，不会改动任何东西，因此无需口令。
+  const onlyIfAbsent = (request.headers.get('if-none-match') ?? '').trim() === '*';
+  if (existing && !onlyIfAbsent && !hasWriteToken(request, cfg.writeToken)) {
+    return unauthorizedResponse();
+  }
+
   const id = existing?.id ?? shortId(8);
   const r2Key = `books/${id}`;
   // 安全关键：写入 R2 的 Content-Type **只按扩展名推导**，忽略客户端的声明。

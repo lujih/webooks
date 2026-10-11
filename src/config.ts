@@ -12,6 +12,11 @@ export interface Env {
   R2_PUBLIC_BASE: string;
   /** 保护 /api/admin/* 的令牌；未设置时所有 admin 接口返回 404 */
   ADMIN_TOKEN?: string;
+  /**
+   * 破坏性操作（DELETE / MOVE / 覆盖已有书）的共享口令。
+   * 未设置时这些操作**不保护**（保持向后兼容），管理后台会明确告警。
+   */
+  WRITE_TOKEN?: string;
   /** Turnstile 公钥（前端 widget 用），来自 Dashboard */
   TURNSTILE_SITE_KEY?: string;
   /** Turnstile 私钥（服务端 siteverify 用），必须是 secret */
@@ -52,6 +57,11 @@ export interface Settings {
   maxUploadBytes: number;
   /** 每 IP 每日写操作上限（尽力而为，见 lib/throttle.ts）；0 表示不限制 */
   dailyWriteQuota: number;
+  /**
+   * 破坏性操作口令。null 表示未启用保护（删除/覆盖对所有人开放）。
+   * 注意永远是「仅比较，不回显」，因此不会被前端拿到。
+   */
+  writeToken: string | null;
 }
 
 /**
@@ -106,5 +116,6 @@ export function settings(env: Env): Settings {
     dailyWriteQuota: env.DAILY_WRITE_QUOTA === '0'
       ? 0
       : intFrom(env.DAILY_WRITE_QUOTA, DEFAULT_DAILY_WRITE_QUOTA, 1, 100_000),
+    writeToken: env.WRITE_TOKEN?.trim() || null,
   };
 }

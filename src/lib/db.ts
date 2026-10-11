@@ -101,6 +101,69 @@ export async function findBookByLeaf(db: D1Database, leafName: string): Promise<
   return row ?? null;
 }
 
+/**
+ * 管理后台：全局列出书（可按书名/作者/文件名模糊搜）。
+ * 与面向读者的 listBooks 不同 —— 这里不按分桶，直接按时间倒序，
+ * 目的是「管理」而非「浏览」。
+ */
+export async function adminListBooks(
+  db: D1Database,
+  query: string,
+  limit: number,
+  offset: number,
+): Promise<BookRow[]> {
+  const q = query.trim();
+  if (!q) {
+    const { results } = await db
+      .prepare(`SELECT ${BOOK_COLUMNS} FROM books ORDER BY created_at DESC, id LIMIT ? OFFSET ?`)
+      .bind(limit, offset)
+      .all<BookRow>();
+    return results ?? [];
+  }
+  // LIKE 的通配符要转义，否则用户输入 % 会变成「匹配一切」
+  const like = `%${q.replace(/[\\%_]/g, (c) => `\\${c}`)}%`;
+  const { results } = await db
+    .prepare(
+      `SELECT ${BOOK_COLUMNS} FROM books
+        WHERE title LIKE ?1 ESCAPE '\\' OR author LIKE ?1 ESCAPE '\\' OR leaf_name LIKE ?1 ESCAPE '\\'
+        ORDER BY created_at DESC, id LIMIT ?2 OFFSET ?3`,
+    )
+    .bind(like, limit, offset)
+    .all<BookRow>();
+  return results ?? [];
+}
+
+/** 管理后台：总数 + 占用空间（用于容量告警，免费层 R2 只有 10GB） */
+export async function adminTotals(
+  db: D1Database,
+): Promise<{ books: number; bytes: number }> {
+  const row = await db
+    .prepare(`SELECT COUNT(*) AS books, COALESCE(SUM(size), 0) AS bytes FROM books`)
+    .first<{ books: number; bytes: number }>();
+  return { books: row?.books ?? 0, bytes: row?.bytes ?? 0 };
+}
+
+/** 管理后台：按 leaf_name 批量查（先查回 r2_key 以便一并清理对象） */
+export async function findBooksByLeafNames(
+  db: D1Database,
+  leafNames: string[],
+): Promise<BookRow[]> {
+  if (leafNames.length === 0) return [];
+  const out: BookRow[] = [];
+  // D1 单条语句绑定参数有限，分批查
+  const BATCH = 90;
+  for (let i = 0; i < leafNames.length; i += BATCH) {
+    const chunk = leafNames.slice(i, i + BATCH);
+    const ph = chunk.map(() => '?').join(',');
+    const { results } = await db
+      .prepare(`SELECT ${BOOK_COLUMNS} FROM books WHERE leaf_name IN (${ph})`)
+      .bind(...chunk)
+      .all<BookRow>();
+    out.push(...(results ?? []));
+  }
+  return out;
+}
+
 export async function getBookById(db: D1Database, id: string): Promise<BookRow | null> {
   const row = await db
     .prepare(`SELECT ${BOOK_COLUMNS} FROM books WHERE id = ?`)

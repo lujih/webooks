@@ -11,7 +11,12 @@ const ORIGIN = 'https://webooks.test';
 const ALL_PATHS = ['/', '/title/', '/author/', '/format/', '/recent/', '/title/A/', '/title/T/', '/title/B/'];
 
 function dav(path: string, init: RequestInit = {}): Promise<Response> {
-  return SELF.fetch(`${ORIGIN}/dav${path}`, init);
+  // 这些用例关注 WebDAV 协议行为，默认以「已授权客户端」身份发请求；
+  // 「没口令会被拒」由 test/security.test.ts 专门覆盖。
+  return SELF.fetch(`${ORIGIN}/dav${path}`, {
+    ...init,
+    headers: { authorization: 'Bearer test-write-token', ...(init.headers as Record<string, string> | undefined) },
+  });
 }
 
 function propfind(path: string, depth?: string, body?: string): Promise<Response> {
