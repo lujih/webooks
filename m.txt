@@ -1,0 +1,57 @@
+fix(security): 修复两个任意内容托管漏洞 + 安全响应头 + 写入上限与节流
+
+对线上实例做了完整安全审计（新增 scripts/security-probe.mjs，34 项检查），
+修掉两个 HIGH 漏洞与若干结构性风险。审计从 28/33 提升到 34/34。
+
+## HIGH-1：封面 media-type 可控 → 任意内容托管
+
+OPF 的 `<item media-type="…">` 完全由上传者控制，早期实现直接把它当作 R2 的
+Content-Type 与扩展名。实测：声明 text/html 后，`books.<域名>/covers/<id>.html`
+以 `Content-Type: text/html` 原样返回攻击者的 HTML+JS —— 等于把项目域名变成
+任意内容托管点（钓鱼/挂马/SEO 垃圾），也是跨子域存储型 XSS 的种子。
+
+修复：**只信任字节魔数嗅探**。新增 sniffImageType()，白名单仅 jpeg/png/gif/
+webp/bmp/avif/tiff；声明值一律忽略。SVG 刻意不入白名单（可内嵌脚本）。
+扩展名由 coverExtFor() 从白名单推导，不再从上传者字符串拼接。
+
+## HIGH-2：文件 Content-Type 可控 → 任意内容托管（更严重）
+
+R2 对外提供的是**写入时**的 httpMetadata.contentType。早期实现用
+preferContentType() 采纳客户端的非泛型声明，于是
+`PUT /dav/recent/x.epub` 带 `Content-Type: text/html` 就能让
+`books.<域名>/books/<id>` 渲染任意 HTML。WebDAV PUT 没有 Turnstile，
+脚本可批量滥用。
+
+修复：新增 safeContentTypeFor()，写入 R2 一律按扩展名推导类型，忽略客户端声明。
+三条写路径（WebDAV PUT / 上传 complete / admin reindex）全部改用它。
+CONTENT_TYPES 里 html/htm/xhtml 改为 text/plain（可下载不渲染），
+svg 改为 application/octet-stream。
+
+## 其他修复
+
+- **安全响应头**：全站补 X-Content-Type-Options / Referrer-Policy / HSTS；
+  HTML 页面额外加 CSP（default-src 'none' + frame-ancestors 'none' +
+  object-src 'none' + base-uri 'none'），WebDAV 的 207 不加 CSP 避免客户端误判。
+- **WebDAV PUT 大小上限**（原缺失，可写满 10GB 免费配额）：新增
+  maxUploadBytes，默认 200MiB，超限 413。实测 4KB 上限时 4KB→413、1KB→201。
+- **EPUB 解析内存炸弹**：原实现对任何 .epub 无条件 request.arrayBuffer()，
+  几百 MB 的假 EPUB 能撑爆 128MB isolate。改为按 Content-Length 三档处理，
+  超大/未声明一律流式落 R2 不解析。
+- **锁表无限膨胀**：过期锁行永不删除，匿名 LOCK 端点可无限写入。新增
+  sweepExpiredLocks()，每次 LOCK 顺带清理。
+- **上传 complete 的文件名未清洗**：原只替换 / 和 \，控制字符与 <>:"|?* 及
+  超长名都能进 D1。改用与 WebDAV 一致的 sanitiseLeafName()。
+- **写入节流**：UPLOAD_DAILY_QUOTA 是死代码（从未使用）。新增
+  lib/throttle.ts + DAILY_WRITE_QUOTA（默认 300 次/IP/日，Cache API 实现，
+  不额外消耗 D1/KV 配额），并诚实标注其为尽力而为的减速带而非硬配额。
+
+## 测试
+
+133 通过（原 115，新增 18）。新增 test/security.test.ts（12 例）覆盖安全头、
+大小上限、文件名清洗、Content-Type 注入、锁清扫；epub.test.ts 增 6 例覆盖
+封面类型白名单（HTML/SVG/伪装 JPEG 均须被拒，且不误伤真实封面）。
+
+## 已验证清理
+
+漏洞验证期间产生的恶意对象（covers/<id>.html、books/<id>）已从 R2 删除，
+线上已返回 404。书库仅剩一本演示书《凡尘之舞.epub》。

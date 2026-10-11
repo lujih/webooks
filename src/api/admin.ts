@@ -7,7 +7,7 @@ import type { Env, Settings } from '../config';
 import { letterBucket } from '../lib/collections';
 import { listBucketTotals, rebuildBuckets, upsertBookStatement } from '../lib/db';
 import { textResponse } from '../lib/http';
-import { deriveMetadata, leafNameFromKey, preferContentType, sanitiseLeafName, sha256Hex } from '../lib/metadata';
+import { deriveMetadata, leafNameFromKey, safeContentTypeFor, sanitiseLeafName, sha256Hex } from '../lib/metadata';
 import { davCache, purgeEntries } from '../lib/cache';
 
 const BATCH_SIZE = 50;
@@ -94,7 +94,8 @@ async function reindex(env: Env, url: URL): Promise<Response> {
         author: meta.author,
         language: null,
         format: meta.format,
-        contentType: preferContentType(object.httpMetadata?.contentType, meta.contentType),
+        // 同样只按扩展名推导：R2 里旧对象的元数据可能带 text/html（历史漏洞遗留）
+        contentType: safeContentTypeFor(leafName),
         size: object.size,
         sha256: null,
         r2Key: object.key,

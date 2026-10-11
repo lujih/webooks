@@ -4,17 +4,19 @@ import type { Env, Settings } from '../config';
 import { letterBucket, resolveNode, type DavNode } from '../lib/collections';
 import { deleteBook, findBookByLeaf, rebuildBuckets, upsertBook, listBooks } from '../lib/db';
 import { methodNotAllowed, shortId, textResponse } from '../lib/http';
-import { preferContentType, deriveMetadata, sanitiseLeafName } from '../lib/metadata';
+import { safeContentTypeFor, deriveMetadata, sanitiseLeafName } from '../lib/metadata';
 import { checkPreconditions } from '../lib/preconditions';
-import { parseEpub, PARSE_SIZE_CAP, type EpubMeta } from '../lib/epub';
+import { parseEpub, coverExtFor, PARSE_SIZE_CAP, type EpubMeta } from '../lib/epub';
 import { bookCacheTargets, purgeEntries } from '../lib/cache';
 import {
   acquireLock,
   liveLockForResource,
   parseTimeoutHeader,
   releaseLock,
+  sweepExpiredLocks,
   lockDiscoveryXml,
 } from '../lib/locks';
+import { allowWrite } from '../lib/throttle';
 import { collectDavEntries, handlePropfind, type Entry } from './propfind';
 import { renderBrowsePage } from '../browse-page';
 import { escapeXml } from '../lib/xml';
@@ -59,7 +61,7 @@ export async function handleDav(
     case 'HEAD':
       return handleGet(env, cfg, node, davPath, method === 'HEAD');
     case 'PUT':
-      return handleLockedWrite(request, () => handlePut(request, env, node, davPath), env, davPath);
+      return handleLockedWrite(request, () => handlePut(request, env, node, davPath, cfg), env, davPath);
     case 'DELETE':
       return handleLockedWrite(request, () => handleDelete(env, node, davPath), env, davPath);
     case 'MKCOL':
@@ -130,6 +132,8 @@ function lockConflictResponse(lock: { token: string; resource: string; owner: st
 
 async function handleLock(request: Request, env: Env, davPath: string): Promise<Response> {
   // RFC 4918 §9.10
+  // 顺带清理过期锁：匿名端点任何人都能建锁，不清理表会无声膨胀。
+  await sweepExpiredLocks(env.DB).catch(() => 0);
   // 解析请求体的 locktype / lockscope / depth
   const body = await request.text().catch(() => '');
   const typeMatch = body.match(/<D:(exclusive|write)\/>/i);
@@ -450,7 +454,7 @@ export function renderHtmlIndex(davPath: string, entries: Entry[], mountPath: st
 
 // ── 写 ──────────────────────────────────────────────────────────────────
 
-async function handlePut(request: Request, env: Env, node: DavNode, davPath: string): Promise<Response> {
+async function handlePut(request: Request, env: Env, node: DavNode, davPath: string, cfg: Settings): Promise<Response> {
   if (node.kind !== 'leaf') {
     return textResponse(405, 'PUT is only allowed on file paths', { allow: ALLOW });
   }
@@ -459,12 +463,31 @@ async function handlePut(request: Request, env: Env, node: DavNode, davPath: str
   if (!leafName) return textResponse(400, 'Invalid file name');
   if (!request.body) return textResponse(411, 'Length Required');
 
+  // 匿名写节流：大小上限管「单次伤害」，这里管「总量」。
+  // 见 lib/throttle.ts —— 是尽力而为的减速带，不是硬配额。
+  const ip = request.headers.get('CF-Connecting-IP') ?? '';
+  if (!(await allowWrite(ip, cfg.dailyWriteQuota))) {
+    return textResponse(429, 'Too Many Requests: daily write quota exceeded', {
+      allow: ALLOW,
+      'retry-after': '3600',
+    });
+  }
+
+  // 大小上限：必须在**读 body 之前**判定。
+  // 免费层 R2 只有 10GB 且 WebDAV 完全匿名开放，没有上限时一个脚本就能写满配额。
+  const declared = Number(request.headers.get('content-length')) || 0;
+  const cap = cfg.maxUploadBytes;
+  if (cap > 0 && declared > cap) {
+    return textResponse(413, `Payload Too Large: limit is ${cap} bytes`, { allow: ALLOW });
+  }
+
   const meta = deriveMetadata(leafName);
   const existing = await findBookByLeaf(env.DB, leafName);
   const id = existing?.id ?? shortId(8);
   const r2Key = `books/${id}`;
-  // 客户端给泛型类型（如 text/plain、application/octet-stream）时以扩展名为准
-  const contentType = preferContentType(request.headers.get('content-type'), meta.contentType);
+  // 安全关键：写入 R2 的 Content-Type **只按扩展名推导**，忽略客户端的声明。
+  // R2 对外提供的就是这个值，信任客户端等于允许 text/html 托管（真实漏洞）。
+  const contentType = safeContentTypeFor(leafName);
 
   // 条件请求（RFC 9110 §13.1）：在**写入之前**判定，否则会把别人的书覆盖掉。
   // 同步客户端依赖 If-None-Match: * 做到「仅新建、不覆盖」，服务端必须配合。
@@ -474,47 +497,56 @@ async function handlePut(request: Request, env: Env, node: DavNode, davPath: str
     return textResponse(412, `Precondition Failed: ${precondition.reason}`, { allow: ALLOW });
   }
 
-  // EPUB 且预计不超解析上限：读进内存以便解析真实元数据/封面。
-  // 不用 Content-Length 当门槛——很多客户端（rclone/脚本）不带该头或走 chunked，
-  // 依赖它会漏解析。改为：EPUB 就尝试读，读完看实际字节数，超 50MB 立即丢弃不解析。
+  // ── 读 body 的策略（避免撑爆 128MB isolate）──────────────────────────
+  // 关键约束：`request.arrayBuffer()` 会把**整个** body 读进内存。早期实现对
+  // 任何 .epub 都无条件 arrayBuffer()，于是一个几百 MB 的「EPUB」就能把 isolate
+  // 打爆（DoS）。现在按 Content-Length 三档处理：
+  //   · 声明 ≤ PARSE_SIZE_CAP  → 读进内存并解析（封面/元数据）
+  //   · 声明 > PARSE_SIZE_CAP  → 直接流式落 R2，不解析（不占内存）
+  //   · 未声明（chunked）      → 流式落 R2，不解析（无法在不缓存的前提下解析）
   const isEpub = meta.format === 'epub';
+  const parseable = isEpub && declared > 0 && declared <= PARSE_SIZE_CAP;
 
   let parsed: EpubMeta | null = null;
   let coverKey: string | null = null;
   let object;
 
-  if (isEpub) {
+  if (parseable) {
     const buf = await request.arrayBuffer();
-    if (buf.byteLength <= PARSE_SIZE_CAP) {
-      object = await env.BUCKET.put(r2Key, new Uint8Array(buf), { httpMetadata: { contentType } });
-      try {
-        parsed = await parseEpub(buf);
-        if (parsed?.cover) {
-          const coverType = parsed.cover.contentType || 'image/jpeg';
-          const ext = coverType.split('/')[1]?.replace('jpeg', 'jpg') ?? 'jpg';
+    object = await env.BUCKET.put(r2Key, new Uint8Array(buf), { httpMetadata: { contentType } });
+    try {
+      parsed = await parseEpub(buf);
+      if (parsed?.cover) {
+        const coverType = parsed.cover.contentType;
+        // 扩展名由白名单推导，绝不用上传者可控的字符串拼对象键
+        const ext = coverExtFor(coverType);
+        if (ext) {
           coverKey = `covers/${id}.${ext}`;
           await env.BUCKET.put(coverKey, new Uint8Array(parsed.cover.bytes), {
             httpMetadata: { contentType: coverType },
           });
         }
-      } catch (err) {
-        // 解析失败不影响写入，退回文件名推导。但要留痕，否则「有封面却判无封面」
-        // 这类问题会静默消失（真实踩过：封面 inflate 失败被空 catch 吞掉）。
-        console.error('[epub-parse] failed', {
-          leafName,
-          bytes: buf.byteLength,
-          err: err instanceof Error ? `${err.name}: ${err.message}` : String(err),
-        });
       }
-    } else {
-      // 超大 EPUB：不落完整字节也能存（R2 流式），但不解析
-      object = await env.BUCKET.put(r2Key, buf, { httpMetadata: { contentType } });
+    } catch (err) {
+      // 解析失败不影响写入，退回文件名推导。但要留痕，否则「有封面却判无封面」
+      // 这类问题会静默消失（真实踩过：封面 inflate 失败被空 catch 吞掉）。
+      console.error('[epub-parse] failed', {
+        leafName,
+        bytes: buf.byteLength,
+        err: err instanceof Error ? `${err.name}: ${err.message}` : String(err),
+      });
     }
   } else {
-    // 非 EPUB：直接流式落 R2，绝不把 body 读进内存（isolate 上限 128MB）
+    // 非 EPUB、超大文件、或 chunked：直接流式落 R2，绝不把 body 读进内存
     object = await env.BUCKET.put(r2Key, request.body, {
       httpMetadata: { contentType },
     });
+  }
+
+  // 兜底：客户端谎报 Content-Length 时按实收大小判定（对象已经写了，删掉即可）
+  if (cap > 0 && (object?.size ?? 0) > cap) {
+    await env.BUCKET.delete(r2Key);
+    return textResponse(413, `Payload Too Large: limit is ${cap} bytes`, { allow: ALLOW });
   }
 
   const title = parsed?.title ?? meta.title;

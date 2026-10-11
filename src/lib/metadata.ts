@@ -21,7 +21,13 @@ const CONTENT_TYPES: Record<string, string> = {
   mp3: 'audio/mpeg',
   zip: 'application/zip',
   md: 'text/markdown; charset=utf-8',
-  html: 'text/html; charset=utf-8',
+  // 安全：HTML 一律按纯文本提供，绝不用 text/html。
+  // 公开匿名书库若以 text/html 提供文件，等于把项目域名变成任意内容托管点
+  // （钓鱼/挂马/存储型 XSS）。浏览器仍能查看源码或下载，只是不渲染。
+  html: 'text/plain; charset=utf-8',
+  htm: 'text/plain; charset=utf-8',
+  xhtml: 'text/plain; charset=utf-8',
+  svg: 'application/octet-stream',
 };
 
 export interface DerivedMetadata {
@@ -61,6 +67,20 @@ export function preferContentType(
   const raw = (headerValue ?? '').trim();
   const essence = raw.split(';')[0]!.trim().toLowerCase();
   return GENERIC_TYPES.has(essence) ? derived : raw;
+}
+
+/**
+ * **写入存储时必须使用的** Content-Type —— 只按扩展名推导。
+ *
+ * 安全要点（真实漏洞）：R2 对象提供的就是写入时 httpMetadata.contentType，
+ * 而不是 D1 里的值。早期实现把客户端声明的 Content-Type 原样写进 R2，
+ * 于是 `PUT /dav/recent/x.epub` 带 `Content-Type: text/html` 就能让
+ * `books.<域名>/books/<id>` 以 text/html 返回任意 HTML/JS —— WebDAV 端点
+ * 没有 Turnstile，脚本可批量滥用。现在一律以扩展名为准（未知扩展名 →
+ * application/octet-stream，浏览器只会下载不会渲染）。
+ */
+export function safeContentTypeFor(leafName: string): string {
+  return contentTypeFor(extensionOf(leafName));
 }
 
 /**

@@ -29,7 +29,17 @@
 
     // "downgrade"（默认，把 infinity 当 Depth:1 处理，兼容性好）
     // "deny"（按 RFC 4918 返回 403 + DAV:propfind-finite-depth）
-    "DEPTH_INFINITY": "downgrade"
+    "DEPTH_INFINITY": "downgrade",
+
+    // 单文件大小上限（字节）。WebDAV PUT 与上传 API 共用；"0" 表示不限制。
+    // 免费层 R2 只有 10GB 且 WebDAV 完全匿名开放，没有上限时一个脚本就能写满配额。
+    // 200MiB（209715200）足够任何正常电子书（含高清扫图 PDF），又让滥用成本可控。
+    // 实测：超限时 PUT 返回 413 且不写库。
+    "MAX_UPLOAD_BYTES": "209715200",
+
+    // 每 IP 每日写操作上限；"0" 表示不限制。见 src/lib/throttle.ts。
+    // 300 次对正常使用（含批量导入整套书）绰绰有余，但让脚本无限灌文件不划算。
+    "DAILY_WRITE_QUOTA": "300"
   },
 
   // ── 资源绑定：故意不写 ID / 名称 ──────────────────────────────────────

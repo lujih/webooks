@@ -19,6 +19,8 @@ const cfg = (over: Partial<Settings> = {}): Settings => ({
   maxEntries: 200,
   propfindTtl: 300,
   depthInfinity: 'downgrade',
+  maxUploadBytes: 200 * 1024 * 1024,
+  dailyWriteQuota: 300,
   ...over,
 });
 

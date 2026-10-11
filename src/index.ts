@@ -11,13 +11,32 @@
 import { handleAdmin } from './api/admin';
 import { handleUploadComplete, handleUploadInit } from './api/upload';
 import { settings, type Env, type Settings } from './config';
-import { textResponse } from './lib/http';
+import { textResponse, withSecurityHeaders } from './lib/http';
 import { indexHtml } from './home-page';
 import { uploadHtml } from './upload-page';
 import { handleDav } from './webdav';
 
 export default {
   async fetch(request: Request, env: Env, _ctx: ExecutionContext): Promise<Response> {
+    // 所有出口统一补安全响应头，放在最外层是为了「不管走哪条分支都不会漏」。
+    return withSecurityHeaders(await route(request, env), wantsHtml(request));
+  },
+} satisfies ExportedHandler<Env>;
+
+/**
+ * 是否需要 HTML 专属响应头（含 CSP）。
+ * 只有「浏览器直接打开页面」的场景加 —— WebDAV 客户端的 207 不加 CSP，
+ * 避免被客户端误判为异常响应。
+ */
+function wantsHtml(request: Request): boolean {
+  const path = new URL(request.url).pathname;
+  if (path === '/' || path === '' || path === '/upload' || path === '/upload/') return true;
+  const accept = request.headers.get('accept') ?? '';
+  return request.method === 'GET' && accept.includes('text/html');
+}
+
+async function route(request: Request, env: Env): Promise<Response> {
+  {
     const url = new URL(request.url);
     const path = url.pathname;
 
@@ -81,8 +100,8 @@ export default {
     }
 
     return textResponse(404, 'Not Found');
-  },
-} satisfies ExportedHandler<Env>;
+  }
+}
 
 /**
  * 「先 deploy 再 migrate」是有意为之：wrangler 的自动资源创建只在 deploy 期间发生，

@@ -6,7 +6,7 @@
  */
 
 import { describe, expect, it } from 'vitest';
-import { parseEpub, PARSE_SIZE_CAP } from '../src/lib/epub';
+import { parseEpub, coverExtFor, PARSE_SIZE_CAP } from '../src/lib/epub';
 import { readZipDirectory, readZipEntry } from '../src/lib/zip';
 
 // ── 造一个最小 EPUB（全部 stored 条目，method=0）─────────────────────
@@ -260,5 +260,71 @@ describe('parseEpub', () => {
     ]);
     const meta = await parseEpub(zip);
     expect(meta!.cover).not.toBeNull();
+  });
+
+  // ── 安全：封面类型必须由字节决定，不能信 OPF 声明 ─────────────────────
+
+  it('安全：声明 media-type=text/html 的「封面」必须被丢弃（防任意内容托管）', async () => {
+    // 真实漏洞：早期实现把 OPF 的 media-type 直接当作 R2 的 Content-Type，
+    // 攻击者可借此把 HTML/JS 以 .html 存进公开桶，由项目域名原样返回。
+    const opfHtmlCover = OPF
+      .replace(
+        '<item id="cover" href="images/cover.jpg" media-type="image/jpeg" properties="cover-image"/>',
+        '<item id="cover" href="cover.html" media-type="text/html"/>',
+      )
+      .replace('<meta property="ebooks:cover">cover</meta>', '<meta name="cover" content="cover"/>');
+    const zip = buildZip([
+      ['META-INF/container.xml', CONTAINER],
+      ['OEBPS/content.opf', opfHtmlCover],
+      ['OEBPS/cover.html', '<!doctype html><script>alert(1)</script>'],
+    ]);
+    const meta = await parseEpub(zip);
+    expect(meta).not.toBeNull();
+    expect(meta!.title).toBe('三国 卷一');
+    expect(meta!.cover).toBeNull();
+  });
+
+  it('安全：声明 media-type=image/svg+xml 的封面必须被丢弃（SVG 可含脚本）', async () => {
+    const opfSvg = OPF.replace(
+      '<item id="cover" href="images/cover.jpg" media-type="image/jpeg" properties="cover-image"/>',
+      '<item id="cover" href="cover.svg" media-type="image/svg+xml" properties="cover-image"/>',
+    );
+    const zip = buildZip([
+      ['META-INF/container.xml', CONTAINER],
+      ['OEBPS/content.opf', opfSvg],
+      ['OEBPS/cover.svg', '<svg xmlns="http://www.w3.org/2000/svg"><script>alert(1)</script></svg>'],
+    ]);
+    const meta = await parseEpub(zip);
+    expect(meta!.cover).toBeNull();
+  });
+
+  it('安全：声明 image/jpeg 但内容其实是 HTML —— 按字节判定，仍被丢弃', async () => {
+    const zip = buildZip([
+      ['META-INF/container.xml', CONTAINER],
+      ['OEBPS/content.opf', OPF],
+      ['OEBPS/images/cover.jpg', '<!doctype html><h1>not an image</h1>'],
+    ]);
+    const meta = await parseEpub(zip);
+    expect(meta!.cover).toBeNull();
+  });
+
+  it('回归：安全修复不能误伤真实封面', async () => {
+    const zip = buildZip([
+      ['META-INF/container.xml', CONTAINER],
+      ['OEBPS/content.opf', OPF],
+      ['OEBPS/images/cover.jpg', tinyJpeg()],
+    ]);
+    const meta = await parseEpub(zip);
+    expect(meta!.cover).not.toBeNull();
+    expect(meta!.cover!.contentType).toBe('image/jpeg');
+  });
+
+  it('coverExtFor：只对白名单图片类型返回扩展名', () => {
+    expect(coverExtFor('image/jpeg')).toBe('jpg');
+    expect(coverExtFor('image/png')).toBe('png');
+    expect(coverExtFor('image/webp')).toBe('webp');
+    expect(coverExtFor('text/html')).toBeNull();
+    expect(coverExtFor('image/svg+xml')).toBeNull();
+    expect(coverExtFor('application/javascript')).toBeNull();
   });
 });

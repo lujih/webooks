@@ -26,7 +26,11 @@ export interface Env {
   R2_BUCKET_NAME?: string;
   /** 单文件大小上限（字节），默认 200 MiB */
   UPLOAD_MAX_BYTES?: string;
-  /** 每个 IP 每天允许的上传次数 */
+  /** 单文件大小上限（字节），WebDAV 与上传 API 共用；0 表示不限制 */
+  MAX_UPLOAD_BYTES?: string;
+  /** 每 IP 每日写操作上限；0 表示不限制 */
+  DAILY_WRITE_QUOTA?: string;
+  /** 每 IP 每天允许的上传次数（已由 DAILY_WRITE_QUOTA 取代，保留仅为兼容旧配置） */
   UPLOAD_DAILY_QUOTA?: string;
   MAX_ENTRIES?: string;
   PROPFIND_TTL?: string;
@@ -44,6 +48,10 @@ export interface Settings {
   /** PROPFIND 缓存 TTL（秒）；0 表示禁用缓存 */
   propfindTtl: number;
   depthInfinity: 'downgrade' | 'deny';
+  /** 单文件大小上限（字节）。WebDAV PUT 与上传 API 共用；0 表示不限制 */
+  maxUploadBytes: number;
+  /** 每 IP 每日写操作上限（尽力而为，见 lib/throttle.ts）；0 表示不限制 */
+  dailyWriteQuota: number;
 }
 
 /**
@@ -55,6 +63,21 @@ export const HARD_MAX_ENTRIES = 200;
 
 /** 分页子目录最多展示多少个，避免把单目录子项数撑爆。 */
 export const PAGINATION_MAX = 100;
+
+/**
+ * 单文件默认上限 200 MiB。
+ * 免费层 R2 只有 10GB，而 WebDAV 是完全匿名开放的 —— 没有上限时
+ * 一个脚本就能把配额写满（并触发超额计费）。200MiB 足够放任何正常电子书，
+ * 又让滥用成本可控。可用 MAX_UPLOAD_BYTES 覆盖。
+ */
+export const DEFAULT_MAX_UPLOAD_BYTES = 200 * 1024 * 1024;
+
+/**
+ * 每 IP 每日写操作默认上限。
+ * 300 次对正常使用者绰绰有余（批量导入一整套书也就几十次），
+ * 但让「脚本无限灌文件」变得不划算。设 0 可关闭。
+ */
+export const DEFAULT_DAILY_WRITE_QUOTA = 300;
 
 function intFrom(value: string | undefined, fallback: number, min: number, max: number): number {
   const n = Number.parseInt(value ?? '', 10);
@@ -76,5 +99,12 @@ export function settings(env: Env): Settings {
     maxEntries: intFrom(env.MAX_ENTRIES, 200, 1, HARD_MAX_ENTRIES),
     propfindTtl: intFrom(env.PROPFIND_TTL, 300, 0, 86_400),
     depthInfinity: env.DEPTH_INFINITY === 'deny' ? 'deny' : 'downgrade',
+    // 0 显式表示「不限制」；未配置走默认上限
+    maxUploadBytes: env.MAX_UPLOAD_BYTES === '0'
+      ? 0
+      : intFrom(env.MAX_UPLOAD_BYTES, DEFAULT_MAX_UPLOAD_BYTES, 1, 5 * 1024 * 1024 * 1024),
+    dailyWriteQuota: env.DAILY_WRITE_QUOTA === '0'
+      ? 0
+      : intFrom(env.DAILY_WRITE_QUOTA, DEFAULT_DAILY_WRITE_QUOTA, 1, 100_000),
   };
 }

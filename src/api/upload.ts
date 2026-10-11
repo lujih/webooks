@@ -18,11 +18,11 @@
 
 import type { Env } from '../config';
 import { letterBucket, normaliseFormat } from '../lib/collections';
-import { deriveMetadata, preferContentType } from '../lib/metadata';
+import { deriveMetadata, safeContentTypeFor, sanitiseLeafName } from '../lib/metadata';
 import { rebuildBuckets, upsertBook } from '../lib/db';
 import { shortId } from '../lib/http';
 import { createPresignedPutUrl } from '../lib/sigv4';
-import { parseEpub, PARSE_SIZE_CAP } from '../lib/epub';
+import { parseEpub, coverExtFor, PARSE_SIZE_CAP } from '../lib/epub';
 import { jsonResponse, textResponse } from '../lib/http';
 
 const SITEVERIFY = 'https://challenges.cloudflare.com/turnstile/v0/siteverify';
@@ -33,7 +33,6 @@ const ALLOWED_EXT = new Set([
 ]);
 
 const DEFAULT_MAX_BYTES = 200 * 1024 * 1024; // 200 MiB
-const DEFAULT_DAILY_QUOTA = 20; // 每 IP 每天上传次数
 
 interface InitBody {
   filename: string;
@@ -142,7 +141,9 @@ export async function handleUploadInit(request: Request, env: Env): Promise<Resp
     return jsonResponse({ error: 'invalid-filename' }, 400);
   }
   const key = `uploads/${todayKey()}/${shortId(6)}/${safeName}`;
-  const contentType = preferContentType(body.contentType ?? null, deriveMetadata(safeName).contentType);
+  // 预签名 URL 签的 Content-Type 同样按扩展名推导：客户端要么照发，要么签名不符。
+  // 这样 uploads/ 暂存对象也不会被做成 text/html。
+  const contentType = safeContentTypeFor(safeName);
 
   const amzDate = new Date().toISOString().replace(/[-:]/g, '').replace(/\.\d{3}/, '');
   const putUrl = await createPresignedPutUrl({
@@ -203,10 +204,17 @@ export async function handleUploadComplete(request: Request, env: Env): Promise<
     return jsonResponse({ error: 'file-too-large', maxBytes }, 413);
   }
 
-  const safeName = (filename || key.split('/').pop() || 'book').replace(/[\/\\]/g, '_');
+  // 文件名清洗必须与 WebDAV PUT 完全一致（sanitiseLeafName）。
+  // 早期实现只替换了 / 和 \，于是控制字符、<>:"|?* 与超长名字都能进 D1 ——
+  // 虽然后续渲染都有转义，但「入库前就该干净」是更可靠的防线。
+  const safeName =
+    sanitiseLeafName((filename || key.split('/').pop() || 'book').replace(/[\/\\]/g, '_')) ??
+    `book-${shortId(6)}`;
   const meta = deriveMetadata(safeName);
   const format = normaliseFormat(safeName.split('.').pop());
-  const contentType = head.httpMetadata?.contentType ?? meta.contentType;
+  // 安全关键：落 R2 的 Content-Type 只按扩展名推导，绝不用 uploads/ 里的元数据
+  // 或客户端声明的值 —— R2 对外提供的就是它，信任它等于允许 text/html 托管。
+  const contentType = safeContentTypeFor(safeName);
 
   // 从 uploads/ 搬到 books/ 并登记元数据（自动上架）。
   // 先确认源对象可读（R2 的 get 可能返回 null），再流式搬到目标键。
@@ -216,7 +224,7 @@ export async function handleUploadComplete(request: Request, env: Env): Promise<
   }
   const bookKey = `books/${shortId(8)}`;
   const copied = await env.BUCKET.put(bookKey, source.body, {
-    httpMetadata: { contentType: head.httpMetadata?.contentType ?? meta.contentType },
+    httpMetadata: { contentType },
   });
   await env.BUCKET.delete(key);
 
@@ -237,12 +245,15 @@ export async function handleUploadComplete(request: Request, env: Env): Promise<
           if (parsed.author) author = parsed.author;
           language = parsed.language;
           if (parsed.cover) {
-            const coverType = parsed.cover.contentType || 'image/jpeg';
-            const ext = coverType.split('/')[1]?.replace('jpeg', 'jpg') ?? 'jpg';
-            coverKey = `covers/${bookKey.slice('books/'.length)}.${ext}`;
-            await env.BUCKET.put(coverKey, new Uint8Array(parsed.cover.bytes), {
-              httpMetadata: { contentType: coverType },
-            });
+            const coverType = parsed.cover.contentType;
+            // 扩展名由白名单推导（封面类型只可能来自字节嗅探，见 epub.ts）
+            const ext = coverExtFor(coverType);
+            if (ext) {
+              coverKey = `covers/${bookKey.slice('books/'.length)}.${ext}`;
+              await env.BUCKET.put(coverKey, new Uint8Array(parsed.cover.bytes), {
+                httpMetadata: { contentType: coverType },
+              });
+            }
           }
         }
       }

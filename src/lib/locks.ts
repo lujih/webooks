@@ -156,6 +156,21 @@ export async function releaseLock(db: D1Database, token: string): Promise<void> 
 }
 
 /**
+ * 清扫已过期的锁。
+ *
+ * 为什么必须做：过期的锁虽然不再生效（所有查询都带 expires_at > now），
+ * 但行会永久留在表里。匿名开放的 LOCK 端点意味着任何人都能不断建锁，
+ * 表会无声膨胀直到 D1 配额被吃满。
+ *
+ * 在每次 LOCK 时顺带清理（LOCK 频率极低，多一条 DELETE 可忽略），
+ * 而不是定时任务 —— 免费层没有 Cron 绑定时也能生效。
+ */
+export async function sweepExpiredLocks(db: D1Database): Promise<number> {
+  const res = await db.prepare(`DELETE FROM locks WHERE expires_at <= ?`).bind(nowIso()).run();
+  return res.meta?.changes ?? 0;
+}
+
+/**
  * 取当前所有未过期活锁（PROPFIND 注入 lockdiscovery 用）。
  *
  * 为什么不用 IN 列表逐路径查：

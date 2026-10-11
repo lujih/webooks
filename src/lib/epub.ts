@@ -38,6 +38,56 @@ export interface EpubMeta {
  */
 const COVER_CAP = 8 * 1024 * 1024;
 
+/**
+ * 封面允许的图片类型白名单。
+ *
+ * 安全要点（真实漏洞）：OPF 里 `<item media-type="…">` 完全由上传者控制。
+ * 早期实现直接把这个声明值当作 R2 对象的 Content-Type 与扩展名，于是攻击者
+ * 只要声明 `media-type="text/html"`，就能把任意 HTML/JS 以 `.html` 存进公开桶，
+ * 由 `books.<域名>` 以 `text/html` 原样返回 —— 等于把项目域名变成任意内容
+ * 托管点（钓鱼 / 挂马 / SEO 垃圾），并埋下跨子域存储型 XSS 隐患。
+ *
+ * 现在改为：**只信任字节魔数嗅探的结果**，声明值一律忽略。
+ * SVG 刻意不入白名单 —— SVG 可内嵌 <script>，安全性等同 HTML。
+ */
+const COVER_TYPES: Record<string, { mime: string; ext: string }> = {
+  jpeg: { mime: 'image/jpeg', ext: 'jpg' },
+  png: { mime: 'image/png', ext: 'png' },
+  gif: { mime: 'image/gif', ext: 'gif' },
+  webp: { mime: 'image/webp', ext: 'webp' },
+  bmp: { mime: 'image/bmp', ext: 'bmp' },
+  avif: { mime: 'image/avif', ext: 'avif' },
+  tiff: { mime: 'image/tiff', ext: 'tiff' },
+};
+
+/** 由封面 MIME 推导安全的扩展名；非白名单类型返回 null */
+export function coverExtFor(contentType: string): string | null {
+  const hit = Object.values(COVER_TYPES).find((v) => v.mime === contentType);
+  return hit ? hit.ext : null;
+}
+
+/** 按魔数嗅探图片类型；返回白名单内的类型键，无法识别返回 null */
+function sniffImageType(bytes: ArrayBuffer): string | null {
+  if (bytes.byteLength < 12) return null;
+  const b = new Uint8Array(bytes);
+  const at = (i: number) => b[i] ?? -1;
+  const ascii = (i: number, s: string) =>
+    s.split('').every((c, k) => at(i + k) === c.charCodeAt(0));
+
+  if (at(0) === 0xff && at(1) === 0xd8 && at(2) === 0xff) return 'jpeg';
+  if (at(0) === 0x89 && ascii(1, 'PNG') && at(4) === 0x0d && at(5) === 0x0a) return 'png';
+  if (ascii(0, 'GIF87a') || ascii(0, 'GIF89a')) return 'gif';
+  if (ascii(0, 'RIFF') && ascii(8, 'WEBP')) return 'webp';
+  if (ascii(0, 'BM')) return 'bmp';
+  if (ascii(0, 'II') && at(2) === 0x2a && at(3) === 0x00) return 'tiff';
+  if (ascii(0, 'MM') && at(2) === 0x00 && at(3) === 0x2a) return 'tiff';
+  if (ascii(4, 'ftyp')) {
+    const brand = String.fromCharCode(at(8), at(9), at(10), at(11));
+    if (brand === 'avif' || brand === 'avis') return 'avif';
+  }
+  return null;
+}
+
 /** 容器名有大小写/前缀差异（`META-INF/` vs `Meta-inf/`），按「不区分大小写」匹配 */
 function findEntry(
   entries: Map<string, ZipEntry>,
@@ -163,12 +213,17 @@ export async function parseEpub(buf: ArrayBuffer): Promise<EpubMeta | null> {
   let cover: EpubMeta['cover'] = null;
   if (coverId && itemAttrs) {
     const href = (itemAttrs.match(/\bhref\s*=\s*"([^"]+)"/i)?.[1]) ?? null;
-    const mediaType = itemAttrs.match(/\bmedia-type\s*=\s*"([^"]+)"/i)?.[1] ?? 'image/jpeg';
     if (href) {
       const coverPath = resolveZipPath(opfDir, href);
       const coverBuf = await readZipEntry(buf, entries, coverPath);
       if (coverBuf && coverBuf.byteLength <= COVER_CAP) {
-        cover = { bytes: coverBuf, contentType: mediaType };
+        // 安全关键：**忽略 OPF 里声明的 media-type**，只按字节魔数判定类型。
+        // 声明值由上传者控制，信任它等于允许把 text/html 存进公开桶。
+        // 嗅探不出来（或不是白名单内的位图）就当作没有封面。
+        const sniffed = sniffImageType(coverBuf);
+        if (sniffed) {
+          cover = { bytes: coverBuf, contentType: COVER_TYPES[sniffed]!.mime };
+        }
       }
     }
   }
