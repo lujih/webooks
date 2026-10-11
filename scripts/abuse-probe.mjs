@@ -156,7 +156,7 @@ console.log('\n▸ 2b. 上传开放性（防误伤）');
     `PUT → ${r.status}`,
     r.status === 401 ? '防护误伤了新书上传！应只在「覆盖已有文件」时才要求口令。' : '',
   );
-  await dav(`/recent/${name}`, { method: 'DELETE' }).catch(() => {});
+  await davAuth(`/recent/${name}`, { method: 'DELETE' }).catch(() => {});
 }
 
 // ── 3. 上传是否必须过人机验证？ ────────────────────────────────────────
@@ -175,7 +175,7 @@ console.log('\n▸ 3. 人机验证覆盖范围');
     '网页上传页有 Turnstile 验证码，但 WebDAV 通道没有 —— 脚本可以直接批量上传。'
       + '配合「每日写入次数」节流可缓解（已启用，但只是减速带）。',
   );
-  await dav(`/recent/${name}`, { method: 'DELETE' });
+  await davAuth(`/recent/${name}`, { method: 'DELETE' }).catch(() => {});
 }
 
 // ── 4. 伪装文件：非电子书能否混进来？ ──────────────────────────────────

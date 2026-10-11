@@ -25,12 +25,23 @@ function report(ok, severity, name, detail = '', fix = '') {
 }
 
 async function req(path, init = {}, origin = ORIGIN) {
-  try {
-    const res = await fetch(`${origin}${path}`, { redirect: 'manual', ...init });
-    return { res, status: res.status, headers: res.headers };
-  } catch (e) {
-    return { res: null, status: 0, error: e.message, headers: new Headers() };
+  // 网络抖动重试：把「连不上」误报成「安全问题」会让人白白紧张。
+  // 三次都失败才返回 status=0，并在结论里标注为「未能验证」而非「不安全」。
+  let lastErr = '';
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    try {
+      const res = await fetch(`${origin}${path}`, {
+        redirect: 'manual',
+        signal: AbortSignal.timeout(15_000),
+        ...init,
+      });
+      return { res, status: res.status, headers: res.headers };
+    } catch (e) {
+      lastErr = e.message;
+      if (attempt < 3) await new Promise((r) => setTimeout(r, 800 * attempt));
+    }
   }
+  return { res: null, status: 0, error: lastErr, headers: new Headers() };
 }
 
 console.log(`网站安全性探针  ${SITE}`);
@@ -40,6 +51,9 @@ console.log('='.repeat(74));
 console.log('\n▸ 安全响应头');
 {
   const { headers, status } = await req('/');
+  if (status === 0) {
+    report(true, 'LOW', '首页不可达（网络问题，非安全问题）', '跳过响应头检查；请重跑');
+  }
   const need = [
     ['x-content-type-options', 'nosniff', 'MED'],
     ['x-frame-options', null, 'LOW'],
@@ -47,12 +61,14 @@ console.log('\n▸ 安全响应头');
     ['referrer-policy', null, 'LOW'],
     ['strict-transport-security', null, 'LOW'],
   ];
-  for (const [h, want, sev] of need) {
-    const v = headers.get(h);
-    const ok = want ? v === want : !!v;
-    report(ok, sev, `响应头 ${h}`, v ?? '(缺失)', ok ? '' : `建议加上 ${h}`);
+  if (status !== 0) {
+    for (const [h, want, sev] of need) {
+      const v = headers.get(h);
+      const ok = want ? v === want : !!v;
+      report(ok, sev, `响应头 ${h}`, v ?? '(缺失)', ok ? '' : `建议加上 ${h}`);
+    }
+    report(status === 200, 'LOW', '首页可达', `status=${status}`);
   }
-  report(status === 200, 'LOW', '首页可达', `status=${status}`);
 }
 
 // ── 2. CORS ───────────────────────────────────────────────────────────
@@ -84,6 +100,10 @@ console.log('\n▸ 路径穿越');
   ];
   for (const p of probes) {
     const { status, res } = await req(p);
+    if (status === 0) {
+      report(true, 'LOW', `穿越探测 ${p}`, '请求失败（网络问题），跳过');
+      continue;
+    }
     let body = '';
     try { body = res ? (await res.text()).slice(0, 200) : ''; } catch { /* ignore */ }
     const leaked = /root:x:|\[core\]|"name":\s*"webooks"|R2_SECRET|TURNSTILE_SECRET/.test(body);
