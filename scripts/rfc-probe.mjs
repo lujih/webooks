@@ -16,13 +16,27 @@
 
 const args = process.argv.slice(2);
 const urlIdx = args.indexOf('--url');
+const tIdx = args.indexOf('--token');
+/**
+ * 写口令。破坏性操作（覆盖已有文件 / DELETE / MOVE）现在需要口令，
+ * 不带上它会把「401 未授权」误报成「RFC 不合规」。
+ */
+const TOKEN = tIdx >= 0 ? args[tIdx + 1] : (process.env.WRITE_TOKEN ?? '');
 const BASE = (urlIdx >= 0 ? args[urlIdx + 1] : 'http://127.0.0.1:8787/dav/').replace(/\/+$/, '');
 const ORIGIN = new URL(BASE).origin;
 
 const C = { r: '\x1b[0m', y: '\x1b[33m', g: '\x1b[32m', red: '\x1b[31m', dim: '\x1b[2m' };
 
 async function req(path, init = {}) {
-  const res = await fetch(`${BASE}${path}`, init);
+  const res = await fetch(`${BASE}${path}`, {
+    redirect: 'manual',
+    signal: AbortSignal.timeout(20_000),
+    ...init,
+    // 默认带上写口令（读操作会忽略它），避免把授权问题误报成协议问题
+    headers: TOKEN
+      ? { authorization: `Bearer ${TOKEN}`, ...(init.headers ?? {}) }
+      : init.headers,
+  });
   const body = await res.text().catch(() => '');
   return { res, body };
 }
@@ -34,7 +48,8 @@ function check(name, ok, detail, ref) {
   console.log(`  ${tag} ${name}${detail ? `${C.dim} — ${detail}${C.r}` : ''}${ref ? `${C.dim} [${ref}]${C.r}` : ''}`);
 }
 
-// ── 造一个可写文件 ──
+// ── 造一个可写文件（后面的检查都基于它）──
+const tmp = `__rfcprobe_${Date.now()}.txt`;
 {
   const tmpRes = await req('/recent/' + tmp, { method: 'PUT', body: 'probe' });
   if (tmpRes.res.status !== 201 && tmpRes.res.status !== 204) {
