@@ -14,14 +14,18 @@
  */
 
 import { themeCss } from './lib/theme';
+import { collectionSegment, type CollectionId } from './lib/collections';
 
 export function indexHtml(mountPath: string, r2PublicBase: string | null): string {
   const mount = `${mountPath}/`;
+  // 集合路径段用中文：WebDAV 客户端与浏览器都以「路径末段」作为文件夹显示名，
+  // 所以想让它们显示中文，路径本身就必须是中文（displayname 属性很多客户端不读）。
+  const seg = (id: CollectionId) => encodeURIComponent(collectionSegment(id));
   const shelves = [
-    { path: `${mount}recent/`, title: '最近收录', sub: '新上架的书 · 倒序', icon: '新' },
-    { path: `${mount}title/`, title: '按书名', sub: 'A–Z 分桶浏览', icon: '名' },
-    { path: `${mount}author/`, title: '按作者', sub: '寻找同一位作者', icon: '著' },
-    { path: `${mount}format/`, title: '按格式', sub: 'EPUB / PDF / 有声书', icon: '式' },
+    { path: `${mount}${seg('recent')}/`, title: '最近收录', sub: '新上架的书 · 倒序', icon: '新' },
+    { path: `${mount}${seg('title')}/`, title: '按书名', sub: 'A–Z 分桶浏览', icon: '名' },
+    { path: `${mount}${seg('author')}/`, title: '按作者', sub: '寻找同一位作者', icon: '著' },
+    { path: `${mount}${seg('format')}/`, title: '按格式', sub: 'EPUB / PDF / 有声书', icon: '式' },
   ];
   const shelfHtml = shelves
     .map((s, i) => {

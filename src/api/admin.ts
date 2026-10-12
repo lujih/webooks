@@ -4,7 +4,7 @@
  */
 
 import type { Env, Settings } from '../config';
-import { letterBucket } from '../lib/collections';
+import { letterBucket, bucketSegment, collectionSegment } from '../lib/collections';
 import {
   adminListBooks,
   adminTotals,
@@ -116,14 +116,19 @@ async function deleteBooks(env: Env, cfg: Settings, request: Request): Promise<R
 
   if (deleted.length > 0) {
     await rebuildBuckets(env.DB);
-    // 让读者侧的目录缓存立刻失效，否则删掉的书在 TTL 内仍会显示
+    // 让读者侧的目录缓存立刻失效，否则删掉的书在 TTL 内仍会显示。
+    // 路径段必须与 nodePath() 一致（中文），否则缓存键对不上、失效没有效果。
+    const titleCol = collectionSegment('title');
+    const authorCol = collectionSegment('author');
+    const formatCol = collectionSegment('format');
+    const recentCol = collectionSegment('recent');
     const targets: Array<readonly [string, 0 | 1]> = [['/', 1]];
     for (const b of found) {
       targets.push(
-        [`/title/${b.title_letter}/`, 1],
-        [`/author/${b.author_letter}/`, 1],
-        [`/format/${b.format_bucket}/`, 1],
-        ['/recent/', 1],
+        [`/${titleCol}/${bucketSegment(b.title_letter)}/`, 1],
+        [`/${authorCol}/${bucketSegment(b.author_letter)}/`, 1],
+        [`/${formatCol}/${bucketSegment(b.format_bucket)}/`, 1],
+        [`/${recentCol}/`, 1],
       );
     }
     await purgeEntries(targets);

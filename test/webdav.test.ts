@@ -137,13 +137,17 @@ describe('OPTIONS', () => {
 // ── PROPFIND 结构 ───────────────────────────────────────────────────────
 
 describe('PROPFIND', () => {
-  it('根目录 Depth:1 列出四个集合', async () => {
+  it('根目录 Depth:1 列出四个集合（href 用中文段名）', async () => {
     const res = await propfind('/', '1');
     expect(res.status).toBe(207);
     const xml = await res.text();
     expect(xml).toContain('<D:multistatus xmlns:D="DAV:">');
-    for (const c of ['title', 'author', 'format', 'recent']) {
-      expect(xml).toContain(`<D:href>/dav/${c}/</D:href>`);
+    // 客户端用 href 末段当文件夹名，所以 href 必须是中文，
+    // 同时 displayname 也给中文（两类客户端都能显示对）
+    for (const label of ['按书名', '按作者', '按格式', '最近收录']) {
+      const enc = encodeURIComponent(label);
+      expect(xml, label).toContain(`<D:href>/dav/${enc}/</D:href>`);
+      expect(xml, label).toContain(`<D:displayname>${label}</D:displayname>`);
     }
     expect(xml).toContain('<D:collection/>');
     expect(res.headers.get('x-dav-entries')).toBe('5'); // root + 4 集合
@@ -154,7 +158,7 @@ describe('PROPFIND', () => {
     expect(res.status).toBe(207);
     expect(res.headers.get('x-dav-entries')).toBe('1');
     const xml = await res.text();
-    expect(xml).not.toContain('<D:href>/dav/title/</D:href>');
+    expect(xml).not.toContain('%E6%8C%89%E4%B9%A6%E5%90%8D'); // 不含「按书名」
   });
 
   it('Depth 缺失按 1 处理（有意偏离 RFC 4918）', async () => {
@@ -173,9 +177,10 @@ describe('PROPFIND', () => {
     await clearDavCache(ALL_PATHS);
     const res = await propfind('/title/', '1');
     const xml = await res.text();
-    expect(xml).toContain('<D:href>/dav/title/D/</D:href>');
-    expect(xml).toContain('<D:href>/dav/title/N/</D:href>');
-    expect(xml).not.toContain('<D:href>/dav/title/A/</D:href>'); // 没有 A 开头的书
+    // href 用中文段名（客户端据此显示中文文件夹名）
+    expect(xml).toContain(`<D:href>/dav/${encodeURIComponent('按书名')}/D/</D:href>`);
+    expect(xml).toContain(`<D:href>/dav/${encodeURIComponent('按书名')}/N/</D:href>`);
+    expect(xml).not.toContain(`<D:href>/dav/${encodeURIComponent('按书名')}/A/</D:href>`); // 没有 A 开头的书
   });
 
   it('列表页返回书叶子，href 经过 URL 编码', async () => {
@@ -183,7 +188,9 @@ describe('PROPFIND', () => {
     await clearDavCache(ALL_PATHS);
     const res = await propfind('/title/other/', '1');
     const xml = await res.text();
-    expect(xml).toContain(`<D:href>/dav/title/other/${encodeURIComponent('三体.epub')}</D:href>`);
+    expect(xml).toContain(
+      `<D:href>/dav/${encodeURIComponent('按书名')}/${encodeURIComponent('其他')}/${encodeURIComponent('三体.epub')}</D:href>`,
+    );
     expect(xml).toContain('<D:getcontentlength>1024</D:getcontentlength>');
     expect(xml).toContain('application/epub+zip');
   });
@@ -238,15 +245,16 @@ describe('PROPFIND', () => {
     const xml = await res.text();
     // self + MAX_ENTRIES 本书 + 1 个"第 2 页"目录
     const MAX = 200; // config.ts 里 HARD_MAX_ENTRIES / 默认值
+    const COL = encodeURIComponent('按书名');
     expect(Number(res.headers.get('x-dav-entries'))).toBe(MAX + 2);
-    expect(xml).toContain('<D:href>/dav/title/A/2/</D:href>');
-    expect(xml).not.toContain('<D:href>/dav/title/A/2/3/</D:href>');
+    expect(xml).toContain(`<D:href>/dav/${COL}/A/2/</D:href>`);
+    expect(xml).not.toContain(`<D:href>/dav/${COL}/A/2/3/</D:href>`);
 
     const page2 = await propfind('/title/A/2/', '1');
     expect(page2.status).toBe(207);
     // self + 剩余 50 本；第 2 页不应再列出指向自己的分页目录
     expect(Number(page2.headers.get('x-dav-entries'))).toBe(51);
-    expect(await page2.text()).not.toContain('<D:href>/dav/title/A/2/2/</D:href>');
+    expect(await page2.text()).not.toContain(`<D:href>/dav/${COL}/A/2/2/</D:href>`);
   });
 
   it('页码越界返回 404', async () => {
@@ -270,7 +278,7 @@ describe('PUT / GET / DELETE', () => {
 
     await clearDavCache(ALL_PATHS);
     const list = await propfind('/title/T/', '1');
-    expect(await list.text()).toContain('<D:href>/dav/title/T/Twilight.epub</D:href>');
+    expect(await list.text()).toContain(`<D:href>/dav/${encodeURIComponent('按书名')}/T/Twilight.epub</D:href>`);
   });
 
   it('PUT 覆盖同名文件返回 204 而不是新建', async () => {
@@ -349,7 +357,7 @@ describe('PUT / GET / DELETE', () => {
     // 不手动清缓存
     const after = await propfind('/title/T/', '1');
     expect(after.headers.get('x-dav-cache')).toBe('MISS');
-    expect(await after.text()).toContain('<D:href>/dav/title/T/Twilight.epub</D:href>');
+    expect(await after.text()).toContain(`<D:href>/dav/${encodeURIComponent('按书名')}/T/Twilight.epub</D:href>`);
   });
 
   it('PUT 到目录路径返回 405', async () => {

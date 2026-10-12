@@ -19,6 +19,8 @@ import { davCache, entriesCacheKey } from '../lib/cache';
 import {
   COLLECTIONS,
   bucketLabel,
+  bucketSegment,
+  collectionSegment,
   nodePath,
   resolveNode,
   type CollectionId,
@@ -238,10 +240,12 @@ export interface Entry {
 
 function bookEntry(collection: CollectionId, bucket: string, book: BookRow, r2PublicBase: string): Entry {
   const def = COLLECTIONS[collection];
+  // 路径段用中文（客户端的文件夹名取自 href 末段）
+  const col = collectionSegment(collection);
   return {
     path: def.bucketed
-      ? `/${collection}/${bucket}/${book.leaf_name}`
-      : `/${collection}/${book.leaf_name}`,
+      ? `/${col}/${bucketSegment(bucket)}/${book.leaf_name}`
+      : `/${col}/${book.leaf_name}`,
     isCollection: false,
     meta: {
       // 解析过 EPUB 时用真实书名/作者，否则退回文件名
@@ -280,7 +284,7 @@ export async function collectDavEntries(
       if (depth === 0) return entries;
       for (const def of Object.values(COLLECTIONS)) {
         entries.push({
-          path: `/${def.id}/`,
+          path: `/${def.segment}/`,
           isCollection: true,
           meta: { displayName: def.label },
         });
@@ -289,15 +293,17 @@ export async function collectDavEntries(
     }
 
     case 'nav': {
-      const label = COLLECTIONS[node.collection].label;
+      const def = COLLECTIONS[node.collection];
+      const label = def.label;
+      const col = def.segment;
       const entries: Entry[] = [
-        { path: `/${node.collection}/`, isCollection: true, meta: { displayName: label } },
+        { path: `/${col}/`, isCollection: true, meta: { displayName: label } },
       ];
       if (depth === 0) return entries;
       const buckets = await listBucketTotals(env.DB, node.collection);
       for (const b of buckets) {
         entries.push({
-          path: `/${node.collection}/${b.bucket}/`,
+          path: `/${col}/${bucketSegment(b.bucket)}/`,
           isCollection: true,
           meta: { displayName: bucketLabel(b.bucket) },
         });
@@ -327,9 +333,12 @@ export async function collectDavEntries(
       if (node.page === 1) {
         const pageCount = Math.min(Math.ceil(total / cfg.maxEntries), PAGINATION_MAX + 1);
         const def = COLLECTIONS[node.collection];
+        const col = def.segment;
         for (let p = 2; p <= pageCount; p++) {
           entries.push({
-            path: def.bucketed ? `/${node.collection}/${node.bucket}/${p}/` : `/${node.collection}/${p}/`,
+            path: def.bucketed
+              ? `/${col}/${bucketSegment(node.bucket)}/${p}/`
+              : `/${col}/${p}/`,
             isCollection: true,
             meta: { displayName: `第 ${p} 页` },
           });

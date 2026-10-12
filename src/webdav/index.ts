@@ -1,7 +1,7 @@
 /** WebDAV 方法分发。完整 Class 2（含 LOCK/UNLOCK/MKCOL/PROPPATCH/MOVE/COPY）。 */
 
 import type { Env, Settings } from '../config';
-import { letterBucket, resolveNode, type DavNode } from '../lib/collections';
+import { letterBucket, canonicalDavPath, decodeDavPath, resolveNode, type DavNode } from '../lib/collections';
 import { deleteBook, findBookByLeaf, rebuildBuckets, upsertBook, listBooks } from '../lib/db';
 import { methodNotAllowed, shortId, textResponse } from '../lib/http';
 import { safeContentTypeFor, deriveMetadata, sanitiseLeafName } from '../lib/metadata';
@@ -56,17 +56,20 @@ export async function handleDav(
   if (method === 'PROPFIND') return handlePropfind(request, env, cfg, davPath);
 
   const node = resolveNode(davPath);
+  // 锁资源键必须用规范路径：客户端可能用 /recent/（旧英文），也可能用 /最近收录/（中文），
+  // 两种写法指向同一本书，不归一的话「加锁」和「写入」会落在不同键上，锁就形同虚设。
+  const lockKey = canonicalDavPath(davPath);
 
   switch (method) {
     case 'GET':
     case 'HEAD':
       return handleGet(env, cfg, node, davPath, method === 'HEAD');
     case 'PUT':
-      return handleLockedWrite(request, () => handlePut(request, env, node, davPath, cfg), env, davPath);
+      return handleLockedWrite(request, () => handlePut(request, env, node, davPath, cfg), env, lockKey);
     case 'DELETE':
       // 删除是破坏性操作：需要共享口令。读与新增保持匿名。
       if (!hasWriteToken(request, cfg.writeToken)) return unauthorizedResponse();
-      return handleLockedWrite(request, () => handleDelete(env, node, davPath), env, davPath);
+      return handleLockedWrite(request, () => handleDelete(env, node, davPath), env, lockKey);
     case 'MKCOL':
       return handleMkcol(request, env, node, davPath);
     case 'MOVE':
@@ -76,9 +79,9 @@ export async function handleDav(
       // COPY 不破坏原书，但会新增文件，走与 PUT 相同的节流即可，不额外要口令
       return handleMoveCopy(request, env, cfg, node, davPath, false);
     case 'LOCK':
-      return handleLock(request, env, davPath);
+      return handleLock(request, env, lockKey);
     case 'UNLOCK':
-      return handleUnlock(request, env, davPath);
+      return handleUnlock(request, env, lockKey);
     case 'PROPPATCH':
       return handleProppatch(request, env, node, davPath);
     default:
@@ -298,8 +301,8 @@ async function handleMoveCopy(
     return textResponse(400, 'Destination must be a file path', { allow: ALLOW });
   }
 
-  // 锁检查：源和目标都不能被锁住
-  for (const p of [davPath, targetDavPath]) {
+  // 锁检查：源和目标都不能被锁住（同样用规范路径，与 LOCK/PUT 保持一致）
+  for (const p of [canonicalDavPath(davPath), canonicalDavPath(targetDavPath)]) {
     const lock = await liveLockForResource(env.DB, p);
     if (lock) return lockConflictResponse(lock, p);
   }
@@ -446,7 +449,12 @@ async function handleGet(
     'cache-control': 'public, max-age=300',
   };
   if (headOnly) return new Response(null, { status: 200, headers });
-  return new Response(renderHtmlIndex(davPath, entries, cfg.mountPath), { status: 200, headers });
+  // 传「解码后」的路径：否则面包屑/标题会显示 %E6%8C%89…，
+  // 而且与 entry.path（解码后的节点路径）比较会不相等，导致自己也被列成子项。
+  return new Response(renderHtmlIndex(decodeDavPath(davPath), entries, cfg.mountPath), {
+    status: 200,
+    headers,
+  });
 }
 
 function encodeR2Key(key: string): string {

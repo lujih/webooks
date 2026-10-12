@@ -2,6 +2,9 @@
 
 import { describe, expect, it } from 'vitest';
 import {
+  bucketFromSegment,
+  bucketSegment,
+  canonicalDavPath,
   letterBucket,
   nodePath,
   normaliseFormat,
@@ -85,11 +88,46 @@ describe('resolveNode', () => {
     });
   });
 
-  it('nodePath 与 resolveNode 互相可逆', () => {
-    for (const p of ['/', '/title/', '/title/A/', '/title/A/3/', '/recent/', '/recent/2/']) {
-      const node = resolveNode(p);
-      expect(nodePath(node)).toBe(p);
+  it('nodePath 与 resolveNode 互相可逆（规范形式为中文段名）', () => {
+    // nodePath 生成的是「规范形式」：集合与桶段都是中文
+    const cases: Array<[string, string]> = [
+      ['/', '/'],
+      ['/title/', '/按书名/'],
+      ['/按书名/', '/按书名/'],
+      ['/title/A/', '/按书名/A/'],
+      ['/title/A/3/', '/按书名/A/3/'],
+      ['/recent/', '/最近收录/'],
+      ['/recent/2/', '/最近收录/2/'],
+    ];
+    for (const [input, expected] of cases) {
+      expect(nodePath(resolveNode(input)), input).toBe(expected);
     }
+  });
+
+  it('英文段名与中文段名指向同一个节点（旧链接兼容）', () => {
+    expect(resolveNode('/recent/')).toEqual(resolveNode('/最近收录/'));
+    expect(resolveNode('/title/A/')).toEqual(resolveNode('/按书名/A/'));
+    expect(resolveNode('/recent/x.epub')).toEqual(resolveNode('/最近收录/x.epub'));
+  });
+
+  it('canonicalDavPath 把两种写法归一到同一个键', () => {
+    // 缓存键与锁资源都用它，不归一会导致「失效打不中」「锁形同虚设」
+    expect(canonicalDavPath('/recent/')).toBe('/最近收录/');
+    expect(canonicalDavPath('/最近收录/')).toBe('/最近收录/');
+    expect(canonicalDavPath('/title/A/')).toBe('/按书名/A/');
+    expect(canonicalDavPath('/recent/x.epub')).toBe('/最近收录/x.epub');
+    expect(canonicalDavPath('/')).toBe('/');
+    // 未知集合原样返回，交给 resolveNode 判 unknown
+    expect(canonicalDavPath('/nope/')).toBe('/nope/');
+  });
+
+  it('「其他」桶：路径段中文、内部 id 仍是 other', () => {
+    expect(bucketSegment('other')).toBe('其他');
+    expect(bucketFromSegment('其他')).toBe('other');
+    expect(bucketSegment('A')).toBe('A');
+    // 两种写法解析结果一致
+    expect(resolveNode('/title/其他/')).toEqual(resolveNode('/title/other/'));
+    expect(nodePath(resolveNode('/title/other/'))).toBe('/按书名/其他/');
   });
 });
 

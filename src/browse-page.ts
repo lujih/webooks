@@ -13,6 +13,7 @@
 
 import type { Entry } from './webdav/propfind';
 import { themeCss } from './lib/theme';
+import { encodeHref } from './lib/xml';
 
 /** 格式 → 中文短标（不用 emoji，用文字/矢量） */
 const FORMAT_LABEL: Record<string, string> = {
@@ -34,14 +35,15 @@ function formatSize(bytes: number): string {
   return `${(bytes / 1024 / 1024 / 1024).toFixed(2)} GB`;
 }
 
-/** 集合 ID → 中文标签（面包屑用） */
+/** 集合路径段 → 中文标签。路径段现在本身就是中文，这里同时兼容旧的英文链接 */
 const COLLECTION_LABEL: Record<string, string> = {
   title: '按书名', author: '按作者', format: '按格式', recent: '最近收录',
+  按书名: '按书名', 按作者: '按作者', 按格式: '按格式', 最近收录: '最近收录',
 };
 
-/** 桶名 → 展示名（other 桶是中文/非字母书的归集处） */
+/** 桶名 → 展示名（other 桶装的是中文书，路径段已改为「其他」） */
 function bucketName(b: string): string {
-  return b === 'other' ? '其他' : b;
+  return b === 'other' || b === '其他' ? '其他' : b;
 }
 
 /** 由 davPath 生成友好标题，避免把裸路径当标题 */
@@ -61,7 +63,11 @@ function friendlyTitle(davPath: string): string {
     .join(' · ');
 }
 
-/** 把 davPath 拆成面包屑层级（每段带累计链接） */
+/**
+ * 把 davPath 拆成面包屑层级（每段带累计链接）。
+ * href 统一走 encodeHref 做百分号编码 —— 路径段是中文，且文件名可能含 `#`
+ * 这类会截断 URL 的字符，不编码就会产生坏链。
+ */
 function crumbs(davPath: string, mountPath: string): string {
   const segs = davPath.split('/').filter(Boolean);
   const parts: string[] = [
@@ -82,7 +88,9 @@ function crumbs(davPath: string, mountPath: string): string {
     if (isLast) {
       parts.push(`<span class="here">${esc(label)}</span>`);
     } else {
-      parts.push(`<a href="${esc(mountPath)}${esc(acc)}/">${esc(label)}</a>`);
+      parts.push(
+        `<a href="${esc(mountPath)}${encodeHref(acc, true)}">${esc(label)}</a>`,
+      );
     }
   });
   return parts.join('');
@@ -101,7 +109,8 @@ export function renderBrowsePage(
   const gridOf = (list: Entry[]): string =>
     list
       .map((e, i) => {
-        const href = esc(`${mountPath}${e.path}`);
+        // encodeHref 做百分号编码：路径段是中文，且文件名可能含 # 之类会截断 URL 的字符
+        const href = esc(`${mountPath}${encodeHref(e.path, e.isCollection)}`);
         const delay = `calc(.05s + ${i} * .035s)`;
         if (e.isCollection) {
           const label = e.meta.displayName.replace(/\/$/, '');
