@@ -21,6 +21,11 @@ export interface Env {
   TURNSTILE_SITE_KEY?: string;
   /** Turnstile 私钥（服务端 siteverify 用），必须是 secret */
   TURNSTILE_SECRET?: string;
+  /**
+   * 批量上传通行证的签名密钥。**可选** —— 不配就退回 TURNSTILE_SECRET，
+   * 不引入新的必填配置。想独立轮换通行证密钥时再单独设置。
+   */
+  UPLOAD_TICKET_SECRET?: string;
   /** R2 API 凭据：Access Key ID，用于签发预签名 URL */
   R2_ACCESS_KEY_ID?: string;
   /** R2 API 凭据：Secret Access Key，用于签名（必须是 secret） */

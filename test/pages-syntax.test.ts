@@ -110,19 +110,33 @@ describe('页面内联脚本语法自检', () => {
     expect(csp).toContain('static.cloudflareinsights.com');
   });
 
-  it('每个文件都领取新的人机验证令牌（否则第 2 本起必定 403）', async () => {
-    // Turnstile 令牌是一次性的。批量上传时如果只取一次令牌，
-    // 第 2 个文件必然拿到 403 turnstile-failed，看起来像"批量上传坏了"。
-    // 所以上传页必须有「取令牌」的封装，并在其中 reset 组件领取新令牌。
+  it('批量上传一批只验证一次（用通行证复用，而不是每本弹一次验证）', async () => {
+    // 真实反馈：早期实现「每个文件领一个新令牌」，导致传 10 本要点 10 次验证。
+    // 现在改成：第一次带一次性令牌，服务端回一张限时通行证，整批复用。
     const res = await SELF.fetch(`${ORIGIN}/upload`, { headers: { accept: 'text/html' } });
     const html = await res.text();
     const code = inlineScripts(html).join('\n');
-    expect(code).toContain('takeToken');
-    expect(code).toContain('turnstile.reset');
-    // 队列里每个文件都要单独取令牌
-    expect(code).toMatch(/await\s+takeToken\(\)/);
-    // 不能再有「一个全局 token 变量反复复用」的老写法
-    // （turnstileToken 作为 API 请求体的字段名仍会出现，所以只禁止赋值）
-    expect(code).not.toMatch(/turnstileToken\s*=[^=]/);
+
+    // 通行证：有就复用，服务端每次回的新通行证要存下来
+    expect(code).toContain('ticket');
+    expect(code).toMatch(/if\(ticket\)\s*body\.ticket\s*=\s*ticket/);
+    expect(code).toMatch(/if\(initJson\.ticket\)\s*ticket\s*=\s*initJson\.ticket/);
+    // 只在没有通行证（或通行证失效重试）时才去取一次性令牌 —— 不能每本都取
+    expect(code).toMatch(/else\s+body\.turnstileToken\s*=\s*await\s+takeToken\(\)/);
+    const perFileToken = code.match(/body\.turnstileToken\s*=\s*await\s+takeToken\(\)/g) ?? [];
+    // 两处：首次（无通行证）+ 通行证失效后的重试。不应更多。
+    expect(perFileToken.length).toBeLessThanOrEqual(2);
+    // 通行证失效时要能自动换令牌重试
+    expect(code).toContain('ticket-invalid');
+  });
+
+  it('人机验证设成 interaction-only（正常用户看不到验证框）', async () => {
+    const res = await SELF.fetch(`${ORIGIN}/upload`, { headers: { accept: 'text/html' } });
+    const html = await res.text();
+    const code = inlineScripts(html).join('\n');
+    expect(code).toContain("appearance: 'interaction-only'");
+    // 不能再有「一个全局 token 变量反复复用」的老写法。
+    // 只匹配裸变量赋值（`turnstileToken = x`），排除对象属性（`body.turnstileToken = x`）。
+    expect(code).not.toMatch(/(^|[^.\w])turnstileToken\s*=[^=]/);
   });
 });

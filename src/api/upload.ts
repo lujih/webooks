@@ -18,6 +18,7 @@
 
 import type { Env } from '../config';
 import { ALLOWED_UPLOAD_FORMATS, isAllowedUploadExt, letterBucket, normaliseFormat } from '../lib/collections';
+import { safeEqual } from '../lib/auth';
 import { deriveMetadata, safeContentTypeFor, sanitiseLeafName } from '../lib/metadata';
 import { rebuildBuckets, upsertBook } from '../lib/db';
 import { shortId } from '../lib/http';
@@ -42,7 +43,10 @@ interface InitBody {
   filename: string;
   size: number;
   contentType?: string;
-  turnstileToken: string;
+  /** 一次性人机验证令牌（与 ticket 二选一） */
+  turnstileToken?: string;
+  /** 批量通行证：通过一次验证后拿到，整批上传复用（与 turnstileToken 二选一） */
+  ticket?: string;
 }
 
 /** 校验 Turnstile token。服务端验证是强制的。 */
@@ -75,6 +79,72 @@ function todayKey(): string {
   return new Date().toISOString().slice(0, 10); // UTC 日期
 }
 
+// ── 批量上传通行证 ──────────────────────────────────────────────────────
+//
+// 为什么要它：Turnstile 令牌是**一次性**的。批量传 N 本书就需要 N 个令牌，
+// 而每领一个新令牌都要 reset 组件 → 用户看到 **每本书弹一次验证**，
+// 传 10 本就要点 10 次，完全没法用。
+//
+// 解法：把「验证码」与「上传次数」解耦 —— 通过一次人机验证，换一张
+// 限时通行证，整批上传都用它。这样一批只验证一次。
+//
+// 设计成无状态（HMAC 签名）而不是存数据库：
+//   · 不占 D1 写入额度，不需要额外表
+//   · 通行证格式：<过期时间戳>.<签名>，签名覆盖「过期时间 + 请求方 IP」
+//   · 不把 IP 放进通行证里 —— 验证时用当前请求的 IP 重新算签名比对即可，
+//     这样通行证更短，且**无法被搬到别的 IP 上使用**
+//
+// 安全性权衡（有意为之）：一张通行证在有效期内可多次使用。
+// 但匿名上传本来就有「每日写入次数」节流的硬上限，验证码的边际价值有限；
+// 用「一个验证码换 10 分钟通行证」换来的可用性提升是值得的。
+
+/** 通行证有效期：够传完一批，又不至于被长期复用 */
+const TICKET_TTL_SECONDS = 600;
+
+function ticketSecret(env: Env): string | null {
+  // 优先用专用密钥；没配就退回 TURNSTILE_SECRET（上传能跑就一定有它），
+  // 这样不引入新的必填配置。
+  return env.UPLOAD_TICKET_SECRET || env.TURNSTILE_SECRET || null;
+}
+
+async function hmacHex(secret: string, data: string): Promise<string> {
+  const key = await crypto.subtle.importKey(
+    'raw',
+    new TextEncoder().encode(secret) as BufferSource,
+    { name: 'HMAC', hash: 'SHA-256' },
+    false,
+    ['sign'],
+  );
+  const sig = await crypto.subtle.sign('HMAC', key, new TextEncoder().encode(data) as BufferSource);
+  return Array.from(new Uint8Array(sig), (b) => b.toString(16).padStart(2, '0')).join('');
+}
+
+/** 签发一张批量通行证（IP 绑定 + 限时） */
+export async function mintTicket(env: Env, ip: string): Promise<string | null> {
+  const secret = ticketSecret(env);
+  if (!secret) return null;
+  const exp = Math.floor(Date.now() / 1000) + TICKET_TTL_SECONDS;
+  const sig = await hmacHex(secret, `${exp}|${ip}`);
+  return `${exp}.${sig}`;
+}
+
+/** 校验批量通行证：签名对、未过期、且是同一个 IP 签发的 */
+export async function verifyTicket(env: Env, ticket: string, ip: string): Promise<boolean> {
+  const secret = ticketSecret(env);
+  if (!secret || !ticket) return false;
+  const dot = ticket.indexOf('.');
+  if (dot <= 0) return false;
+  const expPart = ticket.slice(0, dot);
+  const sigPart = ticket.slice(dot + 1);
+  if (!/^[0-9]{1,12}$/.test(expPart) || !/^[0-9a-f]{64}$/.test(sigPart)) return false;
+
+  const exp = Number(expPart);
+  if (!Number.isFinite(exp) || exp * 1000 < Date.now()) return false;
+
+  const expected = await hmacHex(secret, `${exp}|${ip}`);
+  return safeEqual(expected, sigPart);
+}
+
 export async function handleUploadInit(request: Request, env: Env): Promise<Response> {
   if (request.method !== 'POST') {
     return textResponse(405, 'Method Not Allowed', { allow: 'POST' });
@@ -87,7 +157,7 @@ export async function handleUploadInit(request: Request, env: Env): Promise<Resp
     return jsonResponse({ error: 'bad-json' }, 400);
   }
 
-  const { filename, size, turnstileToken } = body;
+  const { filename, size, turnstileToken, ticket } = body;
 
   // ── 输入校验放在最前面 ──
   // 两个理由：
@@ -99,9 +169,6 @@ export async function handleUploadInit(request: Request, env: Env): Promise<Resp
   }
   if (typeof size !== 'number' || !Number.isFinite(size) || size <= 0) {
     return jsonResponse({ error: 'size-required' }, 400);
-  }
-  if (typeof turnstileToken !== 'string' || !turnstileToken) {
-    return jsonResponse({ error: 'turnstile-token-required' }, 400);
   }
 
   // 扩展名白名单：电子书 + 漫画。isAllowedUploadExt 会先归一化
@@ -134,11 +201,24 @@ export async function handleUploadInit(request: Request, env: Env): Promise<Resp
     return jsonResponse({ error: 'file-too-large', maxBytes }, 413);
   }
 
-  // Turnstile 验证（fail-closed）
+  // ── 人机验证（fail-closed）──
+  // 两条路径，二选一：
+  //   · ticket         —— 之前某次验证换来的批量通行证（整批复用，不再打扰用户）
+  //   · turnstileToken —— 一次性令牌，验完立刻换一张通行证返回给客户端
   const ip = clientIp(request);
-  const ok = await verifyTurnstile(env, turnstileToken, ip);
-  if (!ok) {
-    return jsonResponse({ error: 'turnstile-failed' }, 403);
+  let human = false;
+  if (typeof ticket === 'string' && ticket) {
+    human = await verifyTicket(env, ticket, ip);
+    if (!human) {
+      // 通行证过期/伪造：让客户端重新验证，而不是笼统报错
+      return jsonResponse({ error: 'ticket-invalid' }, 403);
+    }
+  } else if (typeof turnstileToken === 'string' && turnstileToken) {
+    human = await verifyTurnstile(env, turnstileToken, ip);
+    if (!human) return jsonResponse({ error: 'turnstile-failed' }, 403);
+  }
+  if (!human) {
+    return jsonResponse({ error: 'turnstile-token-required' }, 400);
   }
 
   // 生成对象键：上传暂存到 uploads/ 前缀（Phase 1 可加隔离区）。
@@ -170,12 +250,18 @@ export async function handleUploadInit(request: Request, env: Env): Promise<Resp
     amzDate,
   });
 
+  // 返回一张通行证：客户端拿它传这一批的后续文件，不必再打扰用户验证。
+  // 用 token 换 ticket 时是「首次验证」，用 ticket 再来时等于续期（同样限时）。
+  const nextTicket = await mintTicket(env, ip);
+
   return jsonResponse({
     uploadUrl: putUrl,
     key,
     method: 'PUT',
     headers: { 'content-type': contentType },
     expiresIn: 900,
+    ticket: nextTicket,
+    ticketExpiresIn: nextTicket ? TICKET_TTL_SECONDS : null,
   });
 }
 

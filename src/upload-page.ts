@@ -269,9 +269,19 @@ function render(){
 
 function msg(text, cls){ const m=$('msg'); m.textContent=text; m.className='msg'+(text?' show ':' ')+(cls||''); }
 
-// ── Turnstile 令牌队列 ────────────────────────────────────────────────
-// 令牌一次性：每个文件都要一个新令牌。维护「一个缓冲 + 一个等待者」即可，
-// 因为上传是串行的。
+// ── 人机验证：一批只验证一次 ──────────────────────────────────────────
+//
+// Turnstile 令牌是**一次性**的。如果每本书都去领一个新令牌，用户就会
+// 「传一本弹一次验证」—— 传 10 本要点 10 次，没法用（真实反馈）。
+//
+// 所以改成：第一次上传带一次性令牌，服务端验完**回一张限时通行证**；
+// 这一批剩下的文件都用通行证，不再打扰用户。通行证过期（10 分钟）或
+// 失效时才重新走一次验证。
+//
+// 同时把 widget 设成 interaction-only：正常用户根本看不到验证框，
+// 只有 Cloudflare 判定可疑时才弹出来要求交互。
+
+let ticket = null;       // 批量通行证（服务端签发，限时 + 绑定 IP）
 let bufferedToken = null;
 let tokenWaiter = null;
 
@@ -280,7 +290,7 @@ function onToken(t){
   else bufferedToken = t;
 }
 
-/** 取一个可用令牌；没有就 reset 组件向 Turnstile 要一个新的。 */
+/** 取一个一次性令牌；没有就 reset 组件向 Turnstile 要一个新的。 */
 function takeToken(timeoutMs){
   if(bufferedToken){ const t = bufferedToken; bufferedToken = null; return Promise.resolve(t); }
   return new Promise((resolve, reject) => {
@@ -311,6 +321,8 @@ async function renderWidget(){
   await loadTurnstile();
   window.turnstile.render('#ts', {
     sitekey: siteKey,
+    // interaction-only：正常用户看不到验证框，只有被判可疑时才弹出来要求交互
+    appearance: 'interaction-only',
     callback: onToken,
     'expired-callback': () => { bufferedToken = null; },
     'error-callback': () => { /* 交给 takeToken 的超时兜底 */ },
@@ -359,7 +371,8 @@ async function putToR2WithRetry(url, blob, contentType, onProgress, maxAttempts)
 
 function tipFor(code, json){
   const map = {
-    'turnstile-failed': '人机验证失败，正在换一个新令牌重试',
+    'turnstile-failed': '人机验证失败，正在重新验证',
+    'ticket-invalid': '通行证已过期，正在重新验证',
     'file-too-large': '文件超过服务器限制',
     'unsupported-format': '不支持的文件类型',
     'upload-not-configured': '服务器尚未配置上传功能：缺少 ' + ((json && json.missing) || []).join(', '),
@@ -373,18 +386,39 @@ async function uploadOne(item){
   item.status = 'uploading'; item.pct = 0; item.error = null; item.result = null;
   render();
 
-  const token = await takeToken();
-  const initRes = await fetch('/api/upload/init', {
+  // 有通行证就复用它（整批只验证一次）；没有才去取一次性令牌
+  const body = {
+    filename: item.file.name, size: item.file.size,
+    contentType: item.file.type || '',
+  };
+  if(ticket) body.ticket = ticket;
+  else body.turnstileToken = await takeToken();
+
+  let initRes = await fetch('/api/upload/init', {
     method:'POST', headers:{'content-type':'application/json'},
-    body: JSON.stringify({
-      filename: item.file.name, size: item.file.size,
-      contentType: item.file.type || '', turnstileToken: token,
-    }),
+    body: JSON.stringify(body),
   });
-  const initJson = await initRes.json().catch(() => ({}));
+  let initJson = await initRes.json().catch(() => ({}));
+
+  // 通行证失效 → 换一次性令牌重试一次（不消耗用户的第二次手动操作：
+  // interaction-only 下多数情况仍是静默通过）
+  if(!initRes.ok && (initJson.error === 'ticket-invalid' || initJson.error === 'turnstile-failed')){
+    ticket = null;
+    bufferedToken = null;
+    body.turnstileToken = await takeToken();
+    delete body.ticket;
+    initRes = await fetch('/api/upload/init', {
+      method:'POST', headers:{'content-type':'application/json'},
+      body: JSON.stringify(body),
+    });
+    initJson = await initRes.json().catch(() => ({}));
+  }
+
   if(!initRes.ok){
     throw new Error(tipFor(initJson.error || ('HTTP ' + initRes.status), initJson));
   }
+  // 服务端每次都会回一张新通行证（等于续期），后续文件继续免验证
+  if(initJson.ticket) ticket = initJson.ticket;
 
   await putToR2WithRetry(
     initJson.uploadUrl, item.file, initJson.headers['content-type'],
