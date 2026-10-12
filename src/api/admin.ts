@@ -6,7 +6,7 @@
 import type { Env, Settings } from '../config';
 import {
   COLLECTIONS,
-  letterBucket,
+  authorBucket, letterBucket,
   bucketSegment,
   collectionSegment,
   mediaKindOfFormat,
@@ -20,9 +20,18 @@ import {
   rebuildBuckets,
   upsertBookStatement,
 } from '../lib/db';
+import { sniffKindFromBucket } from '../lib/kind-sniff';
 import { hasAdminToken } from '../lib/auth';
 import { jsonResponse, textResponse } from '../lib/http';
-import { deriveMetadata, leafNameFromKey, safeContentTypeFor, sanitiseLeafName, sha256Hex } from '../lib/metadata';
+import {
+  deriveMetadata,
+  guessAuthorFromText,
+  leafNameFromKey,
+  normaliseAuthor,
+  safeContentTypeFor,
+  sanitiseLeafName,
+  sha256Hex,
+} from '../lib/metadata';
 import { davCache, purgeEntries } from '../lib/cache';
 
 const BATCH_SIZE = 50;
@@ -56,6 +65,8 @@ export async function handleAdmin(
       return listBooksAction(env, url);
     case 'delete':
       return deleteBooks(env, cfg, request);
+    case 'update':
+      return updateBook(env, request);
     case 'purge':
       return purge(env, cfg, url);
     default:
@@ -88,12 +99,78 @@ async function listBooksAction(env: Env, url: URL): Promise<Response> {
       title: b.title,
       author: b.author,
       format: b.format,
+      // 内容嗅探出的类型（ebook/comic/audio），管理页用它渲染下拉框
+      kind: b.kind_bucket,
       size: b.size,
       createdAt: b.created_at,
       hasCover: !!b.cover_key,
     })),
     security: securityStatus(env),
   });
+}
+
+/**
+ * 手动修正一本书的作者与类型。
+ *
+ * 为什么必须有这个：作者猜测和「电子书/漫画」嗅探都是**启发式**，
+ * 再准也会有判错的时候（PDF 漫画用对象流压缩、作者名是笔名、
+ * 文件名格式古怪……）。没有人工兜底的话，用户看到错误分类就束手无策。
+ * 这里改的是 D1 里的分类字段，不动 R2 内容。
+ */
+async function updateBook(env: Env, request: Request): Promise<Response> {
+  let body: { leafName?: unknown; author?: unknown; kind?: unknown; title?: unknown };
+  try {
+    body = (await request.json()) as typeof body;
+  } catch {
+    return jsonResponse({ error: 'bad-json' }, 400);
+  }
+  const leafName = typeof body.leafName === 'string' ? body.leafName : '';
+  if (!leafName) return jsonResponse({ error: 'leaf-name-required' }, 400);
+
+  const row = await env.DB
+    .prepare(`SELECT id, title, author, format_bucket FROM books WHERE leaf_name = ?`)
+    .bind(leafName)
+    .first<{ id: string; title: string; author: string | null; format_bucket: string }>();
+  if (!row) return jsonResponse({ error: 'not-found' }, 404);
+
+  // 只更新明确传了的字段；空字符串表示「清空作者」
+  const patch: string[] = [];
+  const binds: unknown[] = [];
+
+  if (typeof body.author === 'string') {
+    const clean = normaliseAuthor(body.author);
+    patch.push('author = ?', 'author_letter = ?');
+    binds.push(clean, authorBucket(clean));
+  }
+  if (typeof body.title === 'string' && body.title.trim()) {
+    patch.push('title = ?', 'title_letter = ?');
+    binds.push(body.title.trim(), letterBucket(body.title.trim()));
+  }
+  if (typeof body.kind === 'string') {
+    const kind = body.kind.trim();
+    if (!['ebook', 'comic', 'audio'].includes(kind)) {
+      return jsonResponse({ error: 'bad-kind', allowed: ['ebook', 'comic', 'audio'] }, 400);
+    }
+    patch.push('kind_bucket = ?');
+    binds.push(kind);
+  }
+  if (patch.length === 0) return jsonResponse({ error: 'nothing-to-update' }, 400);
+
+  patch.push('updated_at = ?');
+  binds.push(new Date().toISOString(), row.id);
+  await env.DB
+    .prepare(`UPDATE books SET ${patch.join(', ')} WHERE id = ?`)
+    .bind(...binds)
+    .run();
+
+  await rebuildBuckets(env.DB);
+  // 分类变了，读者侧缓存要立刻失效，否则要等 TTL
+  await purgeEntries([
+    ['/', 1],
+    ...Object.values(COLLECTIONS).map((d) => [`/${d.segment}/`, 1] as const),
+  ]);
+
+  return jsonResponse({ ok: true, leafName, updated: patch.length });
 }
 
 /**
@@ -228,6 +305,11 @@ function securityStatus(env: Env): Array<{ key: string; ok: boolean; label: stri
  * （拼音表在 TS 里，SQL 算不出来）。
  *
  * 支持分页（?offset=&limit=），避免书量很大时一次扫描超 CPU 预算。
+ *
+ * **类型（kind_bucket）默认不动**：它现在来自内容嗅探或管理后台的人工修正，
+ * 都比「按扩展名猜」更权威。按扩展名重算会把嗅探结果覆盖掉 ——
+ * 例如扫描漫画 PDF 会被打回「电子书」（真实踩过）。
+ * 想按内容重新嗅探存量书，显式加 `?sniff=1`（会读 R2，较慢）。
  */
 async function rebucket(env: Env, url: URL): Promise<Response> {
   const limit = Math.min(
@@ -235,10 +317,11 @@ async function rebucket(env: Env, url: URL): Promise<Response> {
     5000,
   );
   const offset = Math.max(Number.parseInt(url.searchParams.get('offset') ?? '0', 10) || 0, 0);
+  const doSniff = url.searchParams.get('sniff') === '1';
 
   const { results } = await env.DB
     .prepare(
-      `SELECT id, title, author, format_bucket, title_letter, author_letter, kind_bucket
+      `SELECT id, title, author, format_bucket, title_letter, author_letter, kind_bucket, r2_key
          FROM books ORDER BY id LIMIT ? OFFSET ?`,
     )
     .bind(limit, offset)
@@ -250,22 +333,53 @@ async function rebucket(env: Env, url: URL): Promise<Response> {
       title_letter: string;
       author_letter: string;
       kind_bucket: string;
+      r2_key: string;
     }>();
 
   const rows = results ?? [];
   const now = new Date().toISOString();
   const statements: D1PreparedStatement[] = [];
   let changed = 0;
+  let resniffed = 0;
   const moved: Array<{ title: string; from: string; to: string }> = [];
 
   for (const r of rows) {
     const titleLetter = letterBucket(r.title);
-    const authorLetter = letterBucket(r.author ?? r.title);
-    const kindBucket = mediaKindOfFormat(r.format_bucket);
+    let author = r.author;
+    let authorLetter = authorBucket(author);
+    let kindBucket = r.kind_bucket;
+
+    // ── 按内容重新提取（?sniff=1）──
+    // 两件事：类型（PDF 扫描漫画 vs 文字书）、以及缺失的作者
+    // （TXT 没有元数据，但很多中文小说开头就写着「作者：XXX」）。
+    if (doSniff) {
+      const sniffed = await sniffKindFromBucket(env.BUCKET, r.r2_key, r.format_bucket);
+      // EPUB 的固定版式判断需要解压 OPF，代价高，交给上传路径处理
+      kindBucket = sniffed ?? mediaKindOfFormat(r.format_bucket);
+      if (kindBucket !== r.kind_bucket) resniffed++;
+
+      if (!author && r.format_bucket === 'txt') {
+        try {
+          const obj = await env.BUCKET.get(r.r2_key, { range: { offset: 0, length: 16 * 1024 } });
+          if (obj) {
+            const found = guessAuthorFromText(new TextDecoder('utf-8').decode(await obj.arrayBuffer()));
+            if (found) {
+              author = found;
+              authorLetter = authorBucket(found);
+              if (moved.length < 20) moved.push({ title: r.title, from: '（无作者）', to: found });
+            }
+          }
+        } catch {
+          // 读不到就算了，不影响其它书的处理
+        }
+      }
+    }
+
     if (
       titleLetter === r.title_letter
       && authorLetter === r.author_letter
       && kindBucket === r.kind_bucket
+      && author === r.author
     ) {
       continue; // 没变就不写，省 D1 写入额度
     }
@@ -276,10 +390,11 @@ async function rebucket(env: Env, url: URL): Promise<Response> {
     statements.push(
       env.DB
         .prepare(
-          `UPDATE books SET title_letter = ?, author_letter = ?, kind_bucket = ?, updated_at = ?
+          `UPDATE books SET title_letter = ?, author_letter = ?, kind_bucket = ?, author = ?,
+                            updated_at = ?
             WHERE id = ?`,
         )
-        .bind(titleLetter, authorLetter, kindBucket, now, r.id),
+        .bind(titleLetter, authorLetter, kindBucket, author, now, r.id),
     );
   }
 
@@ -298,6 +413,8 @@ async function rebucket(env: Env, url: URL): Promise<Response> {
   return jsonResponse({
     scanned: rows.length,
     changed,
+    resniffed,
+    sniffed: doSniff,
     offset,
     nextOffset: rows.length === limit ? offset + limit : null,
     movedExamples: moved,
@@ -307,7 +424,8 @@ async function rebucket(env: Env, url: URL): Promise<Response> {
   });
 }
 
-async function reindex(env: Env, url: URL): Promise<Response> {  const prefix = url.searchParams.get('prefix') ?? 'library/';
+async function reindex(env: Env, url: URL): Promise<Response> {
+  const prefix = url.searchParams.get('prefix') ?? 'library/';
   const cursor = url.searchParams.get('cursor') ?? undefined;
   const limit = Math.min(
     Math.max(Number.parseInt(url.searchParams.get('limit') ?? '500', 10) || 500, 1),
@@ -348,7 +466,7 @@ async function reindex(env: Env, url: URL): Promise<Response> {  const prefix = 
         r2Key: object.key,
         etag: object.etag,
         titleLetter: letterBucket(meta.title),
-        authorLetter: letterBucket(meta.author ?? meta.title),
+        authorLetter: authorBucket(meta.author),
         formatBucket: meta.format,
         publishedAt: object.uploaded?.toISOString() ?? new Date().toISOString(),
       }),

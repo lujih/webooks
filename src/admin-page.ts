@@ -75,6 +75,28 @@ ${themeCss()}
   .toast{margin-top:var(--s3);padding:var(--s3) var(--s4);border-radius:var(--r2);font-size:.86rem;display:none}
   .toast.show{display:block;animation:up .3s var(--ease) forwards}
   .toast.ok{background:rgba(125,201,143,.12);border-left:2px solid var(--ok);color:var(--ok)}
+  /* 保存提示：浮在底部，不把列表顶下去 */
+  #toast2{
+    position:fixed;left:50%;bottom:1.2rem;transform:translateX(-50%);
+    margin:0;padding:.5rem .9rem;font-size:.8rem;z-index:50;
+    background:rgba(125,201,143,.16);border:1px solid rgba(125,201,143,.45);color:var(--ok);
+    backdrop-filter:blur(6px);
+  }
+  #toast2.err{background:rgba(255,138,122,.16);border-color:rgba(255,138,122,.5);color:var(--er)}
+
+  /* ── 行内编辑（作者 / 类型）── */
+  .edit-a{
+    width:100%;margin-top:.25rem;font-size:.78rem;
+    background:rgba(0,0,0,.35);color:var(--paper);
+    border:1px solid var(--line-soft);border-radius:var(--r1);
+    padding:.2rem .4rem;
+  }
+  .edit-a::placeholder{color:var(--paper-dim);opacity:.75}
+  .edit-a:focus,.edit-k:focus{outline:2px solid var(--glow);outline-offset:1px}
+  .edit-k{
+    font-size:.76rem;padding:.2rem .3rem;border-radius:var(--r1);
+    background:rgba(0,0,0,.35);color:var(--paper);border:1px solid var(--line-soft);
+  }
   .toast.err{background:rgba(255,138,122,.12);border-left:2px solid var(--er);color:var(--er)}
   .hide{display:none!important}
   .empty{padding:var(--s7) var(--s4);text-align:center;color:var(--paper-dim);
@@ -121,6 +143,7 @@ ${themeCss()}
 
     <div id="listWrap"><div class="empty">加载中…</div></div>
     <div class="toast" id="msg"></div>
+    <div class="toast save" id="toast2" role="status" aria-live="polite"></div>
   </section>
 
 </div>
@@ -166,32 +189,55 @@ function renderSecurity(items) {
     '</div>').join('');
 }
 
-function renderList(data) {
-  $('stat').innerHTML = '共 <b>' + data.total + '</b> 本 · 占用 <b>' + fmtSize(data.usedBytes) + '</b>';
+function renderList(data) {  $('stat').innerHTML = '共 <b>' + data.total + '</b> 本 · 占用 <b>' + fmtSize(data.usedBytes) + '</b>';
   if (!data.books.length) {
     $('listWrap').innerHTML = '<div class="empty">'
       + (data.query ? '没有匹配「' + esc(data.query) + '」的书' : '书库还是空的')
       + '</div>';
     return;
   }
-  const rows = data.books.map((b) =>
-    '<tr>' +
+  const KIND_LABEL = { ebook: '电子书', comic: '漫画', audio: '有声书' };
+  const rows = data.books.map((b) => {
+    const kind = b.kind || 'ebook';
+    return '<tr>' +
       '<td class="rowsel"><input type="checkbox" data-leaf="' + esc(b.leafName) + '"' +
         (selected.has(b.leafName) ? ' checked' : '') + ' aria-label="选择 ' + esc(b.title) + '"></td>' +
       '<td class="name">' +
         '<div class="t">' + esc(b.title) + '</div>' +
-        (b.author ? '<div class="a">' + esc(b.author) + '</div>' : '') +
+        '<input class="edit-a" data-leaf="' + esc(b.leafName) + '" type="text" ' +
+          'value="' + esc(b.author || '') + '" placeholder="（无作者 — 可在此补填）" ' +
+          'aria-label="作者：' + esc(b.title) + '">' +
         '<div class="muted">' + esc(b.leafName) + '</div>' +
       '</td>' +
       '<td><span class="pill">' + esc((b.format || '').toUpperCase()) + '</span></td>' +
+      '<td>' +
+        // 内容嗅探可能有误（PDF 用对象流压缩、图集型 EPUB 等），给人一个改的入口
+        '<select class="edit-k" data-leaf="' + esc(b.leafName) + '" aria-label="类型：' + esc(b.title) + '">' +
+          Object.keys(KIND_LABEL).map((k) =>
+            '<option value="' + k + '"' + (k === kind ? ' selected' : '') + '>' + KIND_LABEL[k] + '</option>',
+          ).join('') +
+        '</select>' +
+      '</td>' +
       '<td class="muted">' + fmtSize(b.size) + '</td>' +
       '<td class="muted">' + esc((b.createdAt || '').slice(0, 10)) + '</td>' +
-    '</tr>').join('');
+    '</tr>';
+  }).join('');
   $('listWrap').innerHTML =
     '<table><thead><tr>' +
       '<th class="rowsel"><input type="checkbox" id="all" aria-label="全选"></th>' +
-      '<th>书名 / 作者 / 文件名</th><th>格式</th><th>大小</th><th>上架日期</th>' +
+      '<th>书名 / 作者（可直接编辑）</th><th>格式</th><th>类型</th><th>大小</th><th>上架日期</th>' +
     '</tr></thead><tbody>' + rows + '</tbody></table>';
+
+  // 作者：失焦或回车时保存
+  document.querySelectorAll('input.edit-a').forEach((el) => {
+    const save = () => saveEdit(el.dataset.leaf, { author: el.value });
+    el.addEventListener('blur', save);
+    el.addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); el.blur(); } });
+  });
+  // 类型：下拉即保存
+  document.querySelectorAll('select.edit-k').forEach((el) => {
+    el.addEventListener('change', () => saveEdit(el.dataset.leaf, { kind: el.value }));
+  });
 
   $('all').onchange = (e) => {
     document.querySelectorAll('input[data-leaf]').forEach((cb) => {
@@ -220,6 +266,30 @@ async function load() {
   const data = await api('/api/admin/books?limit=200&q=' + q);
   renderSecurity(data.security || []);
   renderList(data);
+}
+
+/**
+ * 保存单本书的作者/类型修正。
+ * 失败时提示并重新拉列表 —— 不能让人以为改成功了其实没写进去。
+ */
+async function saveEdit(leafName, patch) {
+  try {
+    const r = await fetch('/api/admin/update', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', authorization: 'Bearer ' + TOKEN },
+      body: JSON.stringify(Object.assign({ leafName: leafName }, patch)),
+    });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(j.error || ('HTTP ' + r.status));
+    $('toast2').textContent = '已保存：' + leafName;
+    $('toast2').classList.add('show');
+    setTimeout(() => $('toast2').classList.remove('show'), 2200);
+  } catch (e) {
+    $('toast2').textContent = '保存失败：' + e.message;
+    $('toast2').classList.add('show', 'err');
+    setTimeout(() => $('toast2').classList.remove('show', 'err'), 5000);
+    await load();
+  }
 }
 
 $('loginBtn').onclick = async () => {

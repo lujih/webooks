@@ -8,7 +8,7 @@
 
 import { SELF } from 'cloudflare:test';
 import { beforeEach, describe, expect, it } from 'vitest';
-import { letterBucket, mediaKindOfFormat, normaliseFormat } from '../src/lib/collections';
+import { authorBucket, letterBucket, mediaKindOfFormat, normaliseFormat } from '../src/lib/collections';
 import { rebuildBuckets, upsertBookStatement } from '../src/lib/db';
 import { deriveMetadata } from '../src/lib/metadata';
 import { clearDavCache, resetLibrary, testEnv } from './setup';
@@ -34,7 +34,7 @@ async function seed(leafNames: string[], opts: { legacyLetter?: string } = {}): 
       etag: `e-${i}`,
       // legacyLetter 用来模拟「拼音规则上线前入库的老数据」
       titleLetter: opts.legacyLetter ?? letterBucket(meta.title),
-      authorLetter: opts.legacyLetter ?? letterBucket(meta.author ?? meta.title),
+      authorLetter: opts.legacyLetter ?? authorBucket(meta.author),
       formatBucket: meta.format,
       publishedAt: new Date().toISOString(),
     });
@@ -141,6 +141,22 @@ describe('rebucket：规则变更后重算存量数据', () => {
     const json = (await res.json()) as { scanned: number; changed: number };
     expect(json.scanned).toBe(1);
     expect(json.changed).toBe(0); // 入库时已按新规则算过，无需再改
+  });
+
+  it('默认不动 type：不能用扩展名覆盖内容嗅探的结果', async () => {
+    // 扫描漫画 PDF：内容嗅探出 comic，但扩展名是 pdf（按扩展名会判成 ebook）。
+    // rebucket 若不保护这个值，就会把正确的分类打回错误的（真实踩过）。
+    await seed(['三体.epub']);
+    await testEnv.DB.prepare(`UPDATE books SET kind_bucket = 'comic' WHERE leaf_name = '三体.epub'`).run();
+    await clearDavCache(['/', '/按书名/']);
+
+    const json = (await (await admin('rebucket')).json()) as { changed: number };
+    expect(json.changed).toBe(0);
+
+    const row = await testEnv.DB
+      .prepare(`SELECT kind_bucket FROM books WHERE leaf_name = '三体.epub'`)
+      .first<{ kind_bucket: string }>();
+    expect(row?.kind_bucket, '内容嗅探出的类型必须被保留').toBe('comic');
   });
 
   it('需要管理员口令', async () => {

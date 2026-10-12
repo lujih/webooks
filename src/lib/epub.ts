@@ -24,6 +24,49 @@ export interface EpubMeta {
   language: string | null;
   /** 封面图字节；没有封面或超过 COVER_CAP 时为 null */
   cover: { bytes: ArrayBuffer; contentType: string } | null;
+  /**
+   * 内容形态判断：'comic' = 固定版式/图集（漫画），'text' = 普通文字书，
+   * null = 判不出来（交给调用方按扩展名回退）。
+   */
+  layout: 'comic' | 'text' | null;
+}
+
+/**
+ * 从 OPF 判断这本 EPUB 是「漫画」还是「文字书」。
+ *
+ * 两条线索，前者更硬：
+ *   1. **固定版式声明** —— 漫画几乎都是固定版式（每页一张图，排版不可重排）：
+ *      · `<meta property="rendition:layout">pre-paginated</meta>`（EPUB3 标准）
+ *      · `<meta name="fixed-layout" content="true">`（Apple / Kobo 工具链）
+ *      · `<meta name="original-resolution">`（Kobo 漫画导出）
+ *   2. **清单以图片为主** —— 图片项明显多于 xhtml 页。
+ *      普通小说：1 张封面 + 几十个章节 xhtml；漫画：几百张图 + 极少数 xhtml。
+ *
+ * 判不出就返回 null，绝不硬猜 —— 猜错的代价比不判更大（用户会看到书跑到错分类里）。
+ */
+export function sniffEpubLayout(opf: string): 'comic' | 'text' | null {
+  // 1. 固定版式声明
+  const prePaginated =
+    /<meta[^>]*\bproperty\s*=\s*"rendition:layout"[^>]*>\s*pre-paginated/i.test(opf)
+    || /<meta[^>]*\bname\s*=\s*"fixed-layout"[^>]*\bcontent\s*=\s*"true"/i.test(opf)
+    || /<meta[^>]*\bname\s*=\s*"original-resolution"/i.test(opf);
+  if (prePaginated) return 'comic';
+
+  // 2. 图片项 vs 文档项
+  const items = opf.match(/<item\b[^>]*>/gi) ?? [];
+  let images = 0;
+  let docs = 0;
+  for (const it of items) {
+    const mt = (it.match(/\bmedia-type\s*=\s*"([^"]*)"/i)?.[1] ?? '').toLowerCase();
+    if (mt.startsWith('image/')) images++;
+    else if (mt === 'application/xhtml+xml' || mt === 'text/html') docs++;
+  }
+  if (images === 0 && docs === 0) return null;
+  // 图集型：图片多且远超文档数
+  if (images >= 10 && images >= docs * 2) return 'comic';
+  // 明确是文字书：文档占多数
+  if (docs >= 3 && images < docs) return 'text';
+  return null;
 }
 
 /**
@@ -233,5 +276,6 @@ export async function parseEpub(buf: ArrayBuffer): Promise<EpubMeta | null> {
     author: stripTags(author ?? '') || null,
     language: language?.trim() || null,
     cover,
+    layout: sniffEpubLayout(opf),
   };
 }

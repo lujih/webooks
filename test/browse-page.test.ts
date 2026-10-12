@@ -9,7 +9,7 @@
 
 import { SELF } from 'cloudflare:test';
 import { beforeEach, describe, expect, it } from 'vitest';
-import { canonicalDavPath, decodeDavPath, letterBucket } from '../src/lib/collections';
+import { canonicalDavPath, decodeDavPath, authorBucket, letterBucket } from '../src/lib/collections';
 import { rebuildBuckets, upsertBookStatement } from '../src/lib/db';
 import { deriveMetadata } from '../src/lib/metadata';
 import { clearDavCache, resetLibrary, testEnv } from './setup';
@@ -39,7 +39,7 @@ async function seed(leafNames: string[]): Promise<void> {
       etag: `e-${i}`,
       // 必须用 letterBucket：中文书名会进 other 桶，直接取首字符会分错
       titleLetter: letterBucket(meta.title),
-      authorLetter: letterBucket(meta.author ?? meta.title),
+      authorLetter: authorBucket(meta.author),
       formatBucket: meta.format,
       publishedAt: new Date().toISOString(),
     });

@@ -2,7 +2,7 @@
 
 import { SELF } from 'cloudflare:test';
 import { beforeEach, describe, expect, it } from 'vitest';
-import { letterBucket } from '../src/lib/collections';
+import { authorBucket, letterBucket } from '../src/lib/collections';
 import { rebuildBuckets, upsertBook, upsertBookStatement } from '../src/lib/db';
 import { deriveMetadata } from '../src/lib/metadata';
 import { clearDavCache, resetLibrary, testEnv } from './setup';
@@ -41,7 +41,7 @@ async function seed(leafNames: string[]): Promise<void> {
       r2Key: `books/test-${i}`,
       etag: `etag-${i}`,
       titleLetter: letterBucket(meta.title),
-      authorLetter: letterBucket(meta.author ?? meta.title),
+      authorLetter: authorBucket(meta.author),
       formatBucket: meta.format,
       publishedAt: new Date(Date.UTC(2026, 0, 1, 0, 0, i)).toISOString(),
     });

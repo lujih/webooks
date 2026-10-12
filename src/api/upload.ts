@@ -17,9 +17,10 @@
  */
 
 import type { Env } from '../config';
-import { ALLOWED_UPLOAD_FORMATS, isAllowedUploadExt, letterBucket, normaliseFormat } from '../lib/collections';
+import { ALLOWED_UPLOAD_FORMATS, isAllowedUploadExt, authorBucket, letterBucket, normaliseFormat } from '../lib/collections';
 import { safeEqual } from '../lib/auth';
-import { deriveMetadata, safeContentTypeFor, sanitiseLeafName } from '../lib/metadata';
+import { deriveMetadata, guessAuthorFromText, safeContentTypeFor, sanitiseLeafName } from '../lib/metadata';
+import { sniffKindFromBucket } from '../lib/kind-sniff';
 import { rebuildBuckets, upsertBook } from '../lib/db';
 import { shortId } from '../lib/http';
 import { createPresignedPutUrl } from '../lib/sigv4';
@@ -332,6 +333,8 @@ export async function handleUploadComplete(request: Request, env: Env): Promise<
   let author = meta.author;
   let language: string | null = null;
   let coverKey: string | null = null;
+  /** 内容嗅探出的形态（漫画/电子书）；null = 判不出，按扩展名分类 */
+  let sniffedKind: 'ebook' | 'comic' | 'audio' | null = null;
 
   if (format === 'epub') {
     try {
@@ -343,6 +346,9 @@ export async function handleUploadComplete(request: Request, env: Env): Promise<
           if (parsed.title) title = parsed.title;
           if (parsed.author) author = parsed.author;
           language = parsed.language;
+          // EPUB 的固定版式判断来自 OPF（已解析出来，不额外读盘）
+          if (parsed.layout === 'comic') sniffedKind = 'comic';
+          else if (parsed.layout === 'text') sniffedKind = 'ebook';
           if (parsed.cover) {
             const coverType = parsed.cover.contentType;
             // 扩展名由白名单推导（封面类型只可能来自字节嗅探，见 epub.ts）
@@ -361,6 +367,31 @@ export async function handleUploadComplete(request: Request, env: Env): Promise<
     }
   }
 
+  // ── 没有作者就再尽力找一次 ──
+  // TXT 这类格式没有元数据，但很多中文小说会在开头几行写「作者：XXX」。
+  // 只读一个小片段，读不到就算了。
+  if (!author && format === 'txt') {
+    try {
+      const obj = await env.BUCKET.get(bookKey, { range: { offset: 0, length: 16 * 1024 } });
+      if (obj) {
+        const sample = new TextDecoder('utf-8').decode(await obj.arrayBuffer());
+        const found = guessAuthorFromText(sample);
+        if (found) author = found;
+      }
+    } catch {
+      // 读不到就算了，不影响上架
+    }
+  }
+
+  // ── PDF 内容嗅探：区分「文字书 PDF」与「扫描漫画 PDF」──
+  if (format === 'pdf') {
+    try {
+      sniffedKind = await sniffKindFromBucket(env.BUCKET, bookKey, format);
+    } catch {
+      sniffedKind = null;
+    }
+  }
+
   await upsertBook(env.DB, {
     id: bookKey.slice('books/'.length),
     leafName: safeName,
@@ -374,8 +405,10 @@ export async function handleUploadComplete(request: Request, env: Env): Promise<
     r2Key: bookKey,
     etag: head.etag,
     titleLetter: letterBucket(title),
-    authorLetter: letterBucket(author ?? title),
+    authorLetter: authorBucket(author),
     formatBucket: format,
+    // 内容嗅探优先于扩展名；判不出才交给 upsertBookStatement 按扩展名派生
+    ...(sniffedKind ? { kindBucket: sniffedKind } : {}),
     publishedAt: new Date().toISOString(),
     coverKey,
   });

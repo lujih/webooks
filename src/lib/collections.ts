@@ -151,22 +151,37 @@ export function letterBucket(input: string | null | undefined): string {
 }
 
 /**
+ * 「未知作者」桶的内部 id。
+ *
+ * 为什么单开一个桶，而不是像以前那样拿书名首字母顶替：
+ * 没有作者的书如果落到某个字母下，会**冒充**成「作者姓 X」——
+ * 一个没有作者信息的书库看起来像分类坏了。单列一个桶才诚实，
+ * 也让「这批书缺作者，需要补」这件事一眼可见。
+ */
+export const UNKNOWN_AUTHOR_BUCKET = 'unknown';
+
+/**
  * 桶的内部 id -> URL 路径段。
- * 「other」桶在客户端里显示「其他」比「other」直观得多。
- * 内部 id 保持不变（D1 里已存的 format_bucket / *_letter 不用迁移）。
+ * 「other」「unknown」在客户端里显示中文比英文 id 直观得多。
+ * 内部 id 保持不变（D1 里已存的 *_letter 不用迁移）。
  */
 export function bucketSegment(bucket: string): string {
-  return bucket === 'other' ? '其他' : bucket;
+  if (bucket === 'other') return '其他';
+  if (bucket === UNKNOWN_AUTHOR_BUCKET) return '未知作者';
+  return bucket;
 }
 
-/** 路径段 -> 内部桶 id（接受中文别名，也接受旧的英文 other） */
+/** 路径段 -> 内部桶 id（接受中文别名，也接受旧的英文 id） */
 export function bucketFromSegment(segment: string): string {
-  return segment === '其他' ? 'other' : segment;
+  if (segment === '其他') return 'other';
+  if (segment === '未知作者') return UNKNOWN_AUTHOR_BUCKET;
+  return segment;
 }
 
 /** 桶的内部 id -> 展示名（HTML 页面用，比路径段更详细） */
 export function bucketLabel(bucket: string): string {
   if (bucket === 'other') return '其他';
+  if (bucket === UNKNOWN_AUTHOR_BUCKET) return '未知作者';
   if (KIND_LABEL[bucket]) return KIND_LABEL[bucket]!;
   return bucket;
 }
@@ -280,11 +295,18 @@ export type BucketResolver = (book: { title: string; author: string | null; form
 
 export const BUCKET_RESOLVERS: Record<CollectionId, BucketResolver> = {
   title: (b) => letterBucket(b.title),
-  author: (b) => letterBucket(b.author ?? b.title),
+  // 没有作者 → 「未知作者」桶。**不要**拿书名首字母顶替 ——
+  // 那会让一本书看起来像「作者姓某字」，是错误信息而不是缺信息。
+  author: (b) => (b.author && b.author.trim() ? letterBucket(b.author) : UNKNOWN_AUTHOR_BUCKET),
   format: (b) => b.format_bucket,
   type: (b) => mediaKindOfFormat(b.format_bucket),
   recent: () => 'all',
 };
+
+/** 取出「作者桶」——多处需要（写入、重算）用同一套规则 */
+export function authorBucket(author: string | null | undefined): string {
+  return author && author.trim() ? letterBucket(author) : UNKNOWN_AUTHOR_BUCKET;
+}
 
 // ── 路径解析 ────────────────────────────────────────────────────────────
 

@@ -4,7 +4,7 @@ import type { Env, Settings } from '../config';
 import {
   ALLOWED_UPLOAD_FORMATS,
   isAllowedUploadExt,
-  letterBucket,
+  authorBucket, letterBucket,
   canonicalDavPath,
   decodeDavPath,
   resolveNode,
@@ -15,6 +15,7 @@ import { methodNotAllowed, shortId, textResponse } from '../lib/http';
 import { safeContentTypeFor, deriveMetadata, sanitiseLeafName } from '../lib/metadata';
 import { checkPreconditions } from '../lib/preconditions';
 import { parseEpub, coverExtFor, PARSE_SIZE_CAP, type EpubMeta } from '../lib/epub';
+import { sniffKindFromBucket } from '../lib/kind-sniff';
 import { bookCacheTargets, purgeEntries } from '../lib/cache';
 import {
   acquireLock,
@@ -343,7 +344,7 @@ async function handleMoveCopy(
     r2Key: targetR2Key,
     etag: null,
     titleLetter: letterBucket(sourceBook.title),
-    authorLetter: letterBucket(sourceBook.author ?? sourceBook.title),
+    authorLetter: authorBucket(sourceBook.author),
     formatBucket: sourceBook.format_bucket,
     publishedAt: new Date().toISOString(),
     coverKey: null,
@@ -361,7 +362,7 @@ async function handleMoveCopy(
     bookCacheTargets({
       leafName: targetLeafName,
       titleLetter: letterBucket(sourceBook.title),
-      authorLetter: letterBucket(sourceBook.author ?? sourceBook.title),
+      authorLetter: authorBucket(sourceBook.author),
       formatBucket: sourceBook.format_bucket,
     }),
   );
@@ -598,6 +599,20 @@ async function handlePut(request: Request, env: Env, node: DavNode, davPath: str
   const title = parsed?.title ?? meta.title;
   const author = parsed?.author ?? meta.author;
 
+  // 内容嗅探：区分「文字书 PDF」与「扫描漫画 PDF」，与网页上传走同一套规则。
+  // EPUB 的固定版式判断来自已解析的 OPF，不额外读盘。
+  // 判不出就返回 null —— 绝不硬猜，交给按扩展名派生。
+  let sniffedKind: 'ebook' | 'comic' | 'audio' | null = null;
+  if (parsed?.layout === 'comic') sniffedKind = 'comic';
+  else if (parsed?.layout === 'text') sniffedKind = 'ebook';
+  else if (meta.format === 'pdf') {
+    try {
+      sniffedKind = await sniffKindFromBucket(env.BUCKET, r2Key, meta.format);
+    } catch {
+      sniffedKind = null;
+    }
+  }
+
   await upsertBook(env.DB, {
     id,
     leafName,
@@ -611,8 +626,9 @@ async function handlePut(request: Request, env: Env, node: DavNode, davPath: str
     r2Key,
     etag: object?.etag ?? null,
     titleLetter: letterBucket(title),
-    authorLetter: letterBucket(author ?? title),
+    authorLetter: authorBucket(author),
     formatBucket: meta.format,
+    ...(sniffedKind ? { kindBucket: sniffedKind } : {}),
     publishedAt: new Date().toISOString(),
     coverKey,
   });
@@ -627,7 +643,7 @@ async function handlePut(request: Request, env: Env, node: DavNode, davPath: str
     bookCacheTargets({
       leafName,
       titleLetter: letterBucket(title),
-      authorLetter: letterBucket(author ?? title),
+      authorLetter: authorBucket(author),
       formatBucket: meta.format,
     }),
   );
