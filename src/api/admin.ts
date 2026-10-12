@@ -4,7 +4,13 @@
  */
 
 import type { Env, Settings } from '../config';
-import { letterBucket, bucketSegment, collectionSegment } from '../lib/collections';
+import {
+  COLLECTIONS,
+  letterBucket,
+  bucketSegment,
+  collectionSegment,
+  mediaKindOfFormat,
+} from '../lib/collections';
 import {
   adminListBooks,
   adminTotals,
@@ -42,6 +48,8 @@ export async function handleAdmin(
   switch (action) {
     case 'reindex':
       return reindex(env, url);
+    case 'rebucket':
+      return rebucket(env, url);
     case 'stats':
       return stats(env);
     case 'books':
@@ -210,8 +218,96 @@ function securityStatus(env: Env): Array<{ key: string; ok: boolean; label: stri
  * 幂等：id 由对象键的哈希推导，重复运行不会产生重复记录。
  * 一次调用最多处理 MAX_LIST_LIMIT 个对象；返回 nextCursor 时用同一个 cursor 再调一次。
  */
-async function reindex(env: Env, url: URL): Promise<Response> {
-  const prefix = url.searchParams.get('prefix') ?? 'library/';
+/**
+ * 按当前分类规则重算所有书的桶，并重建 buckets 表。
+ *
+ * 什么时候需要它：**分类规则一旦变化，存量书不会自动跟上**。
+ * 例如「中文按拼音首字母分桶」上线后，老书的 title_letter 还停在 'other'，
+ * 按书名浏览时所有中文书仍然挤在一个桶里 —— 看起来像新功能没生效。
+ * 加字段用迁移能解决，但「按新规则重算已有数据」必须由应用逻辑来做
+ * （拼音表在 TS 里，SQL 算不出来）。
+ *
+ * 支持分页（?offset=&limit=），避免书量很大时一次扫描超 CPU 预算。
+ */
+async function rebucket(env: Env, url: URL): Promise<Response> {
+  const limit = Math.min(
+    Math.max(Number.parseInt(url.searchParams.get('limit') ?? '1000', 10) || 1000, 1),
+    5000,
+  );
+  const offset = Math.max(Number.parseInt(url.searchParams.get('offset') ?? '0', 10) || 0, 0);
+
+  const { results } = await env.DB
+    .prepare(
+      `SELECT id, title, author, format_bucket, title_letter, author_letter, kind_bucket
+         FROM books ORDER BY id LIMIT ? OFFSET ?`,
+    )
+    .bind(limit, offset)
+    .all<{
+      id: string;
+      title: string;
+      author: string | null;
+      format_bucket: string;
+      title_letter: string;
+      author_letter: string;
+      kind_bucket: string;
+    }>();
+
+  const rows = results ?? [];
+  const now = new Date().toISOString();
+  const statements: D1PreparedStatement[] = [];
+  let changed = 0;
+  const moved: Array<{ title: string; from: string; to: string }> = [];
+
+  for (const r of rows) {
+    const titleLetter = letterBucket(r.title);
+    const authorLetter = letterBucket(r.author ?? r.title);
+    const kindBucket = mediaKindOfFormat(r.format_bucket);
+    if (
+      titleLetter === r.title_letter
+      && authorLetter === r.author_letter
+      && kindBucket === r.kind_bucket
+    ) {
+      continue; // 没变就不写，省 D1 写入额度
+    }
+    changed++;
+    if (titleLetter !== r.title_letter && moved.length < 20) {
+      moved.push({ title: r.title, from: r.title_letter, to: titleLetter });
+    }
+    statements.push(
+      env.DB
+        .prepare(
+          `UPDATE books SET title_letter = ?, author_letter = ?, kind_bucket = ?, updated_at = ?
+            WHERE id = ?`,
+        )
+        .bind(titleLetter, authorLetter, kindBucket, now, r.id),
+    );
+  }
+
+  // D1 的 batch 一次别塞太多，分批执行
+  for (let i = 0; i < statements.length; i += 100) {
+    await env.DB.batch(statements.slice(i, i + 100));
+  }
+  await rebuildBuckets(env.DB);
+
+  // 桶变了，读者侧缓存必须整体失效，否则要等 TTL 才看到新分类
+  await purgeEntries([
+    ['/', 1],
+    ...Object.values(COLLECTIONS).map((d) => [`/${d.segment}/`, 1] as const),
+  ]);
+
+  return jsonResponse({
+    scanned: rows.length,
+    changed,
+    offset,
+    nextOffset: rows.length === limit ? offset + limit : null,
+    movedExamples: moved,
+    note: rows.length === limit
+      ? '还有下一页，请带上 nextOffset 再调一次'
+      : '已扫描完全部书，buckets 已重建、目录缓存已失效',
+  });
+}
+
+async function reindex(env: Env, url: URL): Promise<Response> {  const prefix = url.searchParams.get('prefix') ?? 'library/';
   const cursor = url.searchParams.get('cursor') ?? undefined;
   const limit = Math.min(
     Math.max(Number.parseInt(url.searchParams.get('limit') ?? '500', 10) || 500, 1),

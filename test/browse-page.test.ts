@@ -90,7 +90,7 @@ describe('目录浏览页渲染', () => {
 
   it('目录不会把自己列成子项（self 必须被过滤）', async () => {
     await seed(['三体.epub']);
-    const res = await browse(`/${encodeURIComponent('按书名')}/${encodeURIComponent('其他')}/`);
+    const res = await browse(`/${encodeURIComponent('按书名')}/S/`);
     const html = await res.text();
 
     // 面包屑里会提到自己，但卡片网格里不应再出现一次指向自己的「目录」卡
@@ -122,9 +122,25 @@ describe('目录浏览页渲染', () => {
 
   it('书卡链接是百分号编码的可用 URL', async () => {
     await seed(['三体.epub']);
-    const res = await browse(`/${encodeURIComponent('按书名')}/${encodeURIComponent('其他')}/`);
+    const res = await browse(`/${encodeURIComponent('按书名')}/S/`);
     const html = await res.text();
-    // href 必须编码（否则中文/特殊字符会破坏链接）
-    expect(html).toMatch(/href="\/dav\/%E6%8C%89%E4%B9%A6%E5%90%8D\/%E5%85%B6%E4%BB%96\/%E4%B8%89%E4%BD%93\.epub"/);
+    // href 必须编码（否则中文/特殊字符会破坏链接）；三体按拼音归 S 桶
+    expect(html).toMatch(/href="\/dav\/%E6%8C%89%E4%B9%A6%E5%90%8D\/S\/%E4%B8%89%E4%BD%93\.epub"/);
+  });
+
+  it('中文书按拼音进入对应首字母桶，而不是全部堆在 other', async () => {
+    await seed(['三体.epub', '呐喊.epub', '活着.epub']);
+    await clearDavCache(ALL_PATHS);
+    const nav = await browse(`/${encodeURIComponent('按书名')}/`);
+    const navHtml = await nav.text();
+    // 导航应列出 S / N / H 三个桶
+    for (const b of ['S', 'N', 'H']) {
+      expect(navHtml, `应有 ${b} 桶`).toContain(`href="/dav/${encodeURIComponent('按书名')}/${b}/"`);
+    }
+    // 不应出现「其他」桶（这批书都能定序）
+    expect(navHtml).not.toContain(encodeURIComponent('其他'));
+
+    const s = await browse(`/${encodeURIComponent('按书名')}/S/`);
+    expect(await s.text()).toContain('三体');
   });
 });

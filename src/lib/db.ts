@@ -1,6 +1,7 @@
 /** D1 访问层。所有查询都走索引，避免全表扫描（D1 按「扫描行数」计费）。 */
 
 import type { CollectionId } from './collections';
+import { mediaKindOfFormat } from './collections';
 
 export interface BookRow {
   id: string;
@@ -17,6 +18,8 @@ export interface BookRow {
   title_letter: string;
   author_letter: string;
   format_bucket: string;
+  /** 大类：ebook / comic / audio（由 format_bucket 派生，供「按类型」集合使用） */
+  kind_bucket: string;
   published_at: string | null;
   created_at: string;
   updated_at: string;
@@ -26,7 +29,7 @@ export interface BookRow {
 }
 
 const BOOK_COLUMNS = `id, leaf_name, title, author, language, format, content_type, size,
-  sha256, r2_key, etag, title_letter, author_letter, format_bucket, published_at,
+  sha256, r2_key, etag, title_letter, author_letter, format_bucket, kind_bucket, published_at,
   created_at, updated_at, status, cover_key, description`;
 
 /** 导航页数据源：桶 + 计数。行数 ≤ 28，非常便宜。 */
@@ -80,6 +83,10 @@ export async function listBooks(
       break;
     case 'format':
       stmt = db.prepare(`${base} AND format_bucket = ? ORDER BY title, id ${paging}`)
+        .bind(bucket, limit, offset);
+      break;
+    case 'type':
+      stmt = db.prepare(`${base} AND kind_bucket = ? ORDER BY title, id ${paging}`)
         .bind(bucket, limit, offset);
       break;
     case 'recent':
@@ -197,6 +204,11 @@ export interface UpsertBookInput {
   titleLetter: string;
   authorLetter: string;
   formatBucket: string;
+  /**
+   * 大类（ebook/comic/audio）。**可省略**：省略时由 formatBucket 自动派生，
+   * 保证只有一个事实来源，调用方也不会忘记设置。
+   */
+  kindBucket?: string;
   publishedAt: string | null;
   coverKey?: string | null;
   description?: string | null;
@@ -205,12 +217,13 @@ export interface UpsertBookInput {
 
 export function upsertBookStatement(db: D1Database, b: UpsertBookInput): D1PreparedStatement {
   const now = new Date().toISOString();
+  const kind = b.kindBucket ?? mediaKindOfFormat(b.formatBucket);
   return db
     .prepare(
       `INSERT INTO books (id, leaf_name, title, author, language, format, content_type, size,
-         sha256, r2_key, etag, title_letter, author_letter, format_bucket, published_at,
+         sha256, r2_key, etag, title_letter, author_letter, format_bucket, kind_bucket, published_at,
           cover_key, description, created_at, updated_at, status)
-       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
        ON CONFLICT(id) DO UPDATE SET
          leaf_name = excluded.leaf_name,
          title = excluded.title,
@@ -225,6 +238,7 @@ export function upsertBookStatement(db: D1Database, b: UpsertBookInput): D1Prepa
          title_letter = excluded.title_letter,
          author_letter = excluded.author_letter,
          format_bucket = excluded.format_bucket,
+         kind_bucket = excluded.kind_bucket,
          published_at = excluded.published_at,
          -- cover_key / description 必须一起更新：否则「覆盖上传」一本书后，
          -- 新解析出的封面与简介永远不会写进去（真实踩过：重传带封面的 EPUB，
@@ -236,7 +250,7 @@ export function upsertBookStatement(db: D1Database, b: UpsertBookInput): D1Prepa
     )
     .bind(
       b.id, b.leafName, b.title, b.author, b.language, b.format, b.contentType, b.size,
-      b.sha256, b.r2Key, b.etag, b.titleLetter, b.authorLetter, b.formatBucket, b.publishedAt,
+      b.sha256, b.r2Key, b.etag, b.titleLetter, b.authorLetter, b.formatBucket, kind, b.publishedAt,
       b.coverKey ?? null, b.description ?? null,
       now, now, b.status ?? 'published',
     );
@@ -273,6 +287,11 @@ export async function rebuildBuckets(db: D1Database): Promise<void> {
       `INSERT INTO buckets (collection, bucket, total, updated_at)
        SELECT 'format', format_bucket, COUNT(*), ?
          FROM books WHERE status = 'published' GROUP BY format_bucket`,
+    ).bind(now),
+    db.prepare(
+      `INSERT INTO buckets (collection, bucket, total, updated_at)
+       SELECT 'type', kind_bucket, COUNT(*), ?
+         FROM books WHERE status = 'published' GROUP BY kind_bucket`,
     ).bind(now),
     db.prepare(
       `INSERT INTO buckets (collection, bucket, total, updated_at)

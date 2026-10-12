@@ -29,14 +29,40 @@ const cfg = (over: Partial<Settings> = {}): Settings => ({
 });
 
 describe('letterBucket', () => {
-  it('按首字母归桶，大小写统一', () => {
+  it('拉丁字母与数字', () => {
     expect(letterBucket('Dune')).toBe('D');
     expect(letterBucket('dune')).toBe('D');
-    expect(letterBucket('  三体')).toBe('other');
     expect(letterBucket('1984')).toBe('0-9');
-    expect(letterBucket('《呐喊》')).toBe('other');
     expect(letterBucket('')).toBe('other');
     expect(letterBucket(null)).toBe('other');
+  });
+
+  it('中文按拼音首字母归桶（不再一律进 other）', () => {
+    // 这是中文书库最关键的分类能力：以前所有中文书都堆在 other，等于没分类
+    expect(letterBucket('三体')).toBe('S');
+    expect(letterBucket('末世降临')).toBe('M');
+    expect(letterBucket('呐喊')).toBe('N');
+    expect(letterBucket('阿Q正传')).toBe('A');
+    expect(letterBucket('围城')).toBe('W');
+    expect(letterBucket('活着')).toBe('H');
+    expect(letterBucket('天龙八部')).toBe('T');
+    expect(letterBucket('红楼梦')).toBe('H');
+  });
+
+  it('跳过前导标点/空白，书名号不影响归桶', () => {
+    expect(letterBucket('  三体')).toBe('S');
+    expect(letterBucket('《呐喊》')).toBe('N');
+    expect(letterBucket('【三体】')).toBe('S');
+    expect(letterBucket('——活着')).toBe('H');
+  });
+
+  it('表里没有的文字才落 other', () => {
+    // 日文假名、西里尔字母等在表外
+    expect(letterBucket('あいう')).toBe('other');
+    expect(letterBucket('Привет')).toBe('other');
+    expect(letterBucket('!!!')).toBe('other');
+    // 扩展 A 区的生僻字能识别就识别，识别不了也必须有确定结果（不崩）
+    expect(typeof letterBucket('㐀')).toBe('string');
   });
 });
 

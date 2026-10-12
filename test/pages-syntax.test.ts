@@ -81,8 +81,8 @@ describe('页面内联脚本语法自检', () => {
 
     // 典型特征：正则开头后紧跟两个斜杠（`/^abc//`），是转义丢失的产物
     expect(code).not.toMatch(/\/\^[A-Za-z]*\/\//);
-    // 应当使用无转义的写法
-    expect(code).toContain("f.type.startsWith('image/')");
+    // 格式校验刻意用字符串判断而非正则，从根上避开转义陷阱
+    expect(code).toContain('ACCEPT.indexOf(ext)');
     // 双保险：整段脚本必须能解析
     assertParses(code, '上传页脚本正文');
   });
@@ -110,13 +110,19 @@ describe('页面内联脚本语法自检', () => {
     expect(csp).toContain('static.cloudflareinsights.com');
   });
 
-  it('上传页在失败后会重置人机验证（否则重试必定 403）', async () => {
-    // Turnstile 令牌是一次性的；失败后不重置，用户再点只会拿到 403，
-    // 看起来像"坏了"，实际是令牌已被消费。
+  it('每个文件都领取新的人机验证令牌（否则第 2 本起必定 403）', async () => {
+    // Turnstile 令牌是一次性的。批量上传时如果只取一次令牌，
+    // 第 2 个文件必然拿到 403 turnstile-failed，看起来像"批量上传坏了"。
+    // 所以上传页必须有「取令牌」的封装，并在其中 reset 组件领取新令牌。
     const res = await SELF.fetch(`${ORIGIN}/upload`, { headers: { accept: 'text/html' } });
     const html = await res.text();
     const code = inlineScripts(html).join('\n');
+    expect(code).toContain('takeToken');
     expect(code).toContain('turnstile.reset');
-    expect(code).toContain('turnstileToken = null');
+    // 队列里每个文件都要单独取令牌
+    expect(code).toMatch(/await\s+takeToken\(\)/);
+    // 不能再有「一个全局 token 变量反复复用」的老写法
+    // （turnstileToken 作为 API 请求体的字段名仍会出现，所以只禁止赋值）
+    expect(code).not.toMatch(/turnstileToken\s*=[^=]/);
   });
 });

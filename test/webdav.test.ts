@@ -144,13 +144,13 @@ describe('PROPFIND', () => {
     expect(xml).toContain('<D:multistatus xmlns:D="DAV:">');
     // 客户端用 href 末段当文件夹名，所以 href 必须是中文，
     // 同时 displayname 也给中文（两类客户端都能显示对）
-    for (const label of ['按书名', '按作者', '按格式', '最近收录']) {
+    for (const label of ['按书名', '按作者', '按类型', '按格式', '最近收录']) {
       const enc = encodeURIComponent(label);
       expect(xml, label).toContain(`<D:href>/dav/${enc}/</D:href>`);
       expect(xml, label).toContain(`<D:displayname>${label}</D:displayname>`);
     }
     expect(xml).toContain('<D:collection/>');
-    expect(res.headers.get('x-dav-entries')).toBe('5'); // root + 4 集合
+    expect(res.headers.get('x-dav-entries')).toBe('6'); // root + 5 集合（按书名/按作者/按类型/按格式/最近收录）
   });
 
   it('Depth:0 只返回资源自身', async () => {
@@ -163,7 +163,7 @@ describe('PROPFIND', () => {
 
   it('Depth 缺失按 1 处理（有意偏离 RFC 4918）', async () => {
     const res = await propfind('/');
-    expect(res.headers.get('x-dav-entries')).toBe('5');
+    expect(res.headers.get('x-dav-entries')).toBe('6');
   });
 
   it('Depth:infinity 默认降级为 1，不返回 403', async () => {
@@ -186,13 +186,33 @@ describe('PROPFIND', () => {
   it('列表页返回书叶子，href 经过 URL 编码', async () => {
     await seed(['三体.epub']);
     await clearDavCache(ALL_PATHS);
-    const res = await propfind('/title/other/', '1');
+    // 三体 → 拼音首字母 S 桶
+    const res = await propfind('/title/S/', '1');
     const xml = await res.text();
     expect(xml).toContain(
-      `<D:href>/dav/${encodeURIComponent('按书名')}/${encodeURIComponent('其他')}/${encodeURIComponent('三体.epub')}</D:href>`,
+      `<D:href>/dav/${encodeURIComponent('按书名')}/S/${encodeURIComponent('三体.epub')}</D:href>`,
     );
     expect(xml).toContain('<D:getcontentlength>1024</D:getcontentlength>');
     expect(xml).toContain('application/epub+zip');
+  });
+
+  it('「按类型」集合按 电子书/漫画 分类', async () => {
+    await seed(['三体.epub', '航海王.cbz']);
+    await clearDavCache(ALL_PATHS);
+    const nav = await propfind('/type/', '1');
+    const navXml = await nav.text();
+    expect(navXml).toContain(`<D:href>/dav/${encodeURIComponent('按类型')}/ebook/</D:href>`);
+    expect(navXml).toContain(`<D:href>/dav/${encodeURIComponent('按类型')}/comic/</D:href>`);
+    // 漫画桶的中文显示名
+    expect(navXml).toContain('<D:displayname>漫画</D:displayname>');
+
+    const comic = await propfind('/type/comic/', '1');
+    const comicXml = await comic.text();
+    expect(comicXml).toContain(encodeURIComponent('航海王.cbz'));
+    expect(comicXml).not.toContain(encodeURIComponent('三体.epub'));
+
+    const ebook = await propfind('/type/ebook/', '1');
+    expect(await ebook.text()).toContain(encodeURIComponent('三体.epub'));
   });
 
   it('只有被请求的属性出现在 200 propstat，其余进 404 propstat', async () => {

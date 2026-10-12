@@ -23,9 +23,10 @@ export function indexHtml(mountPath: string, r2PublicBase: string | null): strin
   const seg = (id: CollectionId) => encodeURIComponent(collectionSegment(id));
   const shelves = [
     { path: `${mount}${seg('recent')}/`, title: '最近收录', sub: '新上架的书 · 倒序', icon: '新' },
-    { path: `${mount}${seg('title')}/`, title: '按书名', sub: 'A–Z 分桶浏览', icon: '名' },
+    { path: `${mount}${seg('type')}/`, title: '按类型', sub: '电子书 / 漫画', icon: '类' },
+    { path: `${mount}${seg('title')}/`, title: '按书名', sub: '中文按拼音 · 英文按字母', icon: '名' },
     { path: `${mount}${seg('author')}/`, title: '按作者', sub: '寻找同一位作者', icon: '著' },
-    { path: `${mount}${seg('format')}/`, title: '按格式', sub: 'EPUB / PDF / 有声书', icon: '式' },
+    { path: `${mount}${seg('format')}/`, title: '按格式', sub: 'EPUB / PDF / CBZ…', icon: '式' },
   ];
   const shelfHtml = shelves
     .map((s, i) => {

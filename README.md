@@ -76,22 +76,79 @@ test/                   53 个测试（单元 + 端到端）
 所以目录数量直接乘进请求数 —— 目录树必须「宽而浅」。
 
 ```
-/                        根：4 个集合
-/title/                  导航：列出有书的首字母桶（A-Z / 0-9 / other）
-/title/A/                列表第 1 页（≤ 200 本）
-/title/A/2/              列表第 2 页（仅当超过 200 本）
-/title/A/Dune.epub       书（叶子）
-/author/  /format/       同构
-/recent/                 扁平集合：/recent/、/recent/2/、/recent/Dune.epub
+/                        根：5 个集合
+/按书名/                  导航：列出有书的首字母桶
+/按书名/A/                列表第 1 页（≤ 200 本）
+/按书名/A/2/              列表第 2 页（仅当超过 200 本）
+/按书名/A/Dune.epub       书（叶子）
+/按作者/  /按类型/  /按格式/   同构
+/最近收录/                扁平集合：/最近收录/、/最近收录/2/、/最近收录/Dune.epub
 ```
 
-**目录总数上界 ≈ 110**（远低于 200 的设计上限）。
+**目录总数上界 ≈ 120**（远低于 200 的设计上限）。
 
 两条刻意的设计决定：
 
 - **绝不「每本书一个目录」** —— 那会让目录数等于书数，请求数直接爆炸。
 - **叶子按 `leaf_name` 全局唯一查找**，所以路径里的桶与书的实际分桶不要求一致。
   客户端即使 PUT 到了「错误的」桶，之后也一定取得到文件。
+
+### 路径段用中文（不是 displayname）
+
+绝大多数 WebDAV 客户端（Windows 资源管理器、rclone、Cyberduck…）**直接用 href 的
+最后一段当文件夹名**，只有少数会读 `displayname` 属性。所以想让客户端显示「按书名」
+而不是「title」，**路径本身就必须是中文**。
+
+英文旧路径（`/dav/title/` 等）保留为**兼容别名**，中英文指向同一本书。
+两者通过 `canonicalDavPath()` 归一 —— 否则缓存键与锁资源会分裂（用英文路径缓存的目录，
+按中文路径失效时打不中，客户端会一直看到旧列表）。
+
+### 分类规则
+
+| 集合 | 分桶依据 |
+|---|---|
+| 按书名 / 按作者 | 拉丁字母 A–Z、数字 `0-9`、**汉字取拼音首字母**、其余进「其他」 |
+| 按类型 | 电子书 / 漫画 / 有声书（由格式派生） |
+| 按格式 | epub / pdf / cbz / … 归一化后的格式 |
+| 最近收录 | 不分组，按收录时间倒序 |
+
+**中文按拼音分桶**是中文书库的关键：早期实现把所有中文书都塞进 `other`，
+按书名浏览等于没有分类。「三体」现在进 S、「末世降临」进 M、「活着」进 H。
+
+拼音表由 `scripts/gen-pinyin-table.mjs` 在**开发期**用 `pinyin-pro` 烘成静态表
+（`src/lib/pinyin-table.ts`，63 KiB，20935 个汉字），**运行时不引入任何依赖** ——
+项目仍然是零运行时依赖。重新生成：
+
+```bash
+node scripts/gen-pinyin-table.mjs
+```
+
+分类规则一旦变化，**存量书不会自动跟上**（`title_letter` 等是入库时算好存起来的）。
+需要跑一次重算：
+
+```bash
+curl -H "Authorization: Bearer $ADMIN_TOKEN" \
+  https://你的域名/api/admin/rebucket
+```
+
+它按当前规则重算 `title_letter` / `author_letter` / `kind_bucket`，重建 `buckets`
+并让目录缓存失效。支持 `?limit=&offset=` 分页，书多时不会一次超 CPU 预算。
+
+### 上传格式白名单
+
+只接受**电子书 + 漫画**格式（`src/lib/collections.ts` 里的
+`ALLOWED_UPLOAD_FORMATS`，是唯一定义处）：
+
+```
+电子书: epub pdf mobi azw3 fb2 djvu txt rtf doc docx odt md html lit chm prc pdb
+漫画:   cbz cbr cb7 cbt cba
+```
+
+**被排除**：有声书（m4a/m4b/mp3）、通用压缩包（zip/rar/7z）、以及一切可执行文件
+和脚本。想调整就改那一个数组，网页上传与 WebDAV PUT 会同时生效。
+
+> 早先网页上传有一份白名单，但 **WebDAV PUT 完全没有检查**，任何文件都能绕过网页
+> 限制塞进书库。现在两条入口共用 `isAllowedUploadExt()`，不存在只改一边的可能。
 
 ---
 
@@ -249,35 +306,46 @@ docker run --rm -it alpine:latest sh -c '
 
 | 项 | 现状 | 原因 |
 |---|---|---|
-| **无 LOCK/UNLOCK** | 返回 501，`DAV: 1` | Class 2 需要 Durable Object 存锁表，会把免费额度再切一块走。Office/Finder 的锁需求在只读书库上是伪需求 |
-| **MKCOL 返回 405** | 目录树是虚拟的，由 D1 推导 | 不允许手工建目录，否则树会漂移 |
-| **MOVE/COPY 返回 501** | Phase 0 不实现 | 目录级 MOVE = 逐对象复制 + 删除，会撞上 `MOVE`/`COPY` 的子请求上限 |
+| **MKCOL 返回 201 但不真的建目录** | 目录树是虚拟的，由 D1 推导 | 兼容层：拒绝会让部分客户端挂载失败。手工建的目录不会出现在树里 |
 | **Depth 缺失按 1 处理** | 有意偏离 RFC 4918 | 规范要求按 `infinity`，那会在大目录上炸掉 CPU |
-| **PROPFIND 缓存有最长 300 秒延迟** | 新增的书最多 5 分钟后才出现在列表里 | 换取命中率。`/api/admin/purge` 可手动失效 |
-| **重命名书名会改变所在桶** | 书会从 `/title/A/` 移到 `/title/B/` | 目录树是派生视图 |
-| **PUT 不计算 SHA-256** | `sha256` 存 null | 流式计算哈希要缓冲整个 body，会撞 128 MB isolate 上限。Phase 1 交给 Queue consumer |
+| **PROPFIND 缓存有最长 300 秒延迟** | 新增的书最多 5 分钟后才出现在列表里 | 换取命中率。`/api/admin/purge` 或 `/api/admin/rebucket` 可手动失效 |
+| **重命名书名会改变所在桶** | 书会从 `/按书名/A/` 移到 `/按书名/B/` | 目录树是派生视图 |
+| **PUT 不计算 SHA-256** | `sha256` 存 null | 流式计算哈希要缓冲整个 body，会撞 128 MB isolate 上限 |
 | **分桶计数用全表重建** | 每次 PUT/DELETE 跑一次聚合 | 写入频率低时可接受。写量大时应改成 Queue + 增量计数 |
 | **单桶超过 20,000 本** | 分页子目录被 `PAGINATION_MAX=100` 截断 | Phase 1 应对超大桶做二级分桶（如按书名前两个字母） |
+| **PDF 格式的漫画归到「电子书」** | 只看扩展名，不看内容 | 无法从扩展名区分「PDF 文档」与「PDF 漫画」。要正确归类需要在服务端解析页数/图片占比 |
+| **服务端不扫描文件内容** | 只按扩展名放行 | 免费层没有可用的杀毒/沙箱。伪装成 `.epub` 的可执行文件会被接受，但浏览器只会下载不会执行 |
+| **WebDAV 通道无人机验证** | 网页上传有 Turnstile，WebDAV 没有 | WebDAV 协议里没有验证码的位置。用「每日写入次数」节流缓解（减速带，非硬限制） |
 
 ---
 
 ## 测试
 
 ```bash
-npm test          # 53 个测试
+npm test          # 194 个测试
 npm run typecheck
 npm run check:dav  -- --url https://你的域名/dav/   # 线上一致性探针
 npm run check:size -- --url https://你的域名/dav/   # 请求体体积边界
 ```
 
-覆盖：路径解析与分桶、元数据推导、content-type 取舍、XML 转义与编码、
-PROPFIND 请求体解析、Depth 语义、207 响应结构、200 条硬上限与分页、
-缓存命中与**写入即失效**（PUT/DELETE 后叶子与父列表必须立刻更新）、
-PUT/GET/HEAD/DELETE 全流程、未实现方法的明确拒绝、admin 鉴权。
+覆盖：路径解析与分桶（含**中文拼音首字母**）、分类体系与 `rebucket` 重算、
+格式白名单（网页上传与 WebDAV 两条入口）、元数据推导、content-type 取舍、
+XML 转义与编码、PROPFIND 请求体解析、Depth 语义、207 响应结构、
+200 条硬上限与分页、缓存命中与**写入即失效**、PUT/GET/HEAD/DELETE 全流程、
+未实现方法的明确拒绝、admin 鉴权、以及**页面内联脚本的语法自检**。
 
-已用 `wrangler dev` + `curl` 做过真实 HTTP 冒烟测试，并用
-`scripts/dav-probe.mjs` 跑过完整探针（**28 通过 / 0 失败 / 1 警告**，
-唯一警告是运行时不发 `100 Continue` 这个已知限制）。
+线上另有几套探针（见 `scripts/`）：
+
+```bash
+node scripts/webdav-litmus.mjs  --url https://你的域名/dav/ --token $WRITE_TOKEN  # 16/16
+node scripts/rfc-probe.mjs      --url https://你的域名/dav/ --token $WRITE_TOKEN  # 14/14
+node scripts/security-probe.mjs --url https://你的域名                            # 33/33
+node scripts/abuse-probe.mjs    --url https://你的域名/dav --token $WRITE_TOKEN   # 22 项
+node scripts/verify-upload-chain.mjs --site https://你的域名                       # 上传链路 4 项
+```
+
+> 探针会创建临时文件并自行删除。破坏性操作现在需要口令，所以**必须带 `--token`**，
+> 否则临时文件删不掉，会在书库里堆积。
 
 ---
 
@@ -285,3 +353,5 @@ PUT/GET/HEAD/DELETE 全流程、未实现方法的明确拒绝、admin 鉴权。
 
 - [可行性报告](docs/cloudflare-ebook-library-feasibility.md) —— 平台限制、合规、成本、落地路线
 - [平台调研原始记录](docs/appendix-platform-research.md) —— 逐条引用与官方文档日期
+- [安全审计报告](docs/security-audit.md) —— 漏洞复现、修复与实测数据
+- [RFC 合规清单](docs/rfc-compliance.md) —— 逐条对照 RFC 4918 / 9110

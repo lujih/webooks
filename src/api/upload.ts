@@ -17,7 +17,7 @@
  */
 
 import type { Env } from '../config';
-import { letterBucket, normaliseFormat } from '../lib/collections';
+import { ALLOWED_UPLOAD_FORMATS, isAllowedUploadExt, letterBucket, normaliseFormat } from '../lib/collections';
 import { deriveMetadata, safeContentTypeFor, sanitiseLeafName } from '../lib/metadata';
 import { rebuildBuckets, upsertBook } from '../lib/db';
 import { shortId } from '../lib/http';
@@ -27,10 +27,14 @@ import { jsonResponse, textResponse } from '../lib/http';
 
 const SITEVERIFY = 'https://challenges.cloudflare.com/turnstile/v0/siteverify';
 
-/** 允许的电子书扩展名（与 normaliseFormat 的映射保持一致） */
-const ALLOWED_EXT = new Set([
-  'epub', 'pdf', 'mobi', 'azw', 'azw3', 'fb2', 'djvu', 'txt', 'rtf', 'cbz', 'cbr', 'm4a', 'm4b', 'mp3',
-]);
+/**
+ * 允许的扩展名 = 电子书 + 漫画（白名单的唯一定义在 collections.ts）。
+ *
+ * 这里**不再**单独维护一份：以前 API 与 WebDAV PUT 各写各的，
+ * 结果网页上传拦掉了 exe，WebDAV 却能直接塞进来（真实漏洞）。
+ * 现在两边共用 isAllowedUploadExt()。
+ */
+const ALLOWED_EXT = new Set(ALLOWED_UPLOAD_FORMATS);
 
 const DEFAULT_MAX_BYTES = 200 * 1024 * 1024; // 200 MiB
 
@@ -76,6 +80,40 @@ export async function handleUploadInit(request: Request, env: Env): Promise<Resp
     return textResponse(405, 'Method Not Allowed', { allow: 'POST' });
   }
 
+  let body: InitBody;
+  try {
+    body = (await request.json()) as InitBody;
+  } catch {
+    return jsonResponse({ error: 'bad-json' }, 400);
+  }
+
+  const { filename, size, turnstileToken } = body;
+
+  // ── 输入校验放在最前面 ──
+  // 两个理由：
+  //   1. 非法输入应当立刻被拒，不该先暴露「服务端缺哪些配置」这种内部状态
+  //   2. 以前配置检查在前，导致格式白名单在未配置环境里根本跑不到，
+  //      测试也测不出白名单是否生效（真实踩过）
+  if (typeof filename !== 'string' || !filename.trim()) {
+    return jsonResponse({ error: 'filename-required' }, 400);
+  }
+  if (typeof size !== 'number' || !Number.isFinite(size) || size <= 0) {
+    return jsonResponse({ error: 'size-required' }, 400);
+  }
+  if (typeof turnstileToken !== 'string' || !turnstileToken) {
+    return jsonResponse({ error: 'turnstile-token-required' }, 400);
+  }
+
+  // 扩展名白名单：电子书 + 漫画。isAllowedUploadExt 会先归一化
+  // （azw→azw3 这类别名也算通过），避免名单对了却把合法扩展名拒掉。
+  const ext = filename.split('.').pop()?.toLowerCase() ?? '';
+  if (!isAllowedUploadExt(ext)) {
+    return jsonResponse(
+      { error: 'unsupported-format', ext, allowed: [...ALLOWED_EXT] },
+      415,
+    );
+  }
+
   // 凭据检查：没有 R2 凭据就明确报错，而不是签一个坏 URL
   const { R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY, R2_ACCOUNT_ID, R2_BUCKET_NAME, TURNSTILE_SECRET } = env;
   const missing: string[] = [];
@@ -89,31 +127,6 @@ export async function handleUploadInit(request: Request, env: Env): Promise<Resp
       { error: 'upload-not-configured', missing },
       503,
     );
-  }
-
-  let body: InitBody;
-  try {
-    body = (await request.json()) as InitBody;
-  } catch {
-    return jsonResponse({ error: 'bad-json' }, 400);
-  }
-
-  const { filename, size, turnstileToken } = body;
-
-  // 基础校验
-  if (typeof filename !== 'string' || !filename.trim()) {
-    return jsonResponse({ error: 'filename-required' }, 400);
-  }
-  if (typeof size !== 'number' || !Number.isFinite(size) || size <= 0) {
-    return jsonResponse({ error: 'size-required' }, 400);
-  }
-  if (typeof turnstileToken !== 'string' || !turnstileToken) {
-    return jsonResponse({ error: 'turnstile-token-required' }, 400);
-  }
-
-  const ext = filename.split('.').pop()?.toLowerCase() ?? '';
-  if (!ALLOWED_EXT.has(ext)) {
-    return jsonResponse({ error: 'unsupported-format', ext, allowed: [...ALLOWED_EXT] }, 415);
   }
 
   const maxBytes = Number.parseInt(env.UPLOAD_MAX_BYTES ?? '', 10) || DEFAULT_MAX_BYTES;

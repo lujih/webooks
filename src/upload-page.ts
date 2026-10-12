@@ -1,21 +1,30 @@
 /**
- * 上传页（/upload）。
+ * 上传页（/upload）—— 支持批量。
  *
  * 单文件、无构建步骤，内联 CSS/JS，直接由 Worker 提供。
  * 复用 lib/theme 的设计系统（「深夜图书馆」），与首页/目录页同一套视觉语言。
  *
- * 交互：拖拽/选择 → 客户端预览（封面/书名/作者/大小）→ Turnstile 无感验证
- *      → init 拿预签名 URL → 浏览器直传 R2（进度条）→ complete 登记元数据
- *      → 展示服务器解析出的真实封面与元数据。
+ * 每个文件的流程：
+ *   人机验证取令牌 → init 拿预签名 URL → 浏览器直传 R2（进度）→ complete 登记元数据
+ *
+ * 批量上传的关键难点：**Turnstile 令牌是一次性的**。
+ * 传 N 个文件就需要 N 个令牌，所以要维护一个「令牌队列」：
+ * 用完一个就 reset 组件领下一个，失败时也要换新的（否则重试必然 403）。
+ * 这里选择**串行**上传：令牌天然是串行的，串行也让进度和错误归属清晰。
  */
 
+import { ALLOWED_UPLOAD_FORMATS, EBOOK_FORMATS, COMIC_FORMATS } from './lib/collections';
 import { themeCss } from './lib/theme';
 
 export function uploadHtml(turnstileSiteKey: string): string {
+  // accept 用归一化后的格式列表；浏览器据此过滤文件选择框
+  const accept = ALLOWED_UPLOAD_FORMATS.map((f) => `.${f}`).join(',');
+  const formatList = [...EBOOK_FORMATS, ...COMIC_FORMATS].join(' / ');
+
   return `<!doctype html>
 <html lang="zh-CN"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>上架一本书 · webooks</title>
+<title>上架书籍 · webooks</title>
 <style>
 ${themeCss()}
   /* ── 页头 ── */
@@ -24,7 +33,7 @@ ${themeCss()}
   .mk a{color:inherit;text-decoration:none}
   .back{margin-left:auto;font-size:.8rem;font-family:var(--serif);letter-spacing:.08em}
   h1{font-family:var(--serif);font-weight:400;font-size:clamp(1.6rem,4.5vw,2.2rem);letter-spacing:.03em;margin-bottom:var(--s2)}
-  .sub{color:var(--paper-dim);font-size:.92rem;line-height:1.75;margin-bottom:var(--s5);max-width:38rem}
+  .sub{color:var(--paper-dim);font-size:.92rem;line-height:1.75;margin-bottom:var(--s5);max-width:40rem}
 
   /* ── 拖放区 ── */
   #drop{
@@ -42,74 +51,65 @@ ${themeCss()}
   .hint{color:var(--paper-dim);font-size:.83rem;margin-top:var(--s3)}
   input[type=file]{display:none}
 
-  /* ── 结果卡 ── */
-  .card{
-    margin-top:var(--s4);padding:var(--s4);
-    background:linear-gradient(160deg,var(--ink-2) 0%,#120f0c 100%);
-    border:1px solid var(--line);border-radius:var(--r3);
-    display:none;
+  /* ── 队列 ── */
+  #queueWrap{margin-top:var(--s5);display:none}
+  #queueWrap.show{display:block;animation:up .4s var(--ease) forwards}
+  .qhead{
+    display:flex;align-items:baseline;gap:var(--s3);flex-wrap:wrap;
+    padding-bottom:var(--s3);border-bottom:1px solid var(--line);margin-bottom:var(--s3);
   }
-  .card.show{display:block;animation:up .45s var(--ease) forwards}
-  .row{display:flex;gap:var(--s4);align-items:flex-start}
-  .cover{
-    width:92px;height:126px;flex:0 0 auto;border-radius:var(--r1);
-    overflow:hidden;display:flex;align-items:center;justify-content:center;
-    background:linear-gradient(150deg,#2a231a,#181410);
-    border:1px solid var(--line-soft);
-    box-shadow:3px 4px 14px rgba(0,0,0,.5);
-    color:var(--paper-dim);font-size:.7rem;text-align:center;
-  }
-  .cover img{width:100%;height:100%;object-fit:cover;display:block}
-  .cover-empty{padding:6px;word-break:break-word;font-family:var(--mono);font-size:.62rem;letter-spacing:.03em}
-  .meta{flex:1;min-width:0}
-  .fname{font-family:var(--serif);font-size:1.02rem;letter-spacing:.02em;word-break:break-all;line-height:1.4}
-  .kv{color:var(--paper-dim);font-size:.85rem;margin-top:.3rem}
-  .kv b{color:var(--paper);font-weight:600}
-  .kv.parsed{margin-top:var(--s3);padding-top:var(--s3);border-top:1px dashed var(--line)}
-  .badge{
-    display:inline-block;font-size:.68rem;font-weight:600;letter-spacing:.08em;
-    padding:.15rem .5rem;border-radius:999px;
-    background:rgba(255,180,77,.14);color:var(--glow);
-    border:1px solid var(--line);margin-bottom:var(--s2);
-  }
+  .qhead .qt{font-family:var(--serif);font-size:1rem;letter-spacing:.04em}
+  .qhead .qs{color:var(--paper-dim);font-size:.82rem;margin-left:auto}
+  .qbar{height:4px;background:rgba(0,0,0,.5);border-radius:999px;overflow:hidden;border:1px solid var(--line-soft);margin-bottom:var(--s4)}
+  .qbar>i{display:block;height:100%;width:0;background:linear-gradient(90deg,var(--glow-deep),var(--glow));transition:width .3s var(--ease)}
 
-  /* ── 进度 ── */
-  .bar{height:6px;background:rgba(0,0,0,.5);border-radius:999px;overflow:hidden;margin-top:var(--s4);border:1px solid var(--line-soft)}
-  .bar>i{display:block;height:100%;width:0;background:linear-gradient(90deg,var(--glow-deep),var(--glow));transition:width .2s var(--ease)}
+  ul.q{list-style:none;padding:0;margin:0;display:flex;flex-direction:column;gap:var(--s2)}
+  li.qi{
+    display:flex;gap:var(--s3);align-items:flex-start;
+    padding:var(--s3);border:1px solid var(--line-soft);border-radius:var(--r2);
+    background:rgba(0,0,0,.2);
+  }
+  li.qi.uploading{border-color:var(--line);background:rgba(255,180,77,.05)}
+  li.qi.done{border-color:rgba(126,217,87,.35)}
+  li.qi.error{border-color:rgba(255,107,107,.45);background:rgba(255,107,107,.05)}
+  li.qi.skip{opacity:.6}
+  .qmark{
+    width:22px;height:22px;flex:0 0 auto;margin-top:1px;
+    display:flex;align-items:center;justify-content:center;
+    font-size:.72rem;font-family:var(--mono);border-radius:50%;
+    border:1px solid var(--line-soft);color:var(--paper-dim);
+  }
+  li.qi.uploading .qmark{border-color:var(--glow);color:var(--glow)}
+  li.qi.done .qmark{border-color:var(--ok);color:var(--ok)}
+  li.qi.error .qmark{border-color:var(--er);color:var(--er)}
+  .qbody{flex:1;min-width:0}
+  .qname{font-size:.9rem;word-break:break-all;line-height:1.45}
+  .qsub{color:var(--paper-dim);font-size:.78rem;margin-top:.15rem;line-height:1.5}
+  .qsub.err{color:var(--er)}
+  .qsub.ok{color:var(--ok)}
+  .qbar2{height:4px;background:rgba(0,0,0,.5);border-radius:999px;overflow:hidden;margin-top:.4rem;display:none}
+  li.qi.uploading .qbar2{display:block}
+  .qbar2>i{display:block;height:100%;width:0;background:linear-gradient(90deg,var(--glow-deep),var(--glow));transition:width .2s var(--ease)}
+  .qcover{width:34px;height:46px;flex:0 0 auto;border-radius:2px;overflow:hidden;background:#1a1612;border:1px solid var(--line-soft)}
+  .qcover img{width:100%;height:100%;object-fit:cover;display:block}
 
   /* ── 消息 ── */
-  .msg{margin-top:var(--s3);font-size:.88rem;display:none;line-height:1.6}
+  .msg{margin-top:var(--s4);font-size:.88rem;display:none;line-height:1.6}
   .msg.show{display:block;animation:up .3s var(--ease) forwards}
   .msg.err{color:var(--er)}
   .msg.ok{color:var(--ok)}
 
-  /* ── 步骤 ── */
-  .steps{
-    margin:var(--s4) 0;padding:0;list-style:none;
-    font-size:.86rem;color:var(--paper-dim);
-    display:flex;flex-wrap:wrap;gap:var(--s2) var(--s5);
-  }
-  .steps li{display:flex;align-items:center;gap:var(--s2)}
-  .steps li::before{
-    content:"";width:7px;height:7px;border-radius:50%;
-    background:var(--paper-dim);opacity:.4;flex:0 0 auto;
-    transition:background var(--dur) var(--ease),opacity var(--dur) var(--ease),box-shadow var(--dur) var(--ease);
-  }
-  .steps li.on{color:var(--glow);font-weight:600}
-  .steps li.on::before{background:var(--glow);opacity:1;box-shadow:0 0 8px var(--glow)}
-  .steps li.ok{color:var(--ok)}
-  .steps li.ok::before{background:var(--ok);opacity:1}
-
   /* ── 按钮区 ── */
-  .actions{display:flex;gap:var(--s2);flex-wrap:wrap;align-items:center}
+  .actions{display:flex;gap:var(--s2);flex-wrap:wrap;align-items:center;margin-top:var(--s4)}
   #ts{margin-top:var(--s5);min-height:0}
 
-  /* ── 隐私提示 ── */
+  /* ── 提示 ── */
   .fineprint{
     margin-top:var(--s6);padding-top:var(--s4);
     border-top:1px solid var(--line);
     font-size:.79rem;color:var(--paper-dim);line-height:1.75;
   }
+  .eligible{color:var(--paper-dim);font-size:.79rem;line-height:1.7;margin-top:var(--s3);word-break:break-word}
 </style></head>
 <body>
 <div class="wrap">
@@ -119,46 +119,39 @@ ${themeCss()}
     <a class="back" href="/">← 回到书库</a>
   </div>
 
-  <h1 class="reveal" style="animation-delay:.08s">上架一本书</h1>
+  <h1 class="reveal" style="animation-delay:.08s">上架书籍</h1>
   <p class="sub reveal" style="animation-delay:.12s">
-    支持 EPUB / PDF / MOBI / AZW3 / CBZ / 有声书等。文件<b>直传 Cloudflare R2</b>，
-    不经服务器中转；EPUB 会自动解析出真实封面、书名与作者。
+    可以<b>一次选多本</b>。文件<b>直传 Cloudflare R2</b>，不经服务器中转；
+    EPUB 会自动解析出真实封面、书名与作者。传完立刻能在 WebDAV 客户端与浏览器书架里看到。
   </p>
 
-  <div id="drop" class="reveal" style="animation-delay:.18s" role="button" tabindex="0" aria-label="选择要上传的书籍文件">
+  <div id="drop" class="reveal" style="animation-delay:.18s" role="button" tabindex="0" aria-label="选择要上传的书籍文件，可多选">
     <div class="dropmark" aria-hidden="true">
       <svg viewBox="0 0 24 24" width="30" height="30" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M12 16V4"/><path d="m7 9 5-5 5 5"/><path d="M4 17v2a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-2"/></svg>
     </div>
-    <div class="droptitle">把文件拖到这里，或 <a href="#" id="pick">点此选择</a></div>
-    <div class="hint">上传后立即可在 WebDAV 客户端与浏览器书架中看到</div>
-    <input type="file" id="file">
+    <div class="droptitle">把书籍文件拖到这里，或 <a href="#" id="pick">点此选择</a></div>
+    <div class="hint">支持一次多选、连续拖入；只会接受电子书与漫画格式</div>
+    <input type="file" id="file" multiple accept="${accept}">
   </div>
 
-  <div class="card" id="card">
-    <div class="row">
-      <div class="cover" id="cover"><div class="cover-empty">无封面</div></div>
-      <div class="meta">
-        <div class="fname" id="fname"></div>
-        <div class="kv">类型：<b id="ftype"></b></div>
-        <div class="kv">大小：<b id="fsize"></b></div>
-        <div class="kv" id="derived" hidden>推测书名：<b id="ftitle"></b> · 推测作者：<b id="fauthor"></b></div>
-        <div class="kv parsed" id="parsed" hidden>
-          <span class="badge" id="parsedBadge">已解析 EPUB</span>
-          真实书名：<b id="ptitle"></b><br>真实作者：<b id="pauthor"></b>
-        </div>
-      </div>
+  <div class="eligible reveal" style="animation-delay:.2s">
+    接受格式：<b>${formatList}</b>
+  </div>
+
+  <div id="queueWrap">
+    <div class="qhead">
+      <span class="qt">上传队列</span>
+      <span class="qs" id="qstat" role="status" aria-live="polite"></span>
     </div>
-    <div class="bar" id="bar"><i id="pct"></i></div>
-    <div class="msg" id="msg" role="status" aria-live="polite"></div>
-    <ol class="steps" id="steps">
-      <li id="s1">获取上传地址</li>
-      <li id="s2">上传到 R2</li>
-      <li id="s3">写入书库</li>
-    </ol>
+    <div class="qbar"><i id="qbar"></i></div>
+    <ul class="q" id="queue"></ul>
     <div class="actions">
       <button class="btn btn-primary" id="go">开始上传</button>
-      <button class="btn" id="reset">换一个文件</button>
+      <button class="btn" id="retry" hidden>重试失败的</button>
+      <button class="btn" id="clear">清空队列</button>
+      <button class="btn" id="addmore">继续添加</button>
     </div>
+    <div class="msg" id="msg" role="status" aria-live="polite"></div>
   </div>
 
   <div id="ts"></div>
@@ -172,67 +165,138 @@ ${themeCss()}
 
 <script>
 const $ = (id) => document.getElementById(id);
-let picked = null, turnstileToken = null, siteKey = ${JSON.stringify(turnstileSiteKey)};
+const ACCEPT = ${JSON.stringify(ALLOWED_UPLOAD_FORMATS)};
+let siteKey = ${JSON.stringify(turnstileSiteKey)};
 
-const drop = $('drop'), file = $('file');
-drop.onclick = () => file.click();
+// 队列项：{ file, status: waiting|uploading|done|error|skip, pct, error, result }
+let queue = [];
+let running = false;
+
+const drop = $('drop'), fileInput = $('file');
+drop.onclick = () => fileInput.click();
 // 键盘可达：#drop 是 role="button" tabindex="0"，必须支持 Enter/Space
 drop.addEventListener('keydown', (e) => {
-  if (e.key === 'Enter' || e.key === ' ' || e.key === 'Spacebar') { e.preventDefault(); file.click(); }
+  if (e.key === 'Enter' || e.key === ' ' || e.key === 'Spacebar') { e.preventDefault(); fileInput.click(); }
 });
-$('pick').onclick = (e) => { e.stopPropagation(); file.click(); };
-file.onchange = () => file.files[0] && preview(file.files[0]);
+$('pick').onclick = (e) => { e.stopPropagation(); fileInput.click(); };
+$('addmore').onclick = () => fileInput.click();
 
 ['dragenter','dragover'].forEach(ev => drop.addEventListener(ev, e => { e.preventDefault(); drop.classList.add('drag','over'); }));
 ['dragleave','drop'].forEach(ev => drop.addEventListener(ev, e => { e.preventDefault(); drop.classList.remove('drag','over'); }));
-drop.addEventListener('drop', e => { const f = e.dataTransfer.files[0]; if (f) preview(f); });
-
-$('reset').onclick = () => {
-  picked = null; file.value='';
-  $('card').classList.remove('show');
-  $('msg').className='msg';
-  $('pct').style.width='0%';
-  for(let i=1;i<=3;i++){ const el=$('s'+i); el.classList.remove('on','ok'); }
-  turnstileToken=null;
-  file.click();
-};
+drop.addEventListener('drop', e => { if (e.dataTransfer && e.dataTransfer.files) addFiles(e.dataTransfer.files); });
+fileInput.onchange = () => { addFiles(fileInput.files); fileInput.value = ''; };
 
 function fmtSize(b){ if(b<1024) return b+' B'; if(b<1048576) return (b/1024).toFixed(1)+' KB'; if(b<1073741824) return (b/1048576).toFixed(1)+' MB'; return (b/1073741824).toFixed(2)+' GB'; }
 function escapeHtml(s){ return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
 
+/** 取扩展名（小写、不含点）。刻意不用正则，避免模板字符串吃掉转义反斜杠。 */
+function extOf(name){
+  const i = name.lastIndexOf('.');
+  return i > 0 ? name.slice(i + 1).toLowerCase() : '';
+}
+
 // 与后端 deriveMetadata 同规则的轻量版，用于上传前预览
 function derive(name){
-  const i = name.lastIndexOf('.'), ext = (i>0?name.slice(i+1):'').toLowerCase();
+  const i = name.lastIndexOf('.'), ext = extOf(name);
   let stem = (i>0?name.slice(0,i):name).replace(/_+/g,' ').trim();
   let author = null;
   for(const sep of [' - ',' – ',' — ',' by ']){ const k=stem.indexOf(sep); if(k>0&&k<stem.length-sep.length){ author=stem.slice(0,k).trim(); stem=stem.slice(k+sep.length).trim(); break; } }
   return { ext, title: stem||name, author };
 }
 
-function preview(f){
-  picked = f;
-  $('card').classList.add('show');
-  // 清掉上一次上传留下的「已解析」区
-  $('parsed').hidden = true;
-  $('fname').textContent = f.name;
-  $('fsize').textContent = fmtSize(f.size);
-  const d = derive(f.name);
-  $('ftype').textContent = d.ext.toUpperCase()||'?';
-  $('derived').hidden = false;
-  $('ftitle').textContent = d.title;
-  $('fauthor').textContent = d.author || '（未识别）';
-  // 图片类给真实预览，其余给占位
-  const cov = $('cover');
-  // 注意：这里是 TS 模板字符串，正则里的转义反斜杠会被模板字符串吃掉，
-  // 生成出语法非法的正则（连续两个斜杠），整段脚本解析失败、上传页彻底失效（真实事故）。
-  // 改用 startsWith，从根上避开反斜杠转义陷阱。
-  if(f.type.startsWith('image/')){ const url=URL.createObjectURL(f); cov.innerHTML='<img src="'+url+'" style="width:100%;height:100%;object-fit:cover">'; }
-  else { cov.innerHTML='<div class="cover-empty">'+ (d.ext.toUpperCase() || '无封面') +'</div>'; }
-  $('go').disabled = false;
-  setStep(1);
+/** 加入队列。格式不合规的直接标成 skip，不上传（前端先拦，反馈更快）。 */
+function addFiles(list){
+  if(running){ msg('正在上传中，请等这一批结束再添加', 'err'); return; }
+  for(const f of list){
+    const ext = extOf(f.name);
+    // 同一批里同名同大小视为重复，避免误拖两次
+    const dup = queue.some(q => q.file.name === f.name && q.file.size === f.size);
+    if(dup) continue;
+    const ok = ACCEPT.indexOf(ext) >= 0;
+    queue.push({
+      file: f,
+      status: ok ? 'waiting' : 'skip',
+      pct: 0,
+      error: ok ? null : ('不支持的格式 .' + (ext || '(无扩展名)') + '，只接受电子书与漫画'),
+      result: null,
+    });
+  }
+  render();
+  if(!running) msg('', '');
 }
 
-// Turnstile
+function render(){
+  $('queueWrap').classList.add('show');
+  const ul = $('queue');
+  ul.innerHTML = queue.map((q, i) => {
+    const d = derive(q.file.name);
+    const mark = q.status==='done' ? '✓' : q.status==='error' ? '!' : q.status==='skip' ? '—' : (q.status==='uploading' ? '↑' : String(i+1));
+    let sub = fmtSize(q.file.size) + ' · ' + (d.ext.toUpperCase() || '?');
+    if(q.status==='uploading') sub += ' · 上传中 ' + Math.round(q.pct*100) + '%';
+    if(q.status==='done') sub += ' · ✅ 已上架' + (q.result && q.result.title ? '：《' + q.result.title + '》' : '');
+    if(q.status==='error') sub += ' · ❌ ' + (q.error || '失败');
+    if(q.status==='skip') sub += ' · 已跳过';
+    const subCls = q.status==='error' ? ' err' : (q.status==='done' ? ' ok' : '');
+    const cover = (q.result && q.result.coverUrl)
+      ? '<span class="qcover"><img src="' + escapeHtml(q.result.coverUrl) + '" alt="" loading="lazy"></span>'
+      : '';
+    return '<li class="qi ' + q.status + '">'
+      + '<span class="qmark" aria-hidden="true">' + mark + '</span>'
+      + cover
+      + '<span class="qbody">'
+      +   '<span class="qname">' + escapeHtml(q.file.name) + '</span>'
+      +   '<span class="qsub' + subCls + '">' + escapeHtml(sub) + '</span>'
+      +   '<span class="qbar2"><i style="width:' + Math.round(q.pct*100) + '%"></i></span>'
+      + '</span>'
+      + '</li>';
+  }).join('');
+
+  const total = queue.length;
+  const done = queue.filter(q => q.status==='done').length;
+  const fail = queue.filter(q => q.status==='error').length;
+  const skip = queue.filter(q => q.status==='skip').length;
+  const workable = queue.filter(q => q.status==='waiting' || q.status==='uploading').length;
+
+  $('qbar').style.width = total ? (Math.round(((done+fail+skip)/total)*100) + '%') : '0%';
+  $('qstat').textContent = total
+    ? ('共 ' + total + ' 本 · 完成 ' + done + (fail?(' · 失败 '+fail):'') + (skip?(' · 跳过 '+skip):''))
+    : '';
+  $('go').disabled = running || workable === 0;
+  $('go').textContent = running ? '上传中…' : (done > 0 && workable === 0 ? '再传一次' : '开始上传');
+  $('retry').hidden = fail === 0 || running;
+  $('addmore').disabled = running;
+}
+
+function msg(text, cls){ const m=$('msg'); m.textContent=text; m.className='msg'+(text?' show ':' ')+(cls||''); }
+
+// ── Turnstile 令牌队列 ────────────────────────────────────────────────
+// 令牌一次性：每个文件都要一个新令牌。维护「一个缓冲 + 一个等待者」即可，
+// 因为上传是串行的。
+let bufferedToken = null;
+let tokenWaiter = null;
+
+function onToken(t){
+  if(tokenWaiter){ const r = tokenWaiter; tokenWaiter = null; r(t); }
+  else bufferedToken = t;
+}
+
+/** 取一个可用令牌；没有就 reset 组件向 Turnstile 要一个新的。 */
+function takeToken(timeoutMs){
+  if(bufferedToken){ const t = bufferedToken; bufferedToken = null; return Promise.resolve(t); }
+  return new Promise((resolve, reject) => {
+    tokenWaiter = resolve;
+    try {
+      if(window.turnstile && typeof window.turnstile.reset === 'function') window.turnstile.reset();
+    } catch(e){ /* 忽略：下面有超时兜底 */ }
+    setTimeout(() => {
+      if(tokenWaiter === resolve){
+        tokenWaiter = null;
+        reject(new Error('人机验证超时。请确认页面上的验证组件已通过；若被拦截插件挡住，请对本站关闭拦截后刷新'));
+      }
+    }, timeoutMs || 60000);
+  });
+}
+
 function loadTurnstile(){
   return new Promise((resolve, reject) => {
     if(!siteKey){ reject(new Error('服务器未配置 Turnstile（缺少 TURNSTILE_SITE_KEY），上传不可用')); return; }
@@ -245,73 +309,15 @@ function loadTurnstile(){
 }
 async function renderWidget(){
   await loadTurnstile();
-  turnstileToken = null;
   window.turnstile.render('#ts', {
     sitekey: siteKey,
-    callback: (token) => { turnstileToken = token; $('go').disabled=false; },
-    'expired-callback': () => { turnstileToken = null; },
+    callback: onToken,
+    'expired-callback': () => { bufferedToken = null; },
+    'error-callback': () => { /* 交给 takeToken 的超时兜底 */ },
   });
 }
 
-function setStep(n){ for(let i=1;i<=3;i++){ const el=$('s'+i); el.classList.toggle('on', i===n); } }
-function markStep(n){ const el=$('s'+n); el.classList.remove('on'); el.classList.add('ok'); }
-function msg(text, cls){ const m=$('msg'); m.textContent=text; m.className='msg show '+(cls||''); }
-
-$('go').onclick = async () => {
-  if(!picked) return;
-  if(!turnstileToken){ msg('请先完成人机验证', 'err'); return; }
-  $('go').disabled = true;
-  try{
-    setStep(1); msg('正在获取上传地址…');
-    const init = await fetch('/api/upload/init', {
-      method:'POST', headers:{'content-type':'application/json'},
-      body: JSON.stringify({ filename: picked.name, size: picked.size, contentType: picked.type, turnstileToken }),
-    }).then(async r => ({ ok:r.ok, status:r.status, json: await r.json().catch(()=>({})) }));
-    if(!init.ok){
-      const code = init.json.error || ('HTTP '+init.status);
-      const tip = { 'turnstile-failed':'人机验证失败，请重试', 'file-too-large':'文件超过服务器限制', 'unsupported-format':'不支持的文件类型', 'upload-not-configured':'服务器尚未配置上传功能：缺少 '+(init.json.missing||[]).join(', ') }[code] || code;
-      throw new Error(tip);
-    }
-    markStep(1);
-
-    setStep(2); msg('正在上传到 R2…');
-    await putToR2WithRetry(init.json.uploadUrl, picked, init.json.headers['content-type']);
-
-    setStep(3); msg('正在写入书库…');
-    const done = await fetch('/api/upload/complete', {
-      method:'POST', headers:{'content-type':'application/json'},
-      body: JSON.stringify({ key: init.json.key, filename: picked.name, size: picked.size, contentType: picked.type }),
-    }).then(async r => ({ ok:r.ok, status:r.status, json: await r.json().catch(()=>({})) }));
-    if(!done.ok) throw new Error(done.json.error || ('HTTP '+done.status));
-    markStep(3);
-
-    // 展示服务器解析出的真实封面与元数据（EPUB 且 < 50MB 时 available）
-    const j = done.json;
-    if (j.coverUrl) {
-      $('cover').innerHTML = '<img src="'+j.coverUrl+'" style="width:100%;height:100%;object-fit:cover" alt="cover">';
-      $('parsed').hidden = false;
-      $('ptitle').textContent = j.title || '—';
-      $('pauthor').textContent = j.author || '（未识别）';
-      $('parsedBadge').textContent = '已解析 EPUB 封面';
-    }
-    msg('✅ 上传成功：《'+(j.title||j.leafName)+'》已上架', 'ok');
-    $('pct').style.width='100%';
-  }catch(e){
-    const detail = e.message||String(e);
-    // 连接类错误在公网上传很常见，明确告诉用户可以重试，而不是让他以为坏了
-    const retryable = /中断|超时|ERR_|网络|CSP|Content Security|blocked/.test(detail);
-    msg('❌ ' + detail + (retryable ? '（大文件在弱网下中断属常见情况，再点一次「开始上传」即可）' : ''), 'err');
-    // 关键：Turnstile 令牌是**一次性**的，上一次 init 已经把它消费掉了。
-    // 不重置的话，用户再点一次只会拿到 403 turnstile-failed，看起来像"坏了"，
-    // 实际是令牌已被用掉（真实踩过：CSP 拦掉上传后重试永远 403）。
-    turnstileToken = null;
-    if (window.turnstile && typeof window.turnstile.reset === 'function') {
-      try { window.turnstile.reset(); } catch {}
-    }
-    $('go').disabled = true; // 等新的令牌回来再启用（callback 里会解除）
-  }
-};
-
+// ── 单文件上传 ────────────────────────────────────────────────────────
 // 用 XHR 以获得上传进度
 function putToR2(url, blob, contentType, onProgress){
   return new Promise((resolve, reject) => {
@@ -332,37 +338,124 @@ function putToR2(url, blob, contentType, onProgress){
 }
 
 /**
- * 带重试的上传。
+ * 带重试的直传。
  *
- * 为什么要重试：实测 R2 预签名直传**没有 100MB 上限**（200MB 一次成功），
- * 但传输途中出现 ERR_CONNECTION_RESET 这类瞬时中断是公网上传家常便饭 ——
- * 实测 120MB 档就偶发断在 41 秒处，而更大的 200MB 却一次过。
- * 说明这是瞬时故障而非体积阈值，所以正确处置是「失败自动重试」，
- * 而不是设一个体积上限去拒绝大文件。
- *
- * 预签名 URL 15 分钟内可重复使用，重试不需要重新签发。
+ * 实测 R2 预签名直传没有 100MB 上限（200MB 一次成功），但公网上传途中出现
+ * ERR_CONNECTION_RESET 这类瞬时中断很常见，所以正确处置是「失败自动重试」，
+ * 而不是设一个体积上限去拒绝大文件。预签名 URL 15 分钟内可重复使用。
  */
-async function putToR2WithRetry(url, blob, contentType, maxAttempts){
+async function putToR2WithRetry(url, blob, contentType, onProgress, maxAttempts){
   maxAttempts = maxAttempts || 3;
-  for (let attempt = 1; attempt <= maxAttempts; attempt++){
-    try {
-      await putToR2(url, blob, contentType, (ratio) => {
-        // 重试时把进度条回退，避免显示成 100% 却失败
-        $('pct').style.width = (ratio * 100) + '%';
-      });
-      return;
-    } catch (err) {
-      if (attempt === maxAttempts) throw err;
-      const waitSec = Math.pow(2, attempt - 1); // 2s, 4s, 8s
-      msg('第 ' + attempt + '/' + maxAttempts + ' 次上传中断（' + (err.message||err) + '），' + waitSec + ' 秒后自动重试…', '');
+  for(let attempt=1; attempt<=maxAttempts; attempt++){
+    try { await putToR2(url, blob, contentType, onProgress); return; }
+    catch(err){
+      if(attempt === maxAttempts) throw err;
+      const waitSec = Math.pow(2, attempt - 1); // 2s, 4s
       await new Promise(r => setTimeout(r, waitSec * 1000));
-      $('pct').style.width = '0%';
+      if(onProgress) onProgress(0);
     }
   }
 }
 
+function tipFor(code, json){
+  const map = {
+    'turnstile-failed': '人机验证失败，正在换一个新令牌重试',
+    'file-too-large': '文件超过服务器限制',
+    'unsupported-format': '不支持的文件类型',
+    'upload-not-configured': '服务器尚未配置上传功能：缺少 ' + ((json && json.missing) || []).join(', '),
+    'bad-json': '请求格式错误',
+  };
+  return map[code] || code;
+}
+
+/** 上传一个队列项。返回 true 表示成功。 */
+async function uploadOne(item){
+  item.status = 'uploading'; item.pct = 0; item.error = null; item.result = null;
+  render();
+
+  const token = await takeToken();
+  const initRes = await fetch('/api/upload/init', {
+    method:'POST', headers:{'content-type':'application/json'},
+    body: JSON.stringify({
+      filename: item.file.name, size: item.file.size,
+      contentType: item.file.type || '', turnstileToken: token,
+    }),
+  });
+  const initJson = await initRes.json().catch(() => ({}));
+  if(!initRes.ok){
+    throw new Error(tipFor(initJson.error || ('HTTP ' + initRes.status), initJson));
+  }
+
+  await putToR2WithRetry(
+    initJson.uploadUrl, item.file, initJson.headers['content-type'],
+    (ratio) => { item.pct = ratio; render(); },
+  );
+  item.pct = 1; render();
+
+  const doneRes = await fetch('/api/upload/complete', {
+    method:'POST', headers:{'content-type':'application/json'},
+    body: JSON.stringify({
+      key: initJson.key, filename: item.file.name,
+      size: item.file.size, contentType: item.file.type || '',
+    }),
+  });
+  const doneJson = await doneRes.json().catch(() => ({}));
+  if(!doneRes.ok) throw new Error(tipFor(doneJson.error || ('HTTP ' + doneRes.status), doneJson));
+
+  item.result = doneJson;
+  item.status = 'done';
+  render();
+  return true;
+}
+
+// ── 批量驱动 ──────────────────────────────────────────────────────────
+$('go').onclick = async () => {
+  if(running) return;
+  const pending = queue.filter(q => q.status === 'waiting' || q.status === 'error');
+  if(pending.length === 0) return;
+
+  running = true;
+  msg('', '');
+  render();
+
+  let ok = 0, fail = 0;
+  for(const item of pending){
+    try {
+      // 每个文件都要新令牌；上传前先把上一个用掉的令牌位清干净
+      if(item.status === 'error'){ item.status = 'waiting'; render(); }
+      await uploadOne(item);
+      ok++;
+    } catch(e){
+      item.status = 'error';
+      item.error = (e && e.message) || String(e);
+      fail++;
+      render();
+    }
+  }
+
+  running = false;
+  render();
+  if(fail === 0) msg('✅ 全部上传成功，共 ' + ok + ' 本已上架', 'ok');
+  else if(ok === 0) msg('❌ 全部失败（' + fail + ' 本）。可点「重试失败的」再试一次', 'err');
+  else msg('部分成功：' + ok + ' 本已上架，' + fail + ' 本失败。可点「重试失败的」再试一次', 'err');
+};
+
+$('retry').onclick = () => {
+  for(const q of queue) if(q.status === 'error'){ q.status = 'waiting'; q.error = null; }
+  render();
+  $('go').click();
+};
+
+$('clear').onclick = () => {
+  if(running) return;
+  queue = [];
+  render();
+  $('queueWrap').classList.remove('show');
+  msg('', '');
+};
+
 // 初始化
-renderWidget().catch(e => { msg('❌ '+e.message, 'err'); $('go').disabled=true; });
+renderWidget().catch(e => { msg('❌ '+e.message, 'err'); $('go').disabled = true; });
 </script>
 </body></html>`;
 }

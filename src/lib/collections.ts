@@ -18,7 +18,9 @@
  * 目录总数上界：1(root) + 3(nav) + 28*3(字母/格式桶) + 分页目录 ≈ 110，远低于 200。
  */
 
-export const COLLECTION_IDS = ['title', 'author', 'format', 'recent'] as const;
+import { pinyinInitial } from './pinyin-table';
+
+export const COLLECTION_IDS = ['title', 'author', 'type', 'format', 'recent'] as const;
 export type CollectionId = (typeof COLLECTION_IDS)[number];
 
 export interface CollectionDef {
@@ -28,7 +30,7 @@ export interface CollectionDef {
    * URL 路径里实际使用的段名。**故意用中文**：
    * 绝大多数 WebDAV 客户端（Windows 资源管理器、rclone、Cyberduck…）
    * 直接用 href 的最后一段当文件夹名，只有少数会读 displayname 属性。
-   * 所以想让客户端显示「最近收录」而不是「recent」，路径本身就必须是中文。
+   * 所以想让客户端显示「按书名」而不是「title」，路径本身就必须是中文。
    */
   segment: string;
   /** true = 有分桶层级（/<按书名>/A/…）；false = 扁平（/<最近收录>/…） */
@@ -38,6 +40,7 @@ export interface CollectionDef {
 export const COLLECTIONS: Record<CollectionId, CollectionDef> = {
   title: { id: 'title', label: '按书名', segment: '按书名', bucketed: true },
   author: { id: 'author', label: '按作者', segment: '按作者', bucketed: true },
+  type: { id: 'type', label: '按类型', segment: '按类型', bucketed: true },
   format: { id: 'format', label: '按格式', segment: '按格式', bucketed: true },
   recent: { id: 'recent', label: '最近收录', segment: '最近收录', bucketed: false },
 };
@@ -121,22 +124,35 @@ export const LETTER_BUCKETS: readonly string[] = [
   'other',
 ];
 
+/**
+ * 取排序用的首字母桶。
+ *
+ * 识别优先级：
+ *   1. 拉丁字母 → 该大写字母（a-z）
+ *   2. 数字 → '0-9'
+ *   3. **汉字 → 拼音首字母**（这是中文书库的关键：以前所有中文书都堆在 other，
+ *      按书名/作者浏览等于没有分类。现在「三体」进 S、「末世降临」进 M）
+ *   4. 表里查不到（生僻字、日文假名、西里尔等）→ 'other'
+ *
+ * 前导的标点/空白会被跳过：`《三体》` 与 `三体` 归到同一个桶。
+ */
 export function letterBucket(input: string | null | undefined): string {
   const text = (input ?? '').trim();
-  // 跳过前导的标点/空白，取第一个有意义的字符
-  const m = text.match(/[A-Za-z0-9\u4e00-\u9fff]/);
+  // 找到第一个「可定序」的字符：拉丁字母 / 数字 / 汉字（含扩展 A 区）
+  const m = text.match(/[A-Za-z0-9\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]/);
   if (!m) return 'other';
   const ch = m[0];
   if (ch >= 'A' && ch <= 'Z') return ch;
   if (ch >= 'a' && ch <= 'z') return ch.toUpperCase();
   if (ch >= '0' && ch <= '9') return '0-9';
-  // CJK 等其他文字统一进 other（Phase 1 可改成拼音首字母）
+  const py = pinyinInitial(ch);
+  if (py) return py;
   return 'other';
 }
 
 /**
  * 桶的内部 id -> URL 路径段。
- * 「other」桶装的是中文书，客户端里显示「其他」比「other」直观得多。
+ * 「other」桶在客户端里显示「其他」比「other」直观得多。
  * 内部 id 保持不变（D1 里已存的 format_bucket / *_letter 不用迁移）。
  */
 export function bucketSegment(bucket: string): string {
@@ -150,31 +166,99 @@ export function bucketFromSegment(segment: string): string {
 
 /** 桶的内部 id -> 展示名（HTML 页面用，比路径段更详细） */
 export function bucketLabel(bucket: string): string {
-  if (bucket === 'other') return '其他（含中文）';
+  if (bucket === 'other') return '其他';
+  if (KIND_LABEL[bucket]) return KIND_LABEL[bucket]!;
   return bucket;
 }
 
-/** 已知的电子书/有声书扩展名白名单；不在表内的一律 other。 */
+// ── 格式识别 ────────────────────────────────────────────────────────────
+
+/**
+ * 扩展名 → 归一化格式 id。
+ *
+ * 分三类，便于「按类型」浏览与上传白名单：
+ *   ebook 电子书 / comic 漫画 / audio 有声书
+ * 不在这张表里的扩展名一律归到 'other'（并会被上传白名单拒绝）。
+ */
 const FORMAT_MAP: Record<string, string> = {
+  // ── 电子书 ──
   epub: 'epub',
   pdf: 'pdf',
   mobi: 'mobi',
   azw: 'azw3',
   azw3: 'azw3',
   fb2: 'fb2',
+  fbz: 'fb2',
   djvu: 'djvu',
+  djv: 'djvu',
   txt: 'txt',
   rtf: 'rtf',
   doc: 'doc',
   docx: 'docx',
+  odt: 'odt',
+  md: 'md',
+  html: 'html',
+  htm: 'html',
+  xhtml: 'html',
+  lit: 'lit',
+  chm: 'chm',
+  prc: 'prc',
+  pdb: 'pdb',
+  // ── 漫画（图片打包成压缩档）──
   cbz: 'cbz',
   cbr: 'cbr',
+  cb7: 'cb7',
+  cbt: 'cbt',
+  cba: 'cba',
+  // ── 有声书 ──
   m4a: 'm4a',
   m4b: 'm4b',
   mp3: 'mp3',
+  // 通用压缩包：不是书籍格式，保留映射只为正确显示，但上传白名单会拒绝
   zip: 'zip',
-  md: 'md',
-  html: 'html',
+};
+
+/** 漫画格式（图片压缩档） */
+export const COMIC_FORMATS: readonly string[] = ['cbz', 'cbr', 'cb7', 'cbt', 'cba'];
+/** 有声书格式 */
+export const AUDIO_FORMATS: readonly string[] = ['m4a', 'm4b', 'mp3'];
+/** 电子书格式（非漫画、非音频的其余书籍格式） */
+export const EBOOK_FORMATS: readonly string[] = [
+  'epub', 'pdf', 'mobi', 'azw3', 'fb2', 'djvu', 'txt', 'rtf',
+  'doc', 'docx', 'odt', 'md', 'html', 'lit', 'chm', 'prc', 'pdb',
+];
+
+/**
+ * 允许上传的扩展名 = 电子书 + 漫画（**不含**有声书与通用压缩包）。
+ *
+ * 这是站点的上传白名单：WebDAV PUT 与网页上传共用同一份，
+ * 避免出现「网页不让传、WebDAV 却能塞进来」的缺口。
+ * 可用环境变量 MAX_UPLOAD_BYTES 之外的 ALLOWED_FORMATS 覆盖（见 config.ts）。
+ */
+export const ALLOWED_UPLOAD_FORMATS: readonly string[] = [...EBOOK_FORMATS, ...COMIC_FORMATS];
+
+/** 原始扩展名（小写、不含点）是否在白名单内 */
+export function isAllowedUploadExt(ext: string | null | undefined): boolean {
+  const key = (ext ?? '').trim().toLowerCase().replace(/^\./, '');
+  if (!key) return false;
+  const fmt = FORMAT_MAP[key];
+  return !!fmt && ALLOWED_UPLOAD_FORMATS.includes(fmt);
+}
+
+/** 类型桶的 id：ebook / comic / audio */
+export type MediaKind = 'ebook' | 'comic' | 'audio';
+
+/** 由归一化格式判断所属大类（用于「按类型」集合） */
+export function mediaKindOfFormat(format: string): MediaKind {
+  if (COMIC_FORMATS.includes(format)) return 'comic';
+  if (AUDIO_FORMATS.includes(format)) return 'audio';
+  return 'ebook';
+}
+
+const KIND_LABEL: Record<string, string> = {
+  ebook: '电子书',
+  comic: '漫画',
+  audio: '有声书',
 };
 
 export function normaliseFormat(ext: string | null | undefined): string {
@@ -182,9 +266,14 @@ export function normaliseFormat(ext: string | null | undefined): string {
   return FORMAT_MAP[key] ?? (key || 'other');
 }
 
+/** 「按格式」集合会出现的桶（按常见度排序，便于客户端展示） */
 export const FORMAT_BUCKETS: readonly string[] = [
-  'epub', 'pdf', 'mobi', 'azw3', 'txt', 'cbz', 'cbr', 'fb2', 'djvu', 'm4b', 'mp3', 'other',
+  'epub', 'pdf', 'mobi', 'azw3', 'txt', 'cbz', 'cbr', 'fb2', 'djvu',
+  'doc', 'docx', 'rtf', 'md', 'html', 'm4b', 'mp3', 'other',
 ];
+
+/** 「按类型」集合的桶 */
+export const KIND_BUCKETS: readonly string[] = ['ebook', 'comic', 'audio'];
 
 /** 叶子节点在某个集合里归到哪个桶 */
 export type BucketResolver = (book: { title: string; author: string | null; format_bucket: string }) => string;
@@ -193,6 +282,7 @@ export const BUCKET_RESOLVERS: Record<CollectionId, BucketResolver> = {
   title: (b) => letterBucket(b.title),
   author: (b) => letterBucket(b.author ?? b.title),
   format: (b) => b.format_bucket,
+  type: (b) => mediaKindOfFormat(b.format_bucket),
   recent: () => 'all',
 };
 

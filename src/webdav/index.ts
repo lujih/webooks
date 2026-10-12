@@ -1,7 +1,15 @@
 /** WebDAV 方法分发。完整 Class 2（含 LOCK/UNLOCK/MKCOL/PROPPATCH/MOVE/COPY）。 */
 
 import type { Env, Settings } from '../config';
-import { letterBucket, canonicalDavPath, decodeDavPath, resolveNode, type DavNode } from '../lib/collections';
+import {
+  ALLOWED_UPLOAD_FORMATS,
+  isAllowedUploadExt,
+  letterBucket,
+  canonicalDavPath,
+  decodeDavPath,
+  resolveNode,
+  type DavNode,
+} from '../lib/collections';
 import { deleteBook, findBookByLeaf, rebuildBuckets, upsertBook, listBooks } from '../lib/db';
 import { methodNotAllowed, shortId, textResponse } from '../lib/http';
 import { safeContentTypeFor, deriveMetadata, sanitiseLeafName } from '../lib/metadata';
@@ -474,6 +482,21 @@ async function handlePut(request: Request, env: Env, node: DavNode, davPath: str
 
   const leafName = sanitiseLeafName(node.leafName);
   if (!leafName) return textResponse(400, 'Invalid file name');
+
+  // 扩展名白名单：只接受电子书 + 漫画格式。
+  // **必须在读 body 之前判定** —— 否则任何文件（exe/脚本/压缩包）都能通过
+  // WebDAV 绕过网页上传的限制塞进书库（网页那边拦、这边不拦 = 白拦）。
+  // 415 是「媒体类型不支持」的语义，并在响应里列出允许的格式。
+  const putExt = leafName.split('.').pop()?.toLowerCase() ?? '';
+  if (!isAllowedUploadExt(putExt)) {
+    return textResponse(
+      415,
+      `Unsupported Media Type: .${putExt || '(无扩展名)'} 不在允许的格式内。\n`
+      + `本站只接受电子书与漫画格式：\n  ${ALLOWED_UPLOAD_FORMATS.join(', ')}\n`,
+      { allow: ALLOW },
+    );
+  }
+
   if (!request.body) return textResponse(411, 'Length Required');
 
   // 匿名写节流：大小上限管「单次伤害」，这里管「总量」。

@@ -308,12 +308,41 @@ WebDAV 上传。这不是安全漏洞（fail-closed 行为正确），但影响�
   /admin 页面         → 200   ✅
 ```
 
+### 新增：上传格式白名单（只允许电子书 + 漫画）
+
+**修掉的漏洞**：网页上传有一份扩展名白名单，但 **WebDAV `PUT` 完全没有检查** ——
+任何文件（`.exe` / `.php` / `.js` / `.zip`）都能绕过网页限制直接塞进书库。
+「一边拦、一边不拦」等于没拦。
+
+现在两条入口共用 `src/lib/collections.ts` 里的 `ALLOWED_UPLOAD_FORMATS`：
+
+```
+电子书: epub pdf mobi azw3 fb2 djvu txt rtf doc docx odt md html lit chm prc pdb
+漫画:   cbz cbr cb7 cbt cba
+```
+
+被排除：有声书（m4a/m4b/mp3）、通用压缩包（zip/rar/7z）、可执行文件与脚本。
+
+实测（`scripts/abuse-probe.mjs`，WebDAV 通道）：
+
+```
+.exe  → 415 ✅   .js   → 415 ✅   .php → 415 ✅   .svg → 415 ✅
+.zip  → 415 ✅   .mp3  → 415 ✅   .sh  → 415 ✅
+.epub → 201 ✅   .pdf  → 201 ✅   .cbz → 201 ✅   .mobi → 201 ✅   .txt → 201 ✅
+```
+
+415 响应里会列出允许的格式，便于用户自查。判定用 `isAllowedUploadExt()` 先做
+归一化（`azw` → `azw3`），避免名单对了却把合法别名拒掉。
+
+另外把 HTTP 输入校验提到了**配置检查之前** —— 非法输入应当立刻被拒，
+不该先暴露「服务端缺哪些配置」这种内部状态（测试也因此才能真正覆盖到白名单）。
+
 ### 剩余 3 项「注意」（设计取舍，非漏洞）
 
 | 项 | 说明 |
 |---|---|
-| WebDAV 无人机验证 | 匿名开放上传的固有代价。已用「每日写入次数」节流缓解（减速带） |
-| 可执行文件可伪装成 .epub | 文件以 `application/epub+zip` 提供，浏览器只下载不执行；但下载者用阅读器打开理论上可能触发解析器漏洞。**服务端病毒扫描未做**（免费层无此能力） |
+| WebDAV 无人机验证 | 匿名开放上传的固有代价（WebDAV 协议里没有验证码的位置）。已用「每日写入次数」节流缓解（减速带） |
+| 可执行文件可伪装成 .epub | 扩展名白名单挡不住「改名的可执行文件」。文件以 `application/epub+zip` 提供，浏览器只下载不执行；但下载者用阅读器打开理论上可能触发解析器漏洞。**服务端病毒扫描未做**（免费层无此能力） |
 | 节流为尽力而为 | Cache API 按数据中心计数，非硬限制。要硬限制需 Durable Object + 账号体系 |
 
 ---
@@ -321,22 +350,25 @@ WebDAV 上传。这不是安全漏洞（fail-closed 行为正确），但影响�
 ## 八、验证方式（可复现）
 
 ```bash
-# 1. 技术安全自查（34 项；--write-test 会写入并自动清理一个临时文件）
+# 1. 技术安全自查（33 项；--write-test 会写入并自动清理一个临时文件）
 node scripts/security-probe.mjs --url https://webooks.cszxorx.dpdns.org --write-test
 
-# 2. 滥用防护自查（15 项；--token 用于自动清理测试文件）
+# 2. 滥用防护自查（22 项；--token 用于自动清理测试文件，不带会留下临时文件）
 node scripts/abuse-probe.mjs --url https://webooks.cszxorx.dpdns.org/dav --token "$WRITE_TOKEN"
 
-# 3. WebDAV 协议合规（15 步完整挂载握手）
-node scripts/webdav-litmus.mjs --url https://webooks.cszxorx.dpdns.org/dav/
+# 3. WebDAV 协议合规（16 步完整挂载握手；破坏性步骤需要口令）
+node scripts/webdav-litmus.mjs --url https://webooks.cszxorx.dpdns.org/dav/ --token "$WRITE_TOKEN"
 
-# 4. RFC 4918 / 9110 合规
-node scripts/rfc-probe.mjs --url https://webooks.cszxorx.dpdns.org/dav/
+# 4. RFC 4918 / 9110 合规（14 项）
+node scripts/rfc-probe.mjs --url https://webooks.cszxorx.dpdns.org/dav/ --token "$WRITE_TOKEN"
 
-# 5. 配色对比度（WCAG）
+# 5. 上传链路（CSP / R2 密钥对 / CORS 三层）
+node scripts/verify-upload-chain.mjs --site https://webooks.cszxorx.dpdns.org
+
+# 6. 配色对比度（WCAG）
 node scripts/contrast-check.mjs
 
-# 6. 单元与端到端测试（148 例，含 30 例安全回归）
+# 7. 单元与端到端测试（194 例，含 30 例安全回归）
 npx vitest run
 ```
 

@@ -59,7 +59,9 @@ async function cleanup() {
     `${tag}.epub`, `${tag}_copy.epub`, `${tag}_evil.txt`, `${tag}_over.epub`,
     `${tag}_fake.epub`, `${tag}_big.epub`,
     ...Array.from({ length: 6 }, (_, i) => `${tag}_bulk_${i}.txt`),
-    ...['exe', 'js', 'html', 'svg', 'php'].map((e) => `${tag}.${e}`),
+    // 4b 的危险扩展名 + 4c 的合法格式，都要清掉（漏一个就会在书库里留垃圾）
+    ...['exe', 'js', 'php', 'svg', 'zip', 'mp3', 'sh'].map((e) => `${tag}.${e}`),
+    ...['epub', 'pdf', 'cbz', 'mobi', 'txt'].map((e) => `${tag}_ok.${e}`),
   ];
   let leftover = 0;
   for (const n of names) {
@@ -197,8 +199,8 @@ console.log('\n▸ 4. 伪装与危险文件');
   );
   await dav(`/recent/${tag}_fake.epub`, { method: 'DELETE' });
 
-  // 4b. 危险扩展名
-  for (const ext of ['exe', 'js', 'html', 'svg', 'php']) {
+  // 4b. 危险/非书籍扩展名：应当被「只允许电子书+漫画」的白名单挡掉
+  for (const ext of ['exe', 'js', 'php', 'svg', 'zip', 'mp3', 'sh']) {
     const n = `${tag}.${ext}`;
     const r = await dav(`/recent/${n}`, {
       method: 'PUT',
@@ -207,7 +209,7 @@ console.log('\n▸ 4. 伪装与危险文件');
     });
     const allowed = r.status === 201 || r.status === 204;
     if (allowed) {
-      // 看它会被当成什么类型提供（决定浏览器是下载还是执行）
+      // 被放行才需要看它被当成什么类型提供（决定浏览器是下载还是执行）
       const head = await dav(`/recent/${n}`, { method: 'GET' });
       const loc = head.headers.get('location');
       let served = '?';
@@ -219,11 +221,38 @@ console.log('\n▸ 4. 伪装与危险文件');
       }
       const dangerous = /text\/html|image\/svg|javascript/i.test(served);
       report(
-        dangerous ? 'SAFE' : 'SAFE',
-        `.${ext} 文件：允许上传，但以 ${served} 提供`,
+        'SAFE',
+        `.${ext} 被放行，以 ${served} 提供`,
         dangerous ? '⚠️ 会被浏览器执行！' : '只会被下载，不会执行',
       );
+    } else {
+      // 415 = 被格式白名单拒绝，这是期望行为
+      report(
+        r.status === 415 ? 'SAFE' : 'WARN',
+        `.${ext} 被格式白名单拒绝`,
+        `PUT → ${r.status}`,
+        r.status === 415
+          ? '只接受电子书与漫画格式（WebDAV 与网页上传共用同一份白名单）'
+          : '期望 415，实际是别的状态码，建议检查白名单是否覆盖 WebDAV 通道',
+      );
     }
+    await dav(`/recent/${n}`, { method: 'DELETE' });
+  }
+
+  // 4c. 允许的格式不该被误伤（防「白名单太严把正常书也拒了」）
+  for (const ext of ['epub', 'pdf', 'cbz', 'mobi', 'txt']) {
+    const n = `${tag}_ok.${ext}`;
+    const r = await dav(`/recent/${n}`, {
+      method: 'PUT',
+      headers: { 'content-type': 'application/octet-stream' },
+      body: 'x',
+    });
+    report(
+      r.status === 201 || r.status === 204 ? 'SAFE' : 'WARN',
+      `.${ext} 属于允许格式，能正常上传`,
+      `PUT → ${r.status}`,
+      r.status === 415 ? '白名单误伤了合法格式！' : '',
+    );
     await dav(`/recent/${n}`, { method: 'DELETE' });
   }
 }
