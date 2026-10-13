@@ -48,6 +48,48 @@ function check(name, ok, detail, ref) {
   console.log(`  ${tag} ${name}${detail ? `${C.dim} — ${detail}${C.r}` : ''}${ref ? `${C.dim} [${ref}]${C.r}` : ''}`);
 }
 
+/**
+ * 严格 XML 良构检查（标签配对 + 单一根元素）。
+ *
+ * 为什么必须有：LOCK 响应历史上输出过 `<D:locktoken><D:locktoken>…`
+ * —— 标签开了两次只关一次，不是合法 XML，所有严格客户端解析失败，
+ * 而 `expect(xml).toContain(...)` 完全测不出来。验证 XML 只能用解析器/配对检查。
+ * （与 test/xml-wellformed-lib.ts 同源；线上用 .NET XmlDocument 交叉验证过。）
+ */
+function isWellFormedXml(xml) {
+  const src = xml.replace(/^<\?xml[^?]*\?>\s*/, '');
+  const stack = [];
+  let rootSeen = 0;
+  let i = 0;
+  while (i < src.length) {
+    const lt = src.indexOf('<', i);
+    if (lt < 0) break;
+    if (src.startsWith('<!--', lt)) { const e = src.indexOf('-->', lt); if (e < 0) return { err: '注释未闭合' }; i = e + 3; continue; }
+    if (src.startsWith('<![CDATA[', lt)) { const e = src.indexOf(']]>', lt); if (e < 0) return { err: 'CDATA 未闭合' }; i = e + 3; continue; }
+    if (src.startsWith('<!', lt)) { const e = src.indexOf('>', lt); if (e < 0) return { err: '声明未闭合' }; i = e + 1; continue; }
+    const gt = src.indexOf('>', lt);
+    if (gt < 0) return { err: '标签未闭合' };
+    const inner = src.slice(lt + 1, gt).trim();
+    if (inner.startsWith('/')) {
+      const name = inner.slice(1).trim();
+      const top = stack.pop();
+      if (top === undefined) return { err: `多余闭合 </${name}>` };
+      if (top !== name) return { err: `</${name}> 与 <${top}> 不匹配` };
+    } else if (inner.endsWith('/')) {
+      if (stack.length === 0) { rootSeen++; if (rootSeen > 1) return { err: '多个根元素' }; }
+    } else {
+      const name = inner.split(/[\s>\/]/)[0] || '';
+      if (!name) return { err: '空标签名' };
+      if (stack.length === 0) { rootSeen++; if (rootSeen > 1) return { err: '多个根元素' }; }
+      stack.push(name);
+    }
+    i = gt + 1;
+  }
+  if (stack.length > 0) return { err: `未闭合 <${stack.join('>, <')}>` };
+  if (rootSeen !== 1) return { err: `根元素数=${rootSeen}` };
+  return { err: null };
+}
+
 // ── 造一个可写文件（后面的检查都基于它）──
 const tmp = `__rfcprobe_${Date.now()}.txt`;
 {
@@ -67,10 +109,16 @@ console.log('='.repeat(72));
 {
   const { res } = await req('/', { method: 'OPTIONS' });
   const dav = res.headers.get('dav') ?? '';
-  // RFC 4918 §18: 完全合规应宣告 "1, 2, 3"（含 Class 2 LOCK）
-  const has2 = /\b2\b/.test(dav);
-  const has3 = /\b3\b/.test(dav);
-  check('OPTIONS 宣告 RFC 4918 完整等级（DAV: 1, 2, 3）', has2 && has3, `DAV: ${dav || '(空)'}`, 'RFC 4918 §18');
+  const classes = dav.split(',').map((s) => s.trim());
+  // RFC 4918 §18.2：Class 2 = Class 1 + LOCK/UNLOCK，必须宣告 1 和 2。
+  // §18.3：宣告 3 等于声称「满足本规范全部要求」—— 本服务有三处有意偏离
+  //        （MKCOL 不真正建目录 / PROPPATCH 不持久化 / DELETE 根目录不支持），
+  //        所以**不应**宣告 3。宣告 3 是不实声明。
+  const has1 = classes.includes('1');
+  const has2 = classes.includes('2');
+  const has3 = classes.includes('3');
+  check('OPTIONS 宣告 DAV: 1, 2（Class 2 含 LOCK/UNLOCK）', has1 && has2, `DAV: ${dav || '(空)'}`, 'RFC 4918 §18.2');
+  check('不宣告 class 3（未满足全部 MUST，宣告即不实）', !has3, `DAV: ${dav || '(空)'}`, 'RFC 4918 §18.3');
 }
 
 // ── OPTIONS * ──
@@ -116,13 +164,19 @@ console.log('='.repeat(72));
   }
 }
 
-// ── PROPPATCH 兼容层：假装成功（回 207，避免客户端无限重试）──
+// ── PROPPATCH：属性无法持久化，应如实报告 403 + 前置条件 ──
 {
   const xml = '<?xml version="1.0"?><D:propertyupdate xmlns:D="DAV:"><D:set><D:prop><D:displayname>x</D:displayname></D:prop></D:set></D:propertyupdate>';
   const { res, body } = await req('/recent/' + tmp, { method: 'PROPPATCH', headers: { 'content-type': 'application/xml' }, body: xml });
-  const ok = res.status === 207 && /<D:status>HTTP\/1\.1 200 OK/.test(body);
-  check('PROPPATCH 返回 207 成功（兼容层，避免客户端重试）', ok,
-    `status=${res.status} body=${body.slice(0, 60).replace(/\n/g, ' ')}`, 'RFC 4918 §9.2 兼容层');
+  // RFC 4918 §9.2：指令「MUST either all be executed or none executed」。
+  // §9.2.1：无法修改的属性应 403 + cannot-modify-protected-property。
+  // 早期实现回 200 OK 却什么都不写 —— 那是虚假成功，客户端会据此缓存「已设置」。
+  const ok = res.status === 207
+    && /<D:status>HTTP\/1\.1 403 Forbidden/.test(body)
+    && /cannot-modify-protected-property/.test(body)
+    && !/HTTP\/1\.1 200 OK/.test(body);
+  check('PROPPATCH 如实报告无法修改（207 + 403 + 前置条件，不谎报成功）', ok,
+    `status=${res.status} body=${body.slice(0, 90).replace(/\n/g, ' ')}`, 'RFC 4918 §9.2 / §9.2.1');
 }
 
 // ── LOCK 应宣告 Class 2 并返回 200 + Lock-Token ──
@@ -135,6 +189,43 @@ console.log('='.repeat(72));
   const ok = res.status === 200 && !!token && /<D:lockdiscovery>/.test(body);
   check('LOCK 返回 200 + Lock-Token（Class 2 已实现）', ok,
     `status=${res.status} lock-token=${token ?? '(无)'}`, 'RFC 4918 §9.10');
+
+  // §9.10.1：lockdiscovery 必须在 prop 元素里
+  check('LOCK 响应把 lockdiscovery 包在 prop 元素内', /<D:prop[\s>]/.test(body) && /<D:lockdiscovery>/.test(body),
+    `body=${body.slice(0, 70).replace(/\n/g, ' ')}`, 'RFC 4918 §9.10.1');
+
+  // §8.2：所有 XML MUST be well formed。历史上 LOCK 曾输出
+  // `<D:locktoken><D:locktoken>…`（标签不配对），所有严格客户端都会挂，
+  // 而字符串包含断言测不出来 —— 这里用严格配对检查。
+  const wf = isWellFormedXml(body);
+  check('LOCK 响应是良构 XML（标签配对）', wf.err === null,
+    wf.err ? `解析错误：${wf.err}` : '标签配对正确', 'RFC 4918 §8.2');
+
+  // §14.14 + §10.5：正文里的 token 与响应头一致，且是原样 URI（转义后解析还原）
+  if (token) {
+    const bare = token.replace(/^</, '').replace(/>$/, '');
+    check('锁令牌在正文与 Lock-Token 头中一致（解析还原后）', body.includes(bare),
+      `期望 ${bare}`, 'RFC 4918 §14.14');
+  }
+
+  // §10.7：Timeout 头必须是 Second-<digits>，服务端要真的采纳。
+  // 必须用**另一个未被锁住**的文件：同一资源已被上面那把锁占着，
+  // 再发 LOCK 会得到 423 + 原有锁的信息（回显的是旧锁的 Second-300，不是新请求的）。
+  {
+    const fresh = `/recent/${tmp}_to`;
+    await req(fresh, { method: 'PUT', body: 'probe' });
+    const t = await req(fresh, {
+      method: 'LOCK',
+      headers: { timeout: 'Second-777' },
+      body: '<D:lockinfo xmlns:D="DAV:"><D:locktype><D:write/></D:locktype><D:lockscope><D:exclusive/></D:lockscope></D:lockinfo>',
+    });
+    const tBody = t.body ?? '';
+    check('Timeout: Second-N 被真正采纳（不是静默退回默认）', /<D:timeout>Second-777<\/D:timeout>/.test(tBody),
+      `回显=${(tBody.match(/Second-\d+/) || ['(无)'])[0]}`, 'RFC 4918 §10.7');
+    const tToken = t.res.headers.get('lock-token');
+    if (tToken) await req(fresh, { method: 'UNLOCK', headers: { 'lock-token': tToken } });
+    await req(fresh, { method: 'DELETE' });
+  }
 
   // 刷新（带 If 头）
   if (token) {
@@ -153,11 +244,26 @@ console.log('='.repeat(72));
   }
 }
 
-// ── MKCOL 应接受虚拟目录创建（客户端挂载兼容性）──
+// ── MKCOL：已映射的集合必须失败（§9.3）；未映射路径如实告知无法创建 ──
 {
   const { res } = await req('/title/A/', { method: 'MKCOL' });
-  const ok = res.status === 201;
-  check('MKCOL 虚拟目录返回 201 Created（客户端挂载兼容）', ok, `status=${res.status}`, 'RFC 4918 §9.3 兼容层');
+  // §9.3：「If the Request-URI is already mapped to a resource, then the MKCOL MUST fail.」
+  // §9.3.1：用 405。（405 也是挂载安全的：客户端把 405 理解为「已存在」。）
+  const ok = res.status === 405;
+  check('MKCOL 对已映射的集合返回 405（不得谎报创建成功）', ok, `status=${res.status}`, 'RFC 4918 §9.3 / §9.3.1');
+
+  const fresh = await req('/__mkcol_probe_' + Date.now() + '/', { method: 'MKCOL' });
+  const ok2 = fresh.res.status === 403;
+  check('MKCOL 对无法持久化的新路径返回 403 + valid-resourcetype', ok2, `status=${fresh.res.status}`, 'RFC 5689 §3.1');
+}
+
+// ── DELETE 集合语义（§9.6.1）与根目录保护 ──
+{
+  const rootDel = await req('/', { method: 'DELETE' });
+  // §9.6.1 要求集合 DELETE 等价于 Depth: infinity（递归删成员）。
+  // 根目录刻意不支持：实现它等于「一次误操作删掉整个书库」，不可逆。
+  check('DELETE 根目录被拒绝（防止一次误操作清空书库）', rootDel.res.status === 405 || rootDel.res.status === 401,
+    `status=${rootDel.res.status}`, 'RFC 4918 §9.6.1（有意偏离，见 rfc-compliance.md）');
 }
 
 // ── PATCH 未实现须 405 且 Allow 不含 PATCH ──

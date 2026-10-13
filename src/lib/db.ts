@@ -150,6 +150,65 @@ export async function adminTotals(
   return { books: row?.books ?? 0, bytes: row?.bytes ?? 0 };
 }
 
+/**
+ * 递归删除一个集合下的**全部**书（RFC 4918 §9.6.1：集合上的 DELETE 等价于
+ * `Depth: infinity`）。
+ *
+ * 分页拉取是因为单页有上限，而一个桶里可能有上千本。循环用「按 id 升序 + 大于
+ * 游标」而不是 OFFSET —— 删除过程中 OFFSET 会跳过行（每删一批后面的行就前移）。
+ *
+ * 返回被删掉的书，供调用方清理 R2 对象与缓存。
+ */
+export async function deleteBooksInBucket(
+  db: D1Database,
+  collection: CollectionId,
+  bucket: string,
+): Promise<BookRow[]> {
+  const where = (): string => {
+    switch (collection) {
+      case 'title':
+        return `title_letter = ?`;
+      case 'author':
+        return `author_letter = ?`;
+      case 'format':
+        return `format_bucket = ?`;
+      case 'type':
+        return `kind_bucket = ?`;
+      case 'recent':
+        return `1 = 1`; // recent 是扁平集合，成员是全部书
+      default:
+        return `1 = 0`;
+    }
+  };
+  const bindArgs = (): unknown[] =>
+    collection === 'recent' ? [] : [bucket];
+
+  const deleted: BookRow[] = [];
+  const PAGE = 100;
+  let cursor = '';
+  for (;;) {
+    const { results } = await db
+      .prepare(
+        `SELECT ${BOOK_COLUMNS} FROM books
+           WHERE status = 'published' AND ${where()} AND id > ?
+           ORDER BY id LIMIT ?`,
+      )
+      .bind(...bindArgs(), cursor, PAGE)
+      .all<BookRow>();
+    const rows = results ?? [];
+    if (rows.length === 0) break;
+
+    const ids = rows.map((r) => r.id);
+    const ph = ids.map(() => '?').join(',');
+    await db.prepare(`DELETE FROM books WHERE id IN (${ph})`).bind(...ids).run();
+
+    deleted.push(...rows);
+    cursor = rows[rows.length - 1]!.id;
+    if (rows.length < PAGE) break;
+  }
+  return deleted;
+}
+
 /** 管理后台：按 leaf_name 批量查（先查回 r2_key 以便一并清理对象） */
 export async function findBooksByLeafNames(
   db: D1Database,

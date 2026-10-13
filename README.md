@@ -367,8 +367,11 @@ docker run --rm -it alpine:latest sh -c '
   TESTS="basic props copymove" ./litmus https://你的域名/dav/ 用户名 密码'
 ```
 
-⚠️ 预期 `locks` 套件会失败 —— 本实现是 **WebDAV Class 1，不提供 LOCK/UNLOCK**（返回 501）。
-这是有意为之：Class 2 需要 Durable Object 存锁表，会再切走一块免费额度。
+✅ 本实现是 **WebDAV Class 2**（`DAV: 1, 2`），提供完整的 LOCK/UNLOCK ——
+锁表存在 D1 里，不依赖 Durable Objects。`locks` 套件应当能通过大部分用例。
+（曾有一处真实缺陷：LOCK 响应体输出了不成对的 `<D:locktoken>` 标签，
+所有严格客户端都会解析失败。已修复，并由 `test/xml-wellformed.test.ts` 持续兜底。）
+
 `http` 套件预计在 `Expect: 100-continue` 上超时（`dav-probe` 会先告诉你这一点）。
 
 ### 待核实清单

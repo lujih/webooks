@@ -78,13 +78,18 @@ async function main() {
     const dav = res.headers.get('dav') ?? '';
     const allow = res.headers.get('allow') ?? '';
     const msVia = res.headers.get('ms-author-via') ?? '';
+    const classes = dav.split(',').map((s) => s.trim());
+    // RFC 4918 §18.2：宣告 1 + 2（Class 2 = 有锁）。
+    // 刻意**不**宣告 3：§18.3 说宣告 3 等于声称满足全部 MUST，
+    // 而本服务有三处有意偏离（MKCOL 不真正建目录 / PROPPATCH 不持久化 /
+    // DELETE 根目录不支持），宣告 3 是不实声明。
     const ok =
       res.status === 200 &&
-      /\b1\b/.test(dav) && /\b2\b/.test(dav) && /\b3\b/.test(dav) &&
+      classes.includes('1') && classes.includes('2') &&
       allow.includes('PROPFIND') && allow.includes('LOCK') &&
       msVia === 'DAV';
-    record(ok, 'OPTIONS 宣告 DAV:1,2,3 + Allow + ms-author-via',
-      `dav=[${dav}] allow=[${allow}] ms-author-via=[${msVia}]`, 'RFC 4918 §18 / MS-WebDAV');
+    record(ok, 'OPTIONS 宣告 DAV:1,2（Class 2，不宣告 3）+ Allow + ms-author-via',
+      `dav=[${dav}] allow=[${allow}] ms-author-via=[${msVia}]`, 'RFC 4918 §18.2 / MS-WebDAV');
     if (!ok) return cleanup(tmp);
   }
 
@@ -140,8 +145,11 @@ async function main() {
   // 5) MKCOL 根
   {
     const { res } = await req('/', { method: 'MKCOL' });
-    record(res.status === 201, 'MKCOL 根目录 → 201（挂载探测）',
-      `status=${res.status}`, 'RFC 4918 §9.3 兼容层');
+    // RFC 4918 §9.3：URI 已映射到资源时 MKCOL MUST fail（§9.3.1 规定用 405）。
+    // 405 同时是**挂载安全**的：客户端把 405 理解为「集合已存在」并继续挂载，
+    // 所以不像返回 201 那样需要额外的兼容判断。
+    record(res.status === 405, 'MKCOL 根目录 → 405（已映射，规范要求失败）',
+      `status=${res.status}`, 'RFC 4918 §9.3 / §9.3.1');
   }
 
   // 6) LOCK 根
@@ -208,8 +216,9 @@ async function main() {
       headers: { 'content-type': 'application/xml' },
       body: '<?xml version="1.0"?><D:propertyupdate xmlns:D="DAV:"><D:set><D:prop><D:displayname>x</D:displayname></D:prop></D:set></D:propertyupdate>',
     });
-    record(res.status === 207 && body.includes('200 OK'), 'PROPPATCH → 207（兼容层假装成功）',
-      `status=${res.status}`, 'RFC 4918 §9.2 兼容层');
+    record(res.status === 207 && body.includes('403 Forbidden') && body.includes('cannot-modify-protected-property'),
+      'PROPPATCH → 207 + 403 + 前置条件（如实报告，不谎报成功）',
+      `status=${res.status}`, 'RFC 4918 §9.2 / §9.2.1');
   }
 
   // 12) MOVE（破坏性操作 → 带口令）

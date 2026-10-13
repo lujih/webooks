@@ -408,24 +408,30 @@ node scripts/verify-upload-chain.mjs --site https://webooks.cszxorx.dpdns.org
 # 6. 配色对比度（WCAG）
 node scripts/contrast-check.mjs
 
-# 7. 单元与端到端测试（194 例，含 30 例安全回归）
+# 7. 单元与端到端测试（253 例，含 XML 良构性 / 格式白名单 / 分类 / 通行证回归）
 npx vitest run
 ```
 
 ### 修复验证结果
 ```
 类型检查           tsc exit 0
-全量测试           148 passed (8 files)
-技术安全探针       34/34 通过，0 项待处理
-滥用防护探针       12 项安全 / 3 项注意 / 0 项风险
-WebDAV litmus      15/15 步通过
+全量测试           253 passed (17 files)
+技术安全探针       33/33 通过，0 项待处理
+滥用防护探针       19 项安全 / 3 项注意 / 0 项风险
+WebDAV litmus      16/16 步通过
 配色对比度         全部达标（文本 8.5:1–16.3:1，均为 AAA）
-构建体积           约 130 KiB / gzip 约 40 KiB
+构建体积           约 282 KiB（未压缩）/ gzip 约 101 KiB
 ```
 
+> 关于体积限制：Wrangler 输出的 `Total Upload`（**未压缩**）才是判据。
+> Cloudflare 现行的 Worker 上限是 **64 MiB 未压缩，Free 与 Paid 相同**，
+> **不再有独立的「压缩后体积」上限**（旧的「Free 1 MB / Paid 10 MB gzip」
+> 是早期 Workers 的规则，早已不适用）。
+> 来源：<https://developers.cloudflare.com/workers/platform/limits/#worker-size>
+
 ### 漏洞验证痕迹已清理
-审计过程中上传的恶意对象（`covers/<id>.html`、`books/<id>`）已从 R2 删除，
-线上返回 404；书库现仅存 1 本演示书 `凡尘之舞.epub`（如需可删除）。
+审计与探针过程中上传的恶意对象（`covers/<id>.html`、`books/<id>`、各类
+`__abuse_*` / `__litmus_*` 临时文件）均已从 R2 与书库中删除，线上返回 404。
 
 ---
 

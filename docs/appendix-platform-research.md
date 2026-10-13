@@ -2,6 +2,14 @@
 
 Research date **2026-10-05**. Doc dates = "Last updated" as served today.
 
+> **这是一份带日期的研究快照**，用于记录「当初为什么这么选型」，不是当前事实的权威来源。
+> 各平台限额与价格会变，实施前请以 <https://developers.cloudflare.com/workers/platform/limits/>
+> 等官方页面为准。已在 2026-10-13 的全面审查中核对过其中影响决策的几项：
+> Workers Free 的子请求上限是 **50/次**（不是 1000）、Worker 体积上限是
+> **64 MiB 未压缩**（不再有「gzip 1 MB/10 MB」的限制）、Free 计划**已支持**
+> Durable Objects（仅 SQLite 后端）与 Cron Triggers（每账号 5 个）。
+> 本项目最终**没有**采用 DO：锁状态直接存在 D1 里，避免额外的一份配额与故障域。
+
 ## 1. Workers request body limit (Cloudflare plan, not Workers plan)
 
 | Plan | Max request body |

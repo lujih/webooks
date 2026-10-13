@@ -120,14 +120,16 @@ describe('upsertBook 的覆盖语义', () => {
 // ── OPTIONS / 协议声明 ──────────────────────────────────────────────────
 
 describe('OPTIONS', () => {
-  it('宣告 DAV: 1, 2, 3（完整 Class 2，含 LOCK/UNLOCK）', async () => {
+  it('宣告 DAV: 1, 2（Class 2 含 LOCK/UNLOCK），不宣告 3', async () => {
     const res = await dav('/', { method: 'OPTIONS' });
     expect(res.status).toBe(200);
-    // RFC 4918 §18: 1=Class1, 2=Class2(有锁), 3=符合 RFC4918 全部要求
+    // RFC 4918 §18.3：宣告 class 3 意味着「满足本规范的全部要求」。
+    // 我们有若干有意保留的偏离（MKCOL 不真正创建集合、PROPPATCH 不持久化、
+    // DELETE 集合不支持 Depth:infinity），所以宣告 3 是不实声明 —— 只宣告 1, 2。
     const davHeader = res.headers.get('dav') ?? '';
     expect(davHeader).toContain('1');
     expect(davHeader).toContain('2');
-    expect(davHeader).toContain('3');
+    expect(davHeader.split(',').map((s) => s.trim())).not.toContain('3');
     expect(res.headers.get('allow')).toContain('PROPFIND');
     expect(res.headers.get('allow')).toContain('LOCK');
     expect(res.headers.get('ms-author-via')).toBe('DAV');
@@ -451,31 +453,50 @@ describe('Class 2 锁（LOCK/UNLOCK）', () => {
 });
 
 describe('MKCOL', () => {
-  it('MKCOL 虚拟目录返回 201 Created', async () => {
-    const res = await dav('/title/A/', { method: 'MKCOL' });
-    expect(res.status).toBe(201);
+  it('已映射的虚拟集合返回 405（RFC 4918 §9.3「已存在则必须失败」）', async () => {
+    const res = await dav('/按书名/A/', { method: 'MKCOL' });
+    // §9.3：「If the Request-URI is already mapped to a resource, then the
+    // MKCOL MUST fail.」§9.3.1 指定用 405。
+    expect(res.status).toBe(405);
+    await res.text();
   });
 
-  it('Extended MKCOL（带 body）也 201', async () => {
-    const res = await dav('/title/A/', {
+  it('未映射的新路径返回 403 + valid-resourcetype（无法持久化自定义目录）', async () => {
+    const res = await dav('/我的新目录/', { method: 'MKCOL' });
+    expect(res.status).toBe(403);
+    const xml = await res.text();
+    expect(xml).toContain('<D:valid-resourcetype/>');
+  });
+
+  it('Extended MKCOL（带 body）在已映射路径上同样失败', async () => {
+    const res = await dav('/按书名/A/', {
       method: 'MKCOL',
-      body: '<D:propertyupdate xmlns:D="DAV:"><D:set><D:prop><D:displayname>x</D:displayname></D:prop></D:set></D:propertyupdate>',
+      body: '<D:mkcol xmlns:D="DAV:"><D:set><D:prop><D:displayname>x</D:displayname></D:prop></D:set></D:mkcol>',
       headers: { 'content-type': 'application/xml' },
     });
-    expect(res.status).toBe(201);
+    expect(res.status).toBe(405);
+    await res.text();
   });
 });
 
 describe('PROPPATCH', () => {
-  it('PROPPATCH 假装成功返回 207', async () => {
-    const res = await dav('/recent/e.epub', {
+  it('不谎报成功：207 + 403 + cannot-modify-protected-property', async () => {
+    const res = await dav('/最近收录/e.epub', {
       method: 'PROPPATCH',
-      body: '<?xml version="1.0"?><D:propertyupdate xmlns:D="DAV:"><D:set><D:prop><D:displayname>ignored</D:displayname></D:prop></D:set></D:propertyupdate>',
+      body: '<?xml version="1.0"?><D:propertyupdate xmlns:D="DAV:"><D:set><D:prop><D:displayname>x</D:displayname></D:prop></D:set></D:propertyupdate>',
       headers: { 'content-type': 'application/xml' },
     });
+    // §9.2 指令必须「要么全执行要么都不执行」；§9.2.1 对无法修改的属性
+    // 应返回 403 + cannot-modify-protected-property。早期实现回 200 却什么都不写，
+    // 那是虚假成功，客户端会据此缓存「已设置」。
     expect(res.status).toBe(207);
     const xml = await res.text();
-    expect(xml).toContain('<D:status>HTTP/1.1 200 OK</D:status>');
+    expect(xml).toContain('<D:status>HTTP/1.1 403 Forbidden</D:status>');
+    expect(xml).toContain('<D:cannot-modify-protected-property/>');
+    expect(xml).not.toContain('200 OK');
+    // 必须报出**具体**属性名，客户端才知道是哪个没设上（不能是无名的 unknown）
+    expect(xml).toContain('<D:displayname/>');
+    expect(xml).not.toContain('<D:unknown/>');
   });
 });
 

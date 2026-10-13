@@ -164,7 +164,11 @@ function renderProps(
         found.push(`<D:getlastmodified>${httpDate(meta.lastModified)}</D:getlastmodified>`);
         break;
       case 'getetag':
-        found.push(`<D:getetag>${escapeXml(meta.etag ?? `"auto-${hash(meta.displayName + String(meta.lastModified ?? ''))}"`)}</D:getetag>`);
+        // RFC 4918 §15.6：entity-tag 是服务端生成的 `"..."` 形式（hex/UUID），
+        // 不含 < > & & 等需要转义的字符。escapeXml 会把内部的 " 变 &quot;，
+        // 虽是合法 XML，但客户端 If-Match 时回送的是原始 ETag，服务端比对不上。
+        // 所以这里**不转义**（ETag 完全由服务端控制，非用户输入）。
+        found.push(`<D:getetag>${meta.etag ?? `"auto-${hash(meta.displayName + String(meta.lastModified ?? ''))}"`}</D:getetag>`);
         break;
       case 'displayname':
         found.push(`<D:displayname>${escapeXml(meta.displayName)}</D:displayname>`);

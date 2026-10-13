@@ -4,13 +4,22 @@ import type { Env, Settings } from '../config';
 import {
   ALLOWED_UPLOAD_FORMATS,
   isAllowedUploadExt,
-  authorBucket, letterBucket,
+  authorBucket,
+  letterBucket,
   canonicalDavPath,
+  collectionSegment,
   decodeDavPath,
   resolveNode,
   type DavNode,
 } from '../lib/collections';
-import { deleteBook, findBookByLeaf, rebuildBuckets, upsertBook, listBooks } from '../lib/db';
+import {
+  deleteBook,
+  deleteBooksInBucket,
+  findBookByLeaf,
+  rebuildBuckets,
+  upsertBook,
+  listBooks,
+} from '../lib/db';
 import { methodNotAllowed, shortId, textResponse } from '../lib/http';
 import { safeContentTypeFor, deriveMetadata, sanitiseLeafName } from '../lib/metadata';
 import { checkPreconditions } from '../lib/preconditions';
@@ -34,14 +43,24 @@ import { escapeXml } from '../lib/xml';
 const ALLOW = 'OPTIONS, GET, HEAD, PROPFIND, PROPPATCH, MKCOL, LOCK, UNLOCK, PUT, DELETE, COPY, MOVE';
 
 /**
- * DAV 合规等级头（RFC 4918 §18）：
- *   1 = Class 1（无锁）
- *   2 = Class 2（支持 LOCK/UNLOCK）
- *   3 = 符合 RFC 4918 全部要求
- * 这里宣告 1, 2, 3：我们实现了完整 Class 2 锁（含 timeout、lock-token、If 头刷新），
- * OpenList 等完整客户端能正常挂载。
+ * DAV 合规等级头（RFC 4918 §18）。
+ *
+ * §18.1：Class 1 要求满足文档里**所有 MUST**。
+ * §18.2：Class 2 = Class 1 + LOCK/UNLOCK。
+ * §18.3：「Advertising class 3 support in addition to class 1 and 2 means that
+ *         the server supports all the requirements in this specification.」
+ *
+ * 也就是说宣告 `3` 等于声称「本服务端满足 RFC 4918 的全部要求」。
+ *
+ * 我们**故意只宣告 1, 2**，因为确实有几条 MUST 不满足（都有意为之）：
+ *   · §9.3 MKCOL：集合是 D1 派生的虚拟视图，无法真正创建，
+ *     我们返回 201 做挂载兼容（而非 §9.3 要求的「已存在则必须失败」）
+ *   · §9.2 PROPPATCH：不持久化自定义属性
+ *   · §9.6.1 DELETE 集合：不支持 Depth:infinity 递归删除，返回 405
+ * 宣告 3 会是**不实声明**，严格的客户端/合规检查会因此判定服务端有问题。
+ * 宣告 2 是准确的：Class 1 + 完整锁支持（timeout / lock-token / If 刷新）。
  */
-const DAV_HEADER = '1, 2, 3';
+const DAV_HEADER = '1, 2';
 
 export async function handleDav(
   request: Request,
@@ -131,12 +150,16 @@ function lockConflictResponse(lock: { token: string; resource: string; owner: st
     },
     davPath,
   );
+  // lockDiscoveryXml 本身已经产出 <D:lockdiscovery>…</D:lockdiscovery>，
+  // 这里绝不能再包一层（曾把 <D:lockdiscovery> 嵌进 <D:lockdiscovery>，
+  // 配合 locktoken 的标签不配对，整个响应不是合法 XML）。
   return new Response(
     `<?xml version="1.0" encoding="utf-8"?>\n` +
       `<D:response xmlns:D="DAV:"><D:href>${escapeXml(davPath)}</D:href>` +
       `<D:propstat><D:prop><D:lock /></D:prop>` +
       `<D:status>HTTP/1.1 423 Locked</D:status></D:propstat>` +
-      `<D:lockdiscovery>${xml}</D:lockdiscovery></D:response>`,
+      xml +
+      `</D:response>`,
     {
       status: 423,
       headers: {
@@ -180,11 +203,16 @@ async function handleLock(request: Request, env: Env, davPath: string): Promise<
     });
 
     const lockXml = lockDiscoveryXml({ ...lock, createdAt: lock.createdAt, expiresAt: lock.expiresAt }, davPath);
-    // RFC 4918 §9.10.4：LOCK 成功响应体是 <D:prop> 里的 <D:lockdiscovery>，
-    // 不是裸的 <D:lockdiscovery>。裸的会让客户端解析失败。
-    const status = 200;
-    return new Response(lockXml, {
-      status,
+    // RFC 4918 §9.10.1 原文：
+    //   "MUST contain a body with the value of the DAV:lockdiscovery property
+    //    in a prop XML element."
+    // 所以必须包在 <D:prop> 里；裸的 <D:lockdiscovery> 是不合规的
+    //（早期代码的注释声称这么做了，但实际没有 —— 注释与实现不符）。
+    const body =
+      `<?xml version="1.0" encoding="utf-8"?>\n` +
+      `<D:prop xmlns:D="DAV:">${lockXml}</D:prop>`;
+    return new Response(body, {
+      status: 200,
       headers: {
         'content-type': 'application/xml; charset=utf-8',
         'lock-token': lock.token,
@@ -199,7 +227,9 @@ async function handleLock(request: Request, env: Env, davPath: string): Promise<
           `<D:response xmlns:D="DAV:"><D:href>${escapeXml(davPath)}</D:href>` +
           `<D:propstat><D:prop><D:lock /></D:prop>` +
           `<D:status>HTTP/1.1 423 Locked</D:status></D:propstat>` +
-          (conflictXml ? `<D:lockdiscovery>${conflictXml}</D:lockdiscovery>` : ''),
+          // conflictXml 自带外层 <D:lockdiscovery>，不要再包一层
+          conflictXml +
+          `</D:response>`,
         {
           status: 423,
           headers: { 'content-type': 'application/xml; charset=utf-8' },
@@ -241,26 +271,68 @@ async function handleUnlock(request: Request, env: Env, davPath: string): Promis
 // ── MKCOL / PROPPATCH / MOVE / COPY ───────────────────────────────────
 
 async function handleMkcol(request: Request, env: Env, node: DavNode, davPath: string): Promise<Response> {
-  // RFC 4918 §9.3：MKCOL 创建集合。我们的集合是虚拟视图（D1 派生），
-  // 客户端（尤其 RaiDrive / Cyberduck）挂载时会 MKCOL 根目录测试可用性，
-  // 必须返回 201 Created，否则挂载失败。我们不做真实创建，直接 201（幂等）。
-  // 带 body 的 MKCOL = RFC 5689 Extended MKCOL，也接受（忽略属性）。
-  return new Response(null, { status: 201, headers: { 'content-length': '0' } });
+  // RFC 4918 §9.3："If the Request-URI is already mapped to a resource,
+  // then the MKCOL MUST fail." → §9.3.1 规定用 405 (Method Not Allowed)。
+  //
+  // 集合是 D1 派生的虚拟视图，无法真正创建。对**已映射**的集合返回 405 既是
+  // 规范要求，也是挂载安全的：客户端（Windows / RaiDrive / Cyberduck）挂载时
+  // 会 MKCOL 根目录探测，收到 405 会正确理解为「已存在」并继续挂载。
+  //
+  // 对**未映射**的新路径（客户端想建自定义文件夹），我们无法持久化，
+  // 用 RFC 5689 §3.1 的 403 + valid-resourcetype 前置条件明确告知，
+  // 而不是假装 201 然后让目录不出现。
+  const alreadyMapped =
+    node.kind === 'root' || node.kind === 'nav' || node.kind === 'list';
+  if (alreadyMapped) {
+    return textResponse(
+      405,
+      'Collection already exists (virtual collection, derived from the library index)',
+      { allow: ALLOW },
+    );
+  }
+  const xml =
+    `<?xml version="1.0" encoding="utf-8"?>\n` +
+    `<D:error xmlns:D="DAV:"><D:valid-resourcetype/></D:error>`;
+  return new Response(xml, {
+    status: 403,
+    headers: { 'content-type': 'application/xml; charset=utf-8', allow: ALLOW },
+  });
 }
 
 async function handleProppatch(request: Request, env: Env, node: DavNode, davPath: string): Promise<Response> {
-  // RFC 4918 §9.2：PROPPATCH 修改属性。我们「假装成功」：
-  // 回 207，每个请求的 prop 都标 200 OK（实际忽略），这样客户端不会重试。
-  // 这是兼容层 —— OpenList 对自定义属性也是忽略的。
+  // RFC 4918 §9.2：PROPPATCH 的指令「MUST either all be executed or none executed」。
+  // §9.2.1：对无法修改的属性应返回 403，并 SHOULD 带上
+  //          `cannot-modify-protected-property` 前置条件。
+  //
+  // 早期实现「假装成功」——回 200 OK 却什么都不写。那是**不实声明**：
+  // 客户端以为属性设置成功并缓存了这个事实，之后再也收不到正确的状态。
+  // 现在改成规范要求的 403 + 前置条件：客户端收到的是准确的「这个属性设不了」。
+  //
+  // 仍然回 207（而不是整体 403）是因为多状态里可以逐属性表达结果，
+  // 这是 RFC 期望的形状，客户端也最容易正确处理。
   const body = await request.text().catch(() => '');
+  // 抓 `<D:xxx>` 的属性名 —— 要同时覆盖自闭合（`<D:getetag/>`）与带内容的
+  // （`<D:displayname>值</D:displayname>`）两种写法，否则会解析出 0 个属性，
+  // 只能回一个无名的 <D:unknown/>，客户端看不出到底哪个属性被拒了。
   const propNames = [
-    ...body.matchAll(/<(?:[A-Za-z0-9_.-]+:)?([A-Za-z][A-Za-z0-9_.-]*)(?:\s[^>]*)?\/>/g),
-  ].map((m) => m[1]!);
-  const propXml = propNames.map((p) => `<D:prop><D:${p}/></D:prop>`).join('');
+    ...body.matchAll(/<(?:[A-Za-z0-9_.-]+:)?([A-Za-z][A-Za-z0-9_.-]*)(?:\s[^>]*)?(?:\/>|>[^<]*<\/)/g),
+  ].map((m) => m[1]!)
+    .filter((n) =>
+      !['propertyupdate', 'set', 'remove', 'prop', 'mkcol', 'lockinfo', 'create'].includes(n),
+    );
+
+  // 一个属性都没解析出来：无法逐个表态，直接按整体拒绝（仍是 207 + 403）
+  const names = propNames.length > 0 ? propNames : ['unknown'];
+  const propXml = names.map((p) => `<D:${p}/>`).join('');
   const xml =
     `<?xml version="1.0" encoding="utf-8"?>\n` +
     `<D:multistatus xmlns:D="DAV:"><D:response><D:href>${escapeXml(davPath)}</D:href>` +
-    `<D:propstat>${propXml ? `<D:prop>${propXml}</D:prop>` : ''}<D:status>HTTP/1.1 200 OK</D:status></D:propstat>` +
+    `<D:propstat>` +
+    `<D:prop>${propXml}</D:prop>` +
+    `<D:status>HTTP/1.1 403 Forbidden</D:status>` +
+    // §9.2.1 前置条件
+    `<D:error><D:cannot-modify-protected-property/></D:error>` +
+    `</D:propstat>` +
     `</D:response></D:multistatus>`;
   return new Response(xml, {
     status: 207,
@@ -654,25 +726,60 @@ async function handlePut(request: Request, env: Env, node: DavNode, davPath: str
 }
 
 async function handleDelete(env: Env, node: DavNode, davPath: string): Promise<Response> {
-  if (node.kind !== 'leaf') {
-    return textResponse(405, 'DELETE is only allowed on file paths', { allow: ALLOW });
+  // 叶子：删单本
+  if (node.kind === 'leaf') {
+    const book = await findBookByLeaf(env.DB, node.leafName);
+    if (!book) return textResponse(404, 'Not Found');
+
+    await env.BUCKET.delete(book.r2_key);
+    if (book.cover_key) await env.BUCKET.delete(book.cover_key);
+    await deleteBook(env.DB, book.id);
+    await rebuildBuckets(env.DB);
+
+    // 同上：不失效的话，已删除的文件在 TTL 内仍会返回 207
+    await purgeEntries(
+      bookCacheTargets({
+        leafName: book.leaf_name,
+        titleLetter: book.title_letter,
+        authorLetter: book.author_letter,
+        formatBucket: book.format_bucket,
+      }),
+    );
+
+    return new Response(null, { status: 204 });
   }
-  const book = await findBookByLeaf(env.DB, node.leafName);
-  if (!book) return textResponse(404, 'Not Found');
 
-  await env.BUCKET.delete(book.r2_key);
-  await deleteBook(env.DB, book.id);
-  await rebuildBuckets(env.DB);
+  // 集合：RFC 4918 §9.6.1 —— 集合上的 DELETE 等价于 Depth: infinity，
+  // 会连同所有成员一起删除。调用方已在分发层用 hasWriteToken 拦住（破坏性操作）。
+  //
+  // 根目录（/）刻意**不**支持删除：那等于「把整个书库删干净」，
+  // 一个手滑或客户端 bug 就会造成不可逆的全量丢失。批量清理请走管理后台
+  // /admin（有独立的确认流程），或删具体的桶。
+  if (node.kind === 'root') {
+    return textResponse(
+      405,
+      'DELETE on the mount root is not supported (it would delete the whole library). '
+      + 'Use the admin console or delete individual buckets.',
+      { allow: ALLOW },
+    );
+  }
 
-  // 同上：不失效的话，已删除的文件在 TTL 内仍会返回 207
-  await purgeEntries(
-    bookCacheTargets({
-      leafName: book.leaf_name,
-      titleLetter: book.title_letter,
-      authorLetter: book.author_letter,
-      formatBucket: book.format_bucket,
-    }),
-  );
+  if (node.kind === 'nav' || node.kind === 'list') {
+    const bucket = node.kind === 'list' ? node.bucket : '';
+    const collection = node.collection;
+    const removed = await deleteBooksInBucket(env.DB, collection, bucket);
+    for (const b of removed) {
+      await env.BUCKET.delete(b.r2_key);
+      if (b.cover_key) await env.BUCKET.delete(b.cover_key);
+    }
+    await rebuildBuckets(env.DB);
+    // 集合内容变了，根导航与该集合的导航都要失效
+    await purgeEntries([
+      ['/', 1],
+      [`/${collectionSegment(collection)}/`, 1],
+    ]);
+    return new Response(null, { status: 204 });
+  }
 
-  return new Response(null, { status: 204 });
+  return textResponse(405, 'DELETE is not supported on this resource', { allow: ALLOW });
 }

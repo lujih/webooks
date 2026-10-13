@@ -41,14 +41,36 @@ function isoPlusSeconds(baseIso: string, seconds: number): string {
   return new Date(Date.parse(baseIso) + seconds * 1000).toISOString();
 }
 
-/** 解析 `Timeout: Second-N=300` / `Infinite` / 缺省 */
+/**
+ * 解析 `Timeout` 请求头。
+ *
+ * RFC 4918 §10.7 的 BNF：
+ *   TimeType = ("Second-" DAVTimeOutVal | "Infinite")
+ *   DAVTimeOutVal = 1*DIGIT
+ * 也就是说真实写法是 **`Second-300`**，不是 `Second-N=300`。
+ *
+ * 历史事故：这里曾经写 `/Second-N=(\d+)/`（把 BNF 里的 `N` 当成了字面量），
+ * 于是**任何客户端指定的超时都被静默忽略**，一律退回 300 秒默认值。
+ * 客户端要 `Second-604800`（一周）也只拿到 300 秒 —— 大文件同步到一半锁就过期。
+ *
+ * 同时兼容逗号分隔的候选列表（`Infinite, Second-4100000000`），按 RFC 取第一个
+ * 服务端能接受的。
+ */
 export function parseTimeoutHeader(value: string | null): number {
-  if (!value || value === 'Infinite' || value === 'infinity') return INFINITE_LOCK_SECONDS;
-  const m = value.match(/Second-N=(\d+)/i);
-  if (!m) return DEFAULT_LOCK_SECONDS;
-  const n = Number(m[1]);
-  if (!Number.isFinite(n) || n < 0) return DEFAULT_LOCK_SECONDS;
-  return Math.min(n, MAX_LOCK_SECONDS);
+  if (!value) return DEFAULT_LOCK_SECONDS;
+  // 可能是逗号分隔的候选列表，逐个尝试
+  for (const raw of value.split(',')) {
+    const part = raw.trim();
+    if (!part) continue;
+    if (/^infinite$/i.test(part)) return INFINITE_LOCK_SECONDS;
+    const m = part.match(/^Second-(\d+)$/i);
+    if (m) {
+      const n = Number(m[1]);
+      if (!Number.isFinite(n) || n <= 0) continue;
+      return Math.min(n, MAX_LOCK_SECONDS);
+    }
+  }
+  return DEFAULT_LOCK_SECONDS;
 }
 
 /** 生成一个 urn:uuid 格式的锁 token */
@@ -267,7 +289,26 @@ export async function liveLockForResource(
   };
 }
 
-/** 把锁渲染成 DAV 头里要的 lockdiscovery XML 片段 */
+/**
+ * 把锁渲染成 RFC 4918 §14.12 的 lockdiscovery XML 片段。
+ *
+ * 历史事故（必须记住）：
+ *   1. 这里曾经写成 `<D:locktoken><D:locktoken><D:href>…` —— 标签开了两次只关一次，
+ *      产出的**不是合法 XML**。.NET 的原话：
+ *      "The 'D:locktoken' start tag does not match the end tag of 'D:lock'"。
+ *      所有严格客户端在 LOCK 时都会解析失败。
+ *   2. 而当时的测试只做 `expect(xml).toContain(...)` 字符串匹配，一路绿灯。
+ *   现在由 test/xml-wellformed.test.ts 用严格检查器兜底。
+ *
+ * 关于 token 要不要转义（这里很容易改错，两个方向都试过）：
+ *   锁令牌是 `<urn:uuid:…>`，**本身含尖括号**。
+ *   · 不转义 → 正文里出现 `<D:href><urn:uuid:…></D:href>`，
+ *     XML 解析器会把 `<urn:uuid:…>` 当成标签 → 依然不是合法 XML（实测过）。
+ *   · 转义 → 解析器读出来的文本值恰好就是 `<urn:uuid:…>`，
+ *     正是 §14.14 要求的「单个锁令牌 URI」。
+ *   所以**必须转义**：转义是 XML 文本层的表示问题，与「值是什么」无关。
+ *   客户端解析后拿到的仍是裸 URI，与 Lock-Token 响应头里的一致。
+ */
 export function lockDiscoveryXml(lock: LockRow, requestHref: string): string {
   const ownerXml = lock.owner ? `<D:owner>${escapeOwner(lock.owner)}</D:owner>` : '';
   const scope = lock.type === 'shared' ? 'shared' : 'exclusive';
@@ -278,8 +319,11 @@ export function lockDiscoveryXml(lock: LockRow, requestHref: string): string {
     `<D:lockscope><D:${scope}/></D:lockscope>` +
     `<D:locktype><D:${lockType}/></D:locktype>` +
     `<D:depth>${depth}</D:depth>` +
+    // token 含 <>，必须做 XML 转义，否则不是良构 XML
+    `<D:locktoken><D:href>${escapeOwner(lock.token)}</D:href></D:locktoken>` +
+    // §14.12：lockroot 给出被锁资源 URL（SHOULD）
+    `<D:lockroot><D:href>${escapeOwner(requestHref)}</D:href></D:lockroot>` +
     `<D:timeout>Second-${lock.timeoutSec}</D:timeout>` +
-    `<D:locktoken><D:locktoken><D:href>${escapeOwner(lock.token)}</D:href></D:locktoken>` +
     ownerXml +
     `</D:lock></D:lockdiscovery>`
   );

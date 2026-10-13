@@ -1,7 +1,11 @@
 # RFC 4918 / RFC 9110 合规基线
 
-本文档记录 webooks 当前的 WebDAV 合规基线。运行 [rfc-probe.mjs](../scripts/rfc-probe.mjs) 和
-[dav-probe.mjs](../scripts/dav-probe.mjs) 可随时复验。
+本文档记录 webooks 当前的 WebDAV 合规基线。**每一行都可以用
+[scripts/rfc-probe.mjs](../scripts/rfc-probe.mjs)、[scripts/webdav-litmus.mjs](../scripts/webdav-litmus.mjs)
+和 `test/xml-wellformed.test.ts` 复验。**
+
+> ⚠️ 本文档曾经与代码脱节（写着 `DAV: 1, 3`、PROPPATCH → 403、LOCK → 501，
+> 而代码早已是 `1, 2, 3` 并实现了锁）。审查时已按代码与 RFC 原文逐条重写。
 
 ## 合规标准澄清
 
@@ -14,59 +18,81 @@
 
 webdav.org 的规格清单里被标记为 *obsoleted* 的只有 **RFC 2518**，不是 4918。
 
-## 已实现合规项
+## 合规等级：Class 2（宣告 `DAV: 1, 2`）
 
-| RFC 条款 | 行为 | 状态 |
+**不宣告 3**，这是刻意的。RFC 4918 §18.3 原文：
+
+> Advertising class 3 support in addition to class 1 and 2 means that the server
+> supports all the requirements in this specification.
+
+即宣告 `3` 等于声称「满足本规范全部要求」。本服务有三处有意保留的偏离（见下表），
+宣告 3 会是**不实声明**。宣告 `1, 2` 是准确的：Class 1 + 完整锁支持。
+
+## 已实现（逐条对照 RFC 原文）
+
+| RFC 条款 | 规范要求 | 本服务行为 | 状态 |
+|---|---|---|---|
+| §18.2 | Class 2 = Class 1 + LOCK/UNLOCK | `DAV: 1, 2`，含完整锁（timeout / lock-token / If 刷新） | ✅ |
+| §9.10.1 | LOCK 响应体必须是 `prop` 元素里的 `lockdiscovery` | `<D:prop><D:lockdiscovery>…` | ✅ |
+| §8.2 | 所有 XML「MUST be, at minimum, well formed」 | 全部响应体经严格良构校验（`test/xml-wellformed.test.ts`） | ✅ |
+| §10.7 | `TimeType = ("Second-" DAVTimeOutVal \| "Infinite")` | 解析 `Second-600` 等真实写法 | ✅ |
+| §14.12 | lockdiscovery 结构（含 `lockroot`） | `lockscope/locktype/depth/locktoken/lockroot/timeout/owner` | ✅ |
+| §14.14 | href 内是锁令牌 URI | 转义后写入，解析还原即裸 URI，与 `Lock-Token` 头一致 | ✅ |
+| §6.5 / §10.5 | `Lock-Token: "<" absolute-URI ">"` | 带尖括号形式 | ✅ |
+| §9.10.2 | 无 body + `If:` 头 = 刷新锁 | 支持，且刷新时不回 `Lock-Token` 头 | ✅ |
+| §9.10.6 | 已有不兼容锁 → 423（不是 412） | 423 + `no-conflicting-lock` | ✅ |
+| §11.3 | 对已锁资源写入 → 423 Locked | 423 | ✅ |
+| §9.1 | PROPFIND 不存在的资源 → 404 | 404 | ✅ |
+| §9.1 | Depth: infinity **MAY** 被禁用；拒绝时 SHOULD 用 403 + `propfind-finite-depth` | 降级为 Depth: 1 | ⚠️ 见偏离表 |
+| §9.2 / §9.2.1 | 指令「MUST either all be executed or none」；受保护属性用 403 + `cannot-modify-protected-property` | 207 + 403 + 前置条件 | ✅ |
+| §9.3 | URI 已映射时 MKCOL「MUST fail」 | 已映射 → 405；未映射 → 403 + `valid-resourcetype` | ✅ |
+| §9.6.1 | 集合 DELETE「MUST act as if Depth: infinity」 | 递归删除该桶全部书；**根目录例外**（见偏离表） | ✅ |
+| §9.7.2 | PUT 到集合「MAY be treated as an error (405)」 | 405 + Allow | ✅ |
+| §9.4 | GET 集合「may return … a human-readable view」 | 返回 HTML 目录页 | ✅ |
+| §15.6 | entity-tag 是 ASCII token | 原样输出不转义，客户端 If-Match 能对上 | ✅ |
+| §15.7 | `getlastmodified` 用 rfc1123-date | 手写 RFC 1123 格式化 | ✅ |
+| §15.1 | `creationdate` 用 RFC 3339 date-time | `toISOString()` | ✅ |
+| §16 | 预置错误元素 | `supported-lock`、`cannot-modify-protected-property`、`valid-resourcetype` | ✅ |
+| RFC 9110 §13.1 | If-Match / If-None-Match 完整语义 | 弱比较、多值、通配 `*`；**在写入前判定** | ✅ |
+| RFC 9110 §13.1.2 | `If-None-Match: *` 且资源已存在 → 412 | 412 | ✅ |
+| RFC 9110 §9.3.7 | OPTIONS `*` 服务器级查询 | 支持 | ✅ |
+| RFC 9110 §14.2 | Range 头是建议性的（"only provides advice"） | GET 返回 302 交由 CDN 处理 | ✅ |
+| RFC 9110 §8.6 | 204 不带非零 Content-Length | 遵守 | ✅ |
+| RFC 5789 | PATCH 未实现 → 405 | 405 | ✅ |
+| RFC 5689 §3.1 | 非法 resourcetype → 403 + `valid-resourcetype` | MKCOL 未映射路径时使用 | ✅ |
+
+## 有意保留的偏离（不是 bug，是设计取舍）
+
+| 项 | 现状 | 理由 |
 |---|---|---|
-| RFC 4918 §18 | `DAV: 1, 3`（Class 1 + 完全符合 RFC 4918，不宣告 2） | ✅ |
-| RFC 4918 §9.1 | PROPFIND 不存在的资源 → 404 | ✅ |
-| RFC 4918 §9.1 | Depth: infinity → 207（降级为 1） | ✅ |
-| RFC 4918 §9.6.1/10.4 | 条件 PUT：If-Match / If-None-Match / If-Unmodified-Since | ✅ |
-| RFC 4918 §9.7.1 | PUT 打到集合路径 → 405 + Allow | ✅ |
-| RFC 4918 §14 | PROPPATCH → 403 + `<D:error><D:cannot-modify-protected-property/>` | ✅ |
-| RFC 4918 §16 | 预置错误元素（supported-lock、cannot-modify-protected-property） | ✅ |
-| RFC 4918 §10.2 | LOCK 未支持 → 501 + `<D:supported-lock/>` | ✅ |
-| RFC 9110 §9.3.7 | OPTIONS * 服务器级能力查询 | ✅ |
-| RFC 9110 §13.1 | If-Match / If-None-Match 完整语义（含弱比较、多值、通配 *） | ✅ |
-| RFC 9110 §14 | Range 请求 → 206 Partial Content（R2 处理） | ✅ |
-| RFC 9110 §8.6 | 204 响应不携带 Content-Length | ✅ |
-| RFC 5789 | PATCH 未实现 → 405 | ✅ |
+| **Depth: infinity** | 降级为 Depth: 1，而不是 403 + `propfind-finite-depth` | 大目录上 `infinity` 会炸 CPU。§9.1 用的是 SHOULD 级建议；§9.1 的 MAY 允许禁用。可通过 `DEPTH_INFINITY=deny` 切换为显式 403 |
+| **Depth 头缺失** | 按 1 处理 | §9.1 说 SHOULD 按 `infinity`；同样出于 CPU 保护按 1 处理 |
+| **DELETE 根目录** | 405（不支持） | 根 = 整个书库。实现 §9.6.1 会让一次误操作 / 客户端 bug 造成不可逆的全量丢失。批量清理走管理后台 `/admin` |
+| **MKCOL 无法真正建目录** | 403 + `valid-resourcetype` | 集合由 D1 派生，无法持久化自定义目录。如实告知优于假装成功 |
+| **PROPPATCH 不持久化** | 207 + 403 + `cannot-modify-protected-property` | 属性是派生视图。早前「假装 200 成功」是不实声明，已改为规范要求的前置条件 |
+| **未支持** | DeltaV(3253) / ACL(3744) / SEARCH(5323) / BIND(5842) | 公共书库无鉴权、无版本控制；用 PROPFIND 列举替代 SEARCH |
 
-## 未实现（刻意取舍）
+## 自测基线
 
-| RFC | 说明 |
-|---|---|
-| RFC 4918 Class 2（LOCK/UNLOCK） | 本服务是**只读浏览 + 匿名上传**的公共书库。锁对「多人同时编辑同一本书」才有意义，我们不支持同时编辑，故不宣告 2。客户端会自动退回无锁模式（见 RFC 4918 §10.1.1）。 |
-| RFC 3253 DeltaV | 版本控制。公共书库不需要。 |
-| RFC 3744 ACL | 访问控制列表。本服务无鉴权（所有人可读、所有人可传）。 |
-| RFC 5323 SEARCH | 搜索扩展。我们用 OPDS + PROPFIND 列举替代。 |
-| RFC 5689 Extended MKCOL | 集合是虚拟视图（由 D1 派生），不可创建。MKCOL → 405。 |
-| RFC 5842 BIND/UNBIND | 挂载。不需要。 |
+```bash
+# 协议语义（14 项）
+node scripts/rfc-probe.mjs --url https://<host>/dav/ --token "$WRITE_TOKEN"
 
-## litmus 基线
+# 完整挂载握手（16 步）
+node scripts/webdav-litmus.mjs --url https://<host>/dav/ --token "$WRITE_TOKEN"
 
-[Dave Marshall 的 litmus 测试套件](https://github.com/dave-marshall/litmus) 是 WebDAV 合规的
-事实标准。本仓库通过 [dav-probe.mjs](../scripts/dav-probe.mjs) 自测：
-
+# XML 良构性（含线上曾经出过的真实坏样本）
+npx vitest run test/xml-wellformed.test.ts
 ```
-31 通过 / 0 警告 / 0 失败
-```
+
+当前实测：`rfc-probe` 14/14、`webdav-litmus` 16/16、XML 良构全部通过。
+
+> 💡 **为什么必须有 XML 良构性测试**：LOCK 响应曾输出
+> `<D:locktoken><D:locktoken><D:href>…` —— 标签开了两次只关一次。
+> .NET 的 `XmlDocument` 报 *"The 'D:locktoken' start tag does not match the end tag of 'D:lock'"*，
+> 所有严格客户端都会挂。而当时的测试只做 `expect(xml).toContain(...)` 字符串匹配，
+> 字符串里确实含有那个片段，一路绿灯。
+> **教训：验证 XML 必须用解析器，不能用字符串包含。**
 
 要跑完整 litmus 套件（需要 Python + apache + workerd 镜像），参考
 [dav-probe.mjs](../scripts/dav-probe.mjs) 的 `--url` 参数指向 litmus 服务。
-
-已知差异：litmus 的 `class1` 套件含 200+ 用例，部分用例（如 LOCK 超时、
-`refresh-lock` 行为）要求 Class 2，本服务刻意不实现，会被判失败但属预期。
-
-## 如何验证
-
-```bash
-# 合规基线（线上）
-node scripts/rfc-probe.mjs --url https://webooks.cszxorx.dpdns.org/dav/
-
-# 全功能回归（线上）
-node scripts/dav-probe.mjs --url https://webooks.cszxorx.dpdns.org/dav/
-
-# 本地开发
-npm run check
-```
