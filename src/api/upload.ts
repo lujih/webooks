@@ -21,8 +21,9 @@ import { ALLOWED_UPLOAD_FORMATS, isAllowedUploadExt, authorBucket, letterBucket,
 import { safeEqual } from '../lib/auth';
 import { deriveMetadata, guessAuthorFromText, safeContentTypeFor, sanitiseLeafName } from '../lib/metadata';
 import { sniffKindFromBucket } from '../lib/kind-sniff';
-import { rebuildBuckets, upsertBook } from '../lib/db';
+import { adjustBuckets, bucketDeltas, bucketIdentityOf, upsertBook } from '../lib/db';
 import { shortId } from '../lib/http';
+import { clientIpFromRequest, guardWrite } from '../lib/throttle';
 import { createPresignedPutUrl } from '../lib/sigv4';
 import { parseEpub, coverExtFor, PARSE_SIZE_CAP } from '../lib/epub';
 import { jsonResponse, textResponse } from '../lib/http';
@@ -38,7 +39,25 @@ const SITEVERIFY = 'https://challenges.cloudflare.com/turnstile/v0/siteverify';
  */
 const ALLOWED_EXT = new Set(ALLOWED_UPLOAD_FORMATS);
 
+/**
+ * 网页上传通道的默认体积上限。
+ *
+ * 与 WebDAV 的 100 MiB **故意不同**：这条通道用预签名 PUT 直传 R2，
+ * 字节不经过 Worker，因此不受 Cloudflare 的「请求体 ≤ 100MB」限制
+ * （那个限制只作用于 Worker 的入站请求）。所以这里可以放 200 MiB。
+ *
+ * 换句话说：想要大文件就走路面上传，走 WebDAV 传不进来。
+ */
 const DEFAULT_MAX_BYTES = 200 * 1024 * 1024; // 200 MiB
+
+/**
+ * 上传链路的每日写次数上限（每 IP）。
+ *
+ * 与 WebDAV 侧的 DAILY_WRITE_QUOTA 走同一个 env 变量 —— guardWrite 会优先读它。
+ * 默认 300：与 WebDAV 的默认值一致，够正常用户用（含批量导入整套书），
+ * 又让「拿到一张通行证后循环灌 10 分钟」这件事不划算。
+ */
+const DEFAULT_WRITE_QUOTA = 300;
 
 interface InitBody {
   filename: string;
@@ -73,7 +92,12 @@ async function verifyTurnstile(env: Env, token: string, remoteIp: string): Promi
 }
 
 function clientIp(request: Request): string {
-  return request.headers.get('CF-Connecting-IP') ?? request.headers.get('X-Forwarded-For') ?? '';
+  // ⚠️ 只信任 CF-Connecting-IP（Cloudflare 边缘强制设置）。
+  //   原实现在这里回落到 X-Forwarded-For —— 那是个**完全由客户端提供**的头，
+  //   一旦回退生效，批量通行证的 IP 绑定就形同虚设（拿签发时的 IP 填进
+  //   XFF 即可在任意机器上复用）。
+  //   详细取舍见 lib/throttle.ts 的 clientIpFromRequest。
+  return clientIpFromRequest(request);
 }
 
 function todayKey(): string {
@@ -222,6 +246,14 @@ export async function handleUploadInit(request: Request, env: Env): Promise<Resp
     return jsonResponse({ error: 'turnstile-token-required' }, 400);
   }
 
+  // ── 写节流：此前这条链路一次都没走过 allowWrite ────────────────
+  // README、security-audit.md 与本文件上方的注释都声称「匿名上传有
+  // 每日写入次数节流兜底」，但 allowWrite 的唯一调用点在 handlePut 里。
+  // 后果：拿到一张通行证后可以在 10 分钟内无限循环 init，冲击 R2 10GB
+  // 与 D1 10 万行/天额度 —— 这两条都是**硬停**，打满就是全站停摆到次日。
+  const blocked = await guardWrite(env, request, DEFAULT_WRITE_QUOTA);
+  if (blocked) return blocked;
+
   // 生成对象键：上传暂存到 uploads/ 前缀（Phase 1 可加隔离区）。
   // 注意：这里传**未编码**的键，createPresignedPutUrl 内部会逐段做 URL 编码
   // （SigV4 要求 canonical URI 用编码形式，且避免 # 截断签名）。
@@ -278,6 +310,13 @@ export async function handleUploadComplete(request: Request, env: Env): Promise<
     return textResponse(405, 'Method Not Allowed', { allow: 'POST' });
   }
 
+  // ── 写节流 ──────────────────────────────────────────────────────
+  // complete 是最重的端点之一（2 次 R2 读 + 1 次写 + D1 写 + rebuildBuckets），
+  // 却曾经完全开放给任何人反复调用。init 的节流挡不住它 ——
+  // 攻击者可以在 init 之后、complete 之前任意次地重放。
+  const blocked = await guardWrite(env, request, DEFAULT_WRITE_QUOTA);
+  if (blocked) return blocked;
+
   let body: CompleteBody;
   try {
     body = (await request.json()) as CompleteBody;
@@ -310,6 +349,25 @@ export async function handleUploadComplete(request: Request, env: Env): Promise<
   const safeName =
     sanitiseLeafName((filename || key.split('/').pop() || 'book').replace(/[\/\\]/g, '_')) ??
     `book-${shortId(6)}`;
+
+  // ── 白名单校验（此前 complete 完全没做，只有 init 有）────────────
+  // 漏洞路径：init 时传 `a.epub`（过白名单、签 application/epub+zip），
+  // complete 时传 `filename: "a.exe"` —— 白名单被完全绕过。
+  //
+  // 危害有界但真实：R2 的 Content-Type 由 safeContentTypeFor 推导，
+  // 所以**存不出 text/html**（这点是安全的）；但 D1 的 leaf_name / format /
+  // title 可以被写成任意值，format 还会进 format_bucket 影响分桶展示，
+  // 留下一批「按格式/other」里的幽灵条目。
+  const completeExt = safeName.split('.').pop()?.toLowerCase() ?? '';
+  if (!isAllowedUploadExt(completeExt)) {
+    // 把暂存对象删掉：不能让它一直躺在 uploads/ 里
+    await env.BUCKET.delete(key);
+    return jsonResponse(
+      { error: 'unsupported-format', ext: completeExt, allowed: [...ALLOWED_EXT] },
+      415,
+    );
+  }
+
   const meta = deriveMetadata(safeName);
   const format = normaliseFormat(safeName.split('.').pop());
   // 安全关键：落 R2 的 Content-Type 只按扩展名推导，绝不用 uploads/ 里的元数据
@@ -408,11 +466,27 @@ export async function handleUploadComplete(request: Request, env: Env): Promise<
     authorLetter: authorBucket(author),
     formatBucket: format,
     // 内容嗅探优先于扩展名；判不出才交给 upsertBookStatement 按扩展名派生
-    ...(sniffedKind ? { kindBucket: sniffedKind } : {}),
+    // 来源标记为 'sniffed'：内容嗅探得出来的值，比「按扩展名猜」更权威，
+    // 但仍可被重新嗅探覆盖（只有管理员手工改的才是 'manual'，见迁移 0006）。
+    ...(sniffedKind ? { kindBucket: sniffedKind, kindSource: 'sniffed' as const } : {}),
     publishedAt: new Date().toISOString(),
     coverKey,
   });
-  await rebuildBuckets(env.DB);
+  // 增量更新分桶计数（不是全量重算）—— 理由见 lib/db.ts 的 adjustBuckets 注释。
+  // 网页上传同样是匿名入口（一次 Turnstile 换 10 分钟通行证），
+  // 批量导入时写操作很密集，全表聚合会迅速吃掉 D1 的行读额度。
+  // 上传的一定是**新书**（complete 走的是 books/<新id>），所以 before = null。
+  await adjustBuckets(
+    env.DB,
+    bucketDeltas(
+      null,
+      bucketIdentityOf({
+        titleLetter: letterBucket(title),
+        authorLetter: authorBucket(author),
+        formatBucket: format,
+      }),
+    ),
+  );
 
   return jsonResponse({
     ok: true,
