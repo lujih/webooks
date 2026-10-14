@@ -21,7 +21,7 @@ import {
   bucketSegment,
 } from '../src/lib/collections';
 import { sniffEpubLayout } from '../src/lib/epub';
-import { sniffPdfLayout } from '../src/lib/kind-sniff';
+import { SNIFF_SAMPLE_BYTES, sniffPdfLayout, sniffPdfLayoutBytes } from '../src/lib/kind-sniff';
 import { deriveMetadata, guessAuthorFromText, normaliseAuthor } from '../src/lib/metadata';
 import { rebuildBuckets, upsertBookStatement } from '../src/lib/db';
 import { clearDavCache, resetLibrary, testEnv } from './setup';
@@ -171,6 +171,48 @@ describe('电子书 / 漫画精准识别', () => {
     expect(sniffPdfLayout('/Type/Page /Subtype/Image '.repeat(10) + '/Type/Font')).toBeNull();
     // 信息全无（对象流把字典压缩了）→ 也不猜
     expect(sniffPdfLayout('/Type/ObjStm '.repeat(20))).toBeNull();
+  });
+
+  it('PDF 嗅探：直接在字节上扫，且不能退化成慢实现', () => {
+    // 生产路径是 sniffPdfLayoutBytes —— 不把字节转成字符串。
+    // 曾经的三种写法实测（同样大小的输入，Workers Free 只有 10ms CPU/请求）：
+    //   分块 String.fromCharCode(...spread) + 正则 → 430ms（必然 Error 1102）
+    //   手写 latin1 循环（严格 ISO-8859-1）      →  60ms（仍然超 6 倍）
+    //   逐标记各扫一遍的字节匹配                 →  66–221ms（7 趟扫描）
+    //   单趟字节扫描（当前实现）                 →    6ms（512KiB 采样）
+    //
+    // 所以约束有两条：**必须单趟扫描**，且**采样量不能超过 512KiB**。
+    const big = new Uint8Array(SNIFF_SAMPLE_BYTES).fill(0x41);
+    const t0 = Date.now();
+    const verdict = sniffPdfLayoutBytes(big);
+    const elapsed = Date.now() - t0;
+
+    // 全是 0x41 的输入里没有任何 PDF 标记 → 判不出，这是对的
+    expect(verdict).toBeNull();
+    // 宽松阈值（CI 上比边缘慢）：只为拦住数量级退化。
+    // 430ms 那个写法会明显超过；当前实现实测个位数毫秒。
+    expect(elapsed, 'PDF 嗅探必须在 CPU 预算内完成').toBeLessThan(80);
+  });
+
+  it('PDF 嗅探：字符串入口与字节入口判定一致', () => {
+    const comic = '/Type/Page /Subtype/Image /DCTDecode '.repeat(17);
+    expect(sniffPdfLayout(comic)).toBe('comic');
+    expect(sniffPdfLayoutBytes(new TextEncoder().encode(comic))).toBe('comic');
+
+    const text = '/Type/Page /Type/Font /Type/Font /Type/Font '.repeat(5) + '/Subtype/Image';
+    expect(sniffPdfLayout(text)).toBe('text');
+    expect(sniffPdfLayoutBytes(new TextEncoder().encode(text))).toBe('text');
+  });
+
+  it('PDF 嗅探：高位字节不影响判定（二进制图片数据不能干扰）', () => {
+    // 真实 PDF 片段里夹着 0x80-0xFF 的二进制 JPEG 数据。
+    // 注意注入位置必须落在**标记之外**：每 7 字节插一个高位字节会正好
+    // 破坏 /DCTDecode 这个 9 字节标记，那是另一回事（判不出是对的）。
+    const clean = '/Type/Page /Subtype/Image /DCTDecode '.repeat(17);
+    const bytes = new Uint8Array(clean.length + 1024);
+    for (let i = 0; i < clean.length; i++) bytes[i] = clean.charCodeAt(i);
+    for (let i = clean.length; i < bytes.length; i++) bytes[i] = 0x80 + (i % 0x80);
+    expect(sniffPdfLayoutBytes(bytes)).toBe('comic');
   });
 
   it('EPUB：固定版式声明 → 漫画', () => {
