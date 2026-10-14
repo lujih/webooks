@@ -80,12 +80,30 @@ export const HARD_MAX_ENTRIES = 200;
 export const PAGINATION_MAX = 100;
 
 /**
- * 单文件默认上限 200 MiB。
- * 免费层 R2 只有 10GB，而 WebDAV 是完全匿名开放的 —— 没有上限时
- * 一个脚本就能把配额写满（并触发超额计费）。200MiB 足够放任何正常电子书，
- * 又让滥用成本可控。可用 MAX_UPLOAD_BYTES 覆盖。
+ * Cloudflare 的请求体上限（Free / Pro 套餐，核实于 2026-10-14）。
+ *
+ * 来源：https://developers.cloudflare.com/workers/platform/limits/
+ * 的 "Request body size limits"（原文：「Request body size limits depend
+ * on your Cloudflare account plan, not your Workers plan」，
+ * Free 100 MB / Pro 100 MB / Business 200 MB / Enterprise ≤ 5 GB）。
+ *
+ * ⚠️ Business 及以上可以调高，但那是**账户级**配置，代码无从得知 ——
+ *   所以这里按最低的常见档（Free/Pro）clamp。Business 用户如果真的需要
+ *   更大文件，应走网页上传通道（预签名直传，不经过 Worker）。
  */
-export const DEFAULT_MAX_UPLOAD_BYTES = 200 * 1024 * 1024;
+export const CF_REQUEST_BODY_LIMIT = 100 * 1024 * 1024;
+
+/**
+ * 单文件默认上限 100 MiB。
+ *
+ * 与 CF_REQUEST_BODY_LIMIT 对齐 —— 见该常量的说明与下方「为什么不能
+ * 设成 200 MiB」。
+ *
+ * 免费层 R2 只有 10GB，而 WebDAV 完全匿名开放 —— 没有上限时一个脚本
+ * 就能把配额写满（并触发超额计费）。可用 MAX_UPLOAD_BYTES 覆盖，
+ * 但超过 CF_REQUEST_BODY_LIMIT 的部分不会生效（会被 clamp）。
+ */
+export const DEFAULT_MAX_UPLOAD_BYTES = CF_REQUEST_BODY_LIMIT;
 
 /**
  * 每 IP 每日写操作默认上限。
@@ -115,9 +133,24 @@ export function settings(env: Env): Settings {
     propfindTtl: intFrom(env.PROPFIND_TTL, 300, 0, 86_400),
     depthInfinity: env.DEPTH_INFINITY === 'deny' ? 'deny' : 'downgrade',
     // 0 显式表示「不限制」；未配置走默认上限
+    //
+    // ⚠️ 上限 clamp 到 CF_REQUEST_BODY_LIMIT：Cloudflare 的请求体上限按
+    //   **账户套餐**决定（Free/Pro = 100MB），超限请求在代理层就被回 413，
+    //   **根本到不了 Worker**。所以配一个更大的值不会「放宽限制」，
+    //   只会造出一段永远走不到的死路径，且客户端拿到的是 Cloudflare 的
+    //   裸 413 而不是我们的错误信息。写死在代码里而不是只改文档 ——
+    //   否则改 wrangler.jsonc 的人很容易把它调回去。
+    //
+    //   注：网页上传走预签名直传、字节不过 Worker，不受此限，
+    //   它的上限由 UPLOAD_MAX_BYTES 单独控制（见 api/upload.ts）。
     maxUploadBytes: env.MAX_UPLOAD_BYTES === '0'
       ? 0
-      : intFrom(env.MAX_UPLOAD_BYTES, DEFAULT_MAX_UPLOAD_BYTES, 1, 5 * 1024 * 1024 * 1024),
+      : intFrom(
+        env.MAX_UPLOAD_BYTES,
+        DEFAULT_MAX_UPLOAD_BYTES,
+        1,
+        CF_REQUEST_BODY_LIMIT,
+      ),
     dailyWriteQuota: env.DAILY_WRITE_QUOTA === '0'
       ? 0
       : intFrom(env.DAILY_WRITE_QUOTA, DEFAULT_DAILY_WRITE_QUOTA, 1, 100_000),
