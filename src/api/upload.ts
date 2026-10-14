@@ -21,7 +21,8 @@ import { ALLOWED_UPLOAD_FORMATS, isAllowedUploadExt, authorBucket, letterBucket,
 import { safeEqual } from '../lib/auth';
 import { deriveMetadata, guessAuthorFromText, safeContentTypeFor, sanitiseLeafName } from '../lib/metadata';
 import { sniffKindFromBucket } from '../lib/kind-sniff';
-import { adjustBuckets, bucketDeltas, bucketIdentityOf, upsertBook } from '../lib/db';
+import { adjustBuckets, bucketDeltas, bucketIdentityOf, upsertBook, findBookByLeaf
+ } from '../lib/db';
 import { shortId } from '../lib/http';
 import { clientIpFromRequest, guardWrite } from '../lib/throttle';
 import { sanitiseCredit } from '../lib/requests';
@@ -259,7 +260,7 @@ export async function handleUploadInit(request: Request, env: Env): Promise<Resp
 
   const maxBytes = Number.parseInt(env.UPLOAD_MAX_BYTES ?? '', 10) || DEFAULT_MAX_BYTES;
   if (size > maxBytes) {
-    return jsonResponse({ error: 'file-too-large', maxBytes }, 413);
+    return jsonResponse({ error: 'file-too-large', maxBytes, size }, 413);
   }
 
   // ── 人机验证 ──
@@ -380,7 +381,7 @@ export async function handleUploadComplete(request: Request, env: Env): Promise<
   if (actualSize > maxBytes) {
     // 超标：立刻删除刚传上来的文件
     await env.BUCKET.delete(key);
-    return jsonResponse({ error: 'file-too-large', maxBytes }, 413);
+    return jsonResponse({ error: 'file-too-large', maxBytes, size }, 413);
   }
 
   // 文件名清洗必须与 WebDAV PUT 完全一致（sanitiseLeafName）。
@@ -389,6 +390,38 @@ export async function handleUploadComplete(request: Request, env: Env): Promise<
   const safeName =
     sanitiseLeafName((filename || key.split('/').pop() || 'book').replace(/[\/\\]/g, '_')) ??
     `book-${shortId(6)}`;
+
+  // ── 同名书检测 ──
+  // ⚠️ 之前完全没有这一步，于是网页上传同名文件会**静默覆盖**已有那本。
+  //   对 WebDAV 通道来说这是有意的（带口令才能覆盖），但网页上传是
+  //   匿名的 —— 也就是说只要猜到文件名，谁都能把别人的书顶掉。
+  //
+  //   （WebDAV PUT 那条路径我这次也加了明确提示；这里是同一类问题的
+  //   另一半：不是「提示不清」，而是「根本没检测」。）
+  //
+  //   策略：**默认拒绝并说清**，给出改名建议。
+  //   想要覆盖的用户可以走 WebDAV（带口令），或换个文件名。
+  const clash = await findBookByLeaf(env.DB, safeName);
+  if (clash) {
+    // 把刚传上来的临时文件清掉，别让 R2 里堆垃圾
+    await env.BUCKET.delete(key);
+    return jsonResponse(
+      {
+        error: 'already-exists',
+        message:
+          `《${clash.title || safeName}》已经在书库里了`
+          + `${clash.author ? `（作者：${clash.author}）` : ''}。`
+          + `如果要收录另一本同名书，请改个文件名（加版本号、译者或副标题）。`,
+        existing: {
+          title: clash.title,
+          author: clash.author,
+          size: clash.size,
+          publishedAt: clash.published_at,
+        },
+      },
+      409,
+    );
+  }
 
   // ── 白名单校验（此前 complete 完全没做，只有 init 有）────────────
   // 漏洞路径：init 时传 `a.epub`（过白名单、签 application/epub+zip），

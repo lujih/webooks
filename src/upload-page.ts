@@ -189,6 +189,10 @@ ${themeCss()}
 <script>
 const $ = (id) => document.getElementById(id);
 const creditEl = $('credit');
+// BR = 换行符。用它而不是在字符串里写「反斜杠 + n」，是因为本文件
+// 整体是一个模板字符串：那个组合会在渲染成页面时被解析成真实换行，
+// 把 JS 字符串字面量拦腰截断。TS 完全检查不出来，只有页面脚本会炸。
+const BR = String.fromCharCode(10);
 const ACCEPT = ${JSON.stringify(ALLOWED_UPLOAD_FORMATS)};
 let siteKey = ${JSON.stringify(turnstileSiteKey)};
 // 是否需要人机验证。与服务端同一个判断依据：**有没有配 siteKey**。
@@ -404,16 +408,48 @@ async function putToR2WithRetry(url, blob, contentType, onProgress, maxAttempts)
   }
 }
 
+/**
+ * 把服务端的错误码翻成人话。
+ *
+ * ⚠️ 原则：**说清「发生了什么 + 现在能做什么」**，而不是复述状态码。
+ *   「不支持的文件类型」对用户没用 —— 他不知道该传什么。
+ *   「.rar 不在允许的格式内，本站只接受 EPUB / PDF / …」才有用。
+ */
 function tipFor(code, json){
   const map = {
-    'turnstile-failed': '人机验证失败，正在重新验证',
-    'ticket-invalid': '通行证已过期，正在重新验证',
-    'file-too-large': '文件超过服务器限制',
-    'unsupported-format': '不支持的文件类型',
-    'upload-not-configured': '服务器尚未配置上传功能：缺少 ' + ((json && json.missing) || []).join(', '),
-    'bad-json': '请求格式错误',
+    'turnstile-failed': '人机验证没通过（可能是有扩展程序拦了验证码）。可以刷新页面重试，或直接用 WebDAV 上传。',
+    'ticket-invalid': '通行证过期了，正在重新获取 —— 若反复出现请刷新页面。',
+    'file-too-large': '文件太大' + (
+      json && json.maxBytes
+        ? '：本站单文件上限 ' + fmtSize(json.maxBytes) + '，你的文件 ' + fmtSize(json.size || 0) + '。'
+        : '，超过了本站上限。'
+    ),
+    // ⚠️ 这里用 BR 而不是在字符串里直接写换行符：本文件整体是模板字符串，
+    //   写成「反斜杠 + n」渲染时会变成真实换行，把 JS 字符串拦腰截断 ——
+    //   页面脚本直接语法错误，报错还指向文件末尾，极难定位。
+    //   （pages-syntax.test.ts 抓到的；TypeScript 层面完全看不出来。）
+    'unsupported-format': '文件类型不支持'
+      + (json && json.ext ? '：. ' + json.ext : '')
+      + (json && json.allowed && json.allowed.length
+          ? BR + '本站只接受：' + json.allowed.join('、')
+          : BR + '本站只接受电子书与漫画格式。')
+      + BR + '不确定的话，试试把书转成 EPUB 或 PDF。',
+    'upload-not-configured': '服务器的上传功能还没配置好，缺少：'
+      + ((json && json.missing) || []).join('、')
+      + '。这是站点的问题，不是你的操作有误 —— 请过一会儿再试。',
+    'bad-json': '请求格式错误，请刷新页面重试。',
+    'filename-required': '没读到文件名，请重新选择文件。',
+    'size-required': '没读到文件大小，请重新选择文件。',
+    'bad-key': '上传凭证已失效，请刷新页面重新上传这批文件。',
+    // 刻意用「斜杠」这种文字说法而非写出符号：反斜杠在模板字符串里会被
+    //   解析掉一层，渲染出非法的转义序列，连注释里写都会让 TS 报错。
+    'invalid-filename': '文件名不可用：请去掉路径分隔符（斜杠与反斜杠），也试试不要以空格或点开头结尾。',
+    'already-exists': (json && json.message)
+      || '这本书已经在书库里了。如果要新增另一本同名书，请改个文件名（加版本号或译者）。',
+    'object-not-found': '临时文件已失效（可能超时被清理），请刷新页面重新上传这批文件。',
+    'book-not-found': '找不到对应的书目记录，可能已被移除。请刷新页面重试。',
   };
-  return map[code] || code;
+  return map[code] || ('出错了：' + code);
 }
 
 /** 上传一个队列项。返回 true 表示成功。 */

@@ -605,7 +605,14 @@ describe('上传体积上限与平台对齐', () => {
     });
     const text = await res.text();
     expect(res.status).toBe(413);
-    expect(text).toContain('limit is');
+    // 提示要说明「实际多大 / 上限多大 / 接下来怎么办」，
+    // 而不是干巴巴一句 "limit is 1048576 bytes"。
+    expect(text).toMatch(/文件太大/);
+    expect(text).toMatch(/1\.0 MB|1048576/);
+    // 最关键：说清这个上限**不是本站随便定的**，改大也没用，
+    // 并指向可行的替代通道。
+    expect(text).toContain('100MB');
+    expect(text).toContain('/upload');
     // 客户端要能知道该怎么做
     expect(res.headers.get('allow'), '413 应带回可用的方法').toBeTruthy();
   });

@@ -397,7 +397,16 @@ async function handleMoveCopy(
   // RFC 4918 §9.8/9.9：MOVE 源=目标，DELETE 源；COPY 复制。
   // Destination 头：目标 URL（完整 URL，需剥掉 base 前缀）
   const dest = request.headers.get('destination');
-  if (!dest) return textResponse(400, 'Destination header required', { allow: ALLOW });
+  if (!dest) {
+    return textResponse(
+      400,
+      '缺少 Destination 头。\n\n'
+      + `${request.method} 必须说明「挪到哪里去」，例如：\n\n`
+      + `    Destination: https://${new URL(request.url).host}/dav/最近收录/新名字.epub\n\n`
+      + `注意目标要用**完整 URL**，且要与本站同域。`,
+      { allow: ALLOW },
+    );
+  }
 
   // 源必须是叶子（文件），不能是虚拟目录（我们的目录由 D1 派生，无法搬）
   if (node.kind !== 'leaf') {
@@ -421,7 +430,15 @@ async function handleMoveCopy(
     if (mount && rawPath.startsWith(mount)) rawPath = rawPath.slice(mount.length) || '/';
     targetDavPath = rawPath;
   } catch {
-    return textResponse(400, 'Invalid Destination URL', { allow: ALLOW });
+    return textResponse(
+      400,
+      `Destination 头无法解析：${dest.slice(0, 120)}\n\n`
+      + `必须是一个完整的 http(s) URL。常见错误：\n`
+      + `  · 只给了路径（/dav/最近收录/x.epub）—— 要带域名\n`
+      + `  · 指向了别的站 —— 必须与本站同域\n`
+      + `  · 中文没编码 —— 「最近收录」需要百分号编码`,
+      { allow: ALLOW },
+    );
   }
   const targetNode = resolveNode(targetDavPath);
   if (targetNode.kind !== 'leaf') {
@@ -640,6 +657,15 @@ function davErrorResponse(
   });
 }
 
+/** 把字节数说成人话。错误提示里的「4.2 MB」比「4453057」有用得多。 */
+function formatBytes(n: number): string {
+  if (!Number.isFinite(n) || n < 0) return '未知大小';
+  if (n < 1024) return `${n} B`;
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
+  if (n < 1024 * 1024 * 1024) return `${(n / 1024 / 1024).toFixed(1)} MB`;
+  return `${(n / 1024 / 1024 / 1024).toFixed(2)} GB`;
+}
+
 // ── 读 ──────────────────────────────────────────────────────────────────
 
 async function handleGet(
@@ -714,7 +740,15 @@ async function handlePut(request: Request, env: Env, node: DavNode, davPath: str
   }
 
   const leafName = sanitiseLeafName(node.leafName);
-  if (!leafName) return textResponse(400, 'Invalid file name');
+  if (!leafName) {
+    return textResponse(
+      400,
+      '文件名不可用。\n\n'
+      + '以下字符会被拒绝：路径分隔符（/ \\）、控制字符、以及空文件名。\n'
+      + '另外文件名的首尾不能是空格或点（那是 Windows 的保留写法）。',
+      { allow: ALLOW },
+    );
+  }
 
   // 扩展名白名单：只接受电子书 + 漫画格式。
   // **必须在读 body 之前判定** —— 否则任何文件（exe/脚本/压缩包）都能通过
@@ -730,7 +764,16 @@ async function handlePut(request: Request, env: Env, node: DavNode, davPath: str
     );
   }
 
-  if (!request.body) return textResponse(411, 'Length Required');
+  if (!request.body) {
+    return textResponse(
+      411,
+      '请求没有正文。\n\n'
+      + 'PUT 必须携带文件内容。常见原因：\n'
+      + '  · curl 用了 -T 但源文件为空\n'
+      + '  · 客户端做了「零字节文件」的探测请求',
+      { allow: ALLOW },
+    );
+  }
 
   // 匿名写节流：大小上限管「单次伤害」，这里管「总量」。
   // 见 lib/throttle.ts —— 是尽力而为的减速带，不是硬配额。
@@ -742,7 +785,16 @@ async function handlePut(request: Request, env: Env, node: DavNode, davPath: str
   const declared = Number(request.headers.get('content-length')) || 0;
   const cap = cfg.maxUploadBytes;
   if (cap > 0 && declared > cap) {
-    return textResponse(413, `Payload Too Large: limit is ${cap} bytes`, { allow: ALLOW });
+    return textResponse(
+      413,
+      `文件太大：本次上传 ${formatBytes(declared)}，本站单文件上限 ${formatBytes(cap)}。\n\n`
+      + `⚠️ 上限来自 Cloudflare 的请求体限制（免费/付费套餐都是 100MB），\n`
+      + `   **再大的文件 WebDAV 也传不上去** —— 超限请求在 Cloudflare 的\n`
+      + `   代理层就被拦掉，根本到不了本站。\n\n`
+      + `大文件请走网页上传：<本站地址>/upload\n`
+      + `（它直传对象存储，字节不经过 Worker，不受这个限制）`,
+      { allow: ALLOW },
+    );
   }
 
   const meta = deriveMetadata(leafName);
@@ -754,7 +806,32 @@ async function handlePut(request: Request, env: Env, node: DavNode, davPath: str
   // 即使同名文件存在也只会返回 412，不会改动任何东西，因此无需口令。
   const onlyIfAbsent = (request.headers.get('if-none-match') ?? '').trim() === '*';
   if (existing && !onlyIfAbsent && !hasWriteToken(request, cfg.writeToken)) {
-    return unauthorizedResponse();
+    // ⚠️ 这里的 401 极易被误解成「我没登录」。
+    //   真相是「这本书已经在书库里了，而覆盖它需要口令」。
+    //   用 rclone / Cyberduck 的人看到 "Authentication required"
+    //   只会反复重试、反复失败，因为根本没有可用的账号密码可填 ——
+    //   这个站点是匿名开放的。
+    //
+    //   所以正文直接说清现状与两条出路。状态码保持 401（语义正确：
+    //   确实需要凭证才能继续），但**不能只有状态码**。
+    return textResponse(
+      401,
+      `这本书已经在书库里了：${leafName}\n\n`
+      + `《${existing.title || leafName}》已收录`
+      + `${existing.author ? `（作者：${existing.author}）` : ''}`
+      + `，${formatBytes(existing.size)}，上架于 ${String(existing.published_at).slice(0, 10)}。\n\n`
+      + `如果你是想**新增另一本同名书**，请换个文件名（加上版本或译者）。\n`
+      + `如果你确实要**替换现有内容**，请带上写入口令：\n\n`
+      + `    curl -T 新文件.epub \\\n`
+      + `      -H "X-Write-Token: <你的口令>" \\\n`
+      + `      <本站地址>${cfg.mountPath}/<集合路径>/${encodeURIComponent(leafName)}\n\n`
+      + `（替代做法：加 If-None-Match: * 头，服务端会拒绝而不是覆盖。）`,
+      // ⚠️ WWW-Authenticate 必须保留 —— 少了它 WebDAV 客户端不会弹密码框，
+      //   而是直接报「认证失败」（rclone / Cyberduck 的表现完全不同）。
+      //   这就是为什么这里不用 unauthorizedResponse()：它带固定文案，
+      //   而这里要给出「书已经存在」这个具体信息。头是同一个。
+      { allow: ALLOW, 'www-authenticate': 'Basic realm="webooks", charset="UTF-8"' },
+    );
   }
 
   const id = existing?.id ?? shortId(8);
@@ -820,7 +897,16 @@ async function handlePut(request: Request, env: Env, node: DavNode, davPath: str
   // 兜底：客户端谎报 Content-Length 时按实收大小判定（对象已经写了，删掉即可）
   if (cap > 0 && (object?.size ?? 0) > cap) {
     await env.BUCKET.delete(r2Key);
-    return textResponse(413, `Payload Too Large: limit is ${cap} bytes`, { allow: ALLOW });
+    return textResponse(
+      413,
+      `文件太大：本次上传 ${formatBytes(declared)}，本站单文件上限 ${formatBytes(cap)}。\n\n`
+      + `⚠️ 上限来自 Cloudflare 的请求体限制（免费/付费套餐都是 100MB），\n`
+      + `   **再大的文件 WebDAV 也传不上去** —— 超限请求在 Cloudflare 的\n`
+      + `   代理层就被拦掉，根本到不了本站。\n\n`
+      + `大文件请走网页上传：<本站地址>/upload\n`
+      + `（它直传对象存储，字节不经过 Worker，不受这个限制）`,
+      { allow: ALLOW },
+    );
   }
 
   const title = parsed?.title ?? meta.title;

@@ -214,3 +214,105 @@ describe('/upload 页面', () => {
     expect(html).toContain('id="queue"');
   });
 });
+describe('报错提示的可操作性', () => {
+  const DAV = `${ORIGIN}/dav/${encodeURIComponent('最近收录')}`;
+
+  it('覆盖已存在的书：说清「书已经有了」并给出替代方案', async () => {
+    // 先放一本
+    await SELF.fetch(`${DAV}/${encodeURIComponent('提示测试.epub')}`, {
+      method: 'PUT',
+      body: 'original-content',
+      headers: { authorization: 'Bearer test-write-token' },
+    });
+
+    // 匿名覆盖（无口令）
+    const res = await SELF.fetch(`${DAV}/${encodeURIComponent('提示测试.epub')}`, {
+      method: 'PUT',
+      body: 'hijacked',
+    });
+    expect(res.status).toBe(401);
+    const text = await res.text();
+
+    // 旧提示只有一句 "Authentication required for this operation"，
+    // 用户会以为「我没登录」然后反复重试 —— 而这里根本没有账号可填。
+    expect(text).toContain('已经在书库里');
+    expect(text).toContain('提示测试.epub');
+    // 给出可操作的两条出路
+    expect(text).toMatch(/X-Write-Token|If-None-Match/);
+    expect(text).toContain('换');
+
+    // ⚠️ 关键：内容必须没被改掉
+    const after = await SELF.fetch(`${DAV}/${encodeURIComponent('提示测试.epub')}`, {
+      headers: { authorization: 'Bearer test-write-token' },
+    });
+    await after.text();
+    const row = await testEnv.DB
+      .prepare('SELECT size FROM books WHERE leaf_name = ?')
+      .bind('提示测试.epub')
+      .first<{ size: number }>();
+    expect(row?.size, '被拒绝的覆盖不应改变原书大小').toBe(16);
+  });
+
+  it('体积超限：说清上限来自 Cloudflare，并指向网页上传', async () => {
+    const res = await SELF.fetch(`${DAV}/${encodeURIComponent('超大.epub')}`, {
+      method: 'PUT',
+      body: 'x',
+      headers: { 'content-length': String(200 * 1024 * 1024) },
+    });
+    expect(res.status).toBe(413);
+    const text = await res.text();
+    expect(text).toMatch(/100MB|100 MB/);
+    expect(text).toContain('/upload');
+  });
+
+  it('不支持的格式：列出可接受的格式', async () => {
+    const res = await SELF.fetch(`${DAV}/bad.rar`, { method: 'PUT', body: 'x' });
+    expect(res.status).toBe(415);
+    const text = await res.text();
+    expect(text).toContain('rar');
+    expect(text).toMatch(/EPUB|PDF/i);
+  });
+
+  it('网页上传同名文件被拒并说清原因', async () => {
+    // 网页上传**完全没检测过重复** —— 匿名用户只要猜到文件名，
+    // 就能把别人的书静默顶掉。这是本次修掉的一个真实缺陷。
+    const db = testEnv.DB;
+    await db.prepare(
+      `INSERT INTO books (id, leaf_name, title, author, language, format, content_type, size,
+         sha256, r2_key, title_letter, author_letter, format_bucket, kind_bucket, kind_source,
+         published_at, created_at, updated_at, status, credit)
+       VALUES ('dup01','网页重名.epub','网页重名','测试','zh','epub','application/epub+zip',100,
+         'sha','books/dup01','W','C','ebook','ebook','derived',
+         '2026-01-01','2026-01-01','2026-01-01','published','雷锋')`,
+    ).run();
+
+    // 往 uploads/ 放一个对象，模拟 init 之后的暂存
+    await testEnv.BUCKET.put('uploads/dup-test', new TextEncoder().encode('new content'));
+    await testEnv.BUCKET.put('books/dup01', new TextEncoder().encode('original'));
+
+    const res = await SELF.fetch(`${ORIGIN}/api/upload/complete`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ key: 'uploads/dup-test', filename: '网页重名.epub', size: 11 }),
+    });
+    expect(res.status).toBe(409);
+    const json = (await res.json()) as { error: string; message: string };
+    expect(json.error).toBe('already-exists');
+    expect(json.message).toContain('已经在书库里');
+    expect(json.message).toMatch(/改名|换|文件名/);
+
+    // 原书内容必须完好
+    const obj = await testEnv.BUCKET.get('books/dup01');
+    expect(await obj!.text()).toBe('original');
+    // 暂存的垃圾文件应被清掉，不能留在 R2 里
+    expect(await testEnv.BUCKET.get('uploads/dup-test'), '暂存文件应被删除').toBeNull();
+  });
+
+  it('上传页的错误提示要说清「能做什么」而不是复述状态码', async () => {
+    const html = await (await SELF.fetch(`${ORIGIN}/upload`, { headers: { accept: 'text/html' } })).text();
+    // 每个提示都应包含可操作信息
+    expect(html).toContain('本站只接受');
+    expect(html).toContain('改个文件名');
+    expect(html).toMatch(/刷新页面重试/);
+  });
+});
