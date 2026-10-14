@@ -466,3 +466,112 @@ describe('求书墙链接可达', () => {
     expect(res.headers.get('content-security-policy')).toBeNull();
   });
 });
+
+describe('上传者榜单（公开端点）', () => {
+  const DAV = `${ORIGIN}/dav/${encodeURIComponent('最近收录')}`;
+
+  async function putBook(leafName: string, credit: string): Promise<void> {
+    await SELF.fetch(`${DAV}/${encodeURIComponent(leafName)}`, {
+      method: 'PUT',
+      body: 'x',
+      headers: { authorization: 'Bearer test-write-token' },
+    });
+    await testEnv.DB.prepare('UPDATE books SET credit = ? WHERE leaf_name = ?')
+      .bind(credit, leafName).run();
+  }
+
+  it('匿名可访问，不需要口令', async () => {
+    const res = await SELF.fetch(`${ORIGIN}/api/credits`);
+    expect(res.status).toBe(200);
+    expect(res.headers.get('content-type')).toContain('application/json');
+  });
+
+  it('按贡献数倒序，且「雷锋」不计入榜单', async () => {
+    await putBook('榜单甲.epub', 'Alice');
+    await putBook('榜单乙.epub', 'Alice');
+    await putBook('榜单丙.epub', 'Bob');
+    await putBook('榜单丁.epub', '雷锋'); // 留空的默认署名，不是真人
+
+    const res = await SELF.fetch(`${ORIGIN}/api/credits`);
+    const body = (await res.json()) as {
+      contributors: { name: string; books: number }[];
+      namedBooks: number;
+      totalBooks: number;
+    };
+    expect(body.contributors[0]).toEqual({ name: 'Alice', books: 2 });
+    expect(body.contributors[1]).toEqual({ name: 'Bob', books: 1 });
+    expect(
+      body.contributors.some((c) => c.name === '雷锋'),
+      '默认署名「雷锋」不是真人，不该占榜位',
+    ).toBe(false);
+    expect(body.namedBooks).toBe(3);
+    expect(body.totalBooks).toBe(4);
+  });
+
+  it('只返回名字与本数 —— 不泄漏任何管理信息', async () => {
+    const res = await SELF.fetch(`${ORIGIN}/api/credits`);
+    const body = (await res.json()) as Record<string, unknown>;
+    // 这是一个**匿名公开**端点，出现任何额外字段都要重新审视
+    expect(Object.keys(body).sort()).toEqual(['contributors', 'namedBooks', 'totalBooks']);
+    const contributors = (body.contributors as Record<string, unknown>[] | undefined) ?? [];
+    for (const c of contributors) {
+      expect(
+        Object.keys(c).sort(),
+        `贡献者 ${String(c.name)} 的字段超出「名字 + 本数」，需要重新审视是否该公开`,
+      ).toEqual(['books', 'name']);
+    }
+  });
+
+  it('结果被缓存（第二次不再查 D1）', async () => {
+    const t1 = performance.now();
+    await SELF.fetch(`${ORIGIN}/api/credits`);
+    await SELF.fetch(`${ORIGIN}/api/credits`); // 预热，让缓存写入
+    const t2 = performance.now();
+    const r3 = await SELF.fetch(`${ORIGIN}/api/credits`);
+    const t3 = performance.now();
+    expect(r3.status).toBe(200);
+    // 断言「很快」而不是精确时间 —— 缓存命中应该远快于聚合查询
+    expect(t3 - t2).toBeLessThan(50);
+  });
+
+  it('书库为空时返回空榜单而不是报错', async () => {
+    const res = await SELF.fetch(`${ORIGIN}/api/credits`);
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { contributors: unknown[] };
+    expect(Array.isArray(body.contributors)).toBe(true);
+  });
+
+  it('首页包含榜单区块，位置在书架之后、使用方式之前', async () => {
+    const html = await (await SELF.fetch(`${ORIGIN}/`)).text();
+    const shelves = html.indexOf('class="shelves"');
+    const roll = html.indexOf('class="roll');
+    const howto = html.indexOf('class="howto"');
+    expect(shelves).toBeGreaterThan(-1);
+    expect(roll).toBeGreaterThan(shelves);
+    expect(howto).toBeGreaterThan(roll);
+    // 加载失败时静默 —— 榜单是配角，不能影响首页可用性
+    const script = html.match(/<script>([\s\S]*?)<\/script>/)![1];
+    expect(script).toContain('/api/credits');
+    expect(script).toContain('textContent');
+    expect(script).not.toMatch(/rollList\)\.innerHTML|who\.innerHTML/);
+  });
+
+  it('删除书会让榜单缓存失效', async () => {
+    await putBook('将被删.epub', 'Carol');
+    await SELF.fetch(`${ORIGIN}/api/credits`); // 填充缓存
+    // 删除（需要口令）
+    const res = await SELF.fetch(`${ORIGIN}/api/admin/delete`, {
+      method: 'POST',
+      headers: {
+        authorization: 'Bearer test-token',
+        'content-type': 'application/json',
+      },
+      body: JSON.stringify({ leafNames: ['将被删.epub'] }),
+    });
+    expect(res.status).toBe(200);
+    // 缓存应已被打掉，重新取能看到最新数据
+    const after = await SELF.fetch(`${ORIGIN}/api/credits`);
+    const body = (await after.json()) as { contributors: { name: string }[] };
+    expect(body.contributors.some((c) => c.name === 'Carol')).toBe(false);
+  });
+});

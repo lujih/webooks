@@ -26,6 +26,7 @@ import { adjustBuckets, bucketDeltas, bucketIdentityOf, upsertBook, findBookByLe
 import { shortId } from '../lib/http';
 import { clientIpFromRequest, guardWrite } from '../lib/throttle';
 import { sanitiseCredit } from '../lib/requests';
+import { purgeCreditCache } from './requests';
 import { createPresignedPutUrl } from '../lib/sigv4';
 import { parseEpub, coverExtFor, PARSE_SIZE_CAP } from '../lib/epub';
 import { jsonResponse, textResponse } from '../lib/http';
@@ -561,6 +562,11 @@ export async function handleUploadComplete(request: Request, env: Env): Promise<
       }),
     ),
   );
+
+  // 榜单缓存失效（首页 /api/credits 缓存 1 小时，不打的话新书不进榜）。
+  // 单独一次 cache.delete，不与条目缓存的失效混在一起 —— Cache API
+  // 在 Free 层有 50 次/请求的上限。
+  await purgeCreditCache();
 
   return jsonResponse({
     ok: true,

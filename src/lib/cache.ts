@@ -7,7 +7,8 @@
 
 import { bucketSegment, canonicalDavPath, collectionSegment, mediaKindOfFormat } from './collections';
 
-const CACHE_HOST = 'https://webooks.invalid'; // 保留域名，仅作缓存键
+/** 缓存键用的假域名（Cache API 要求绝对 URL；这里只作键，不参与网络请求） */
+export const CACHE_HOST = 'https://webooks.invalid';
 
 export function davCache(): Cache | null {
   try {
@@ -92,4 +93,9 @@ export function bookCacheTargets(book: BookCacheIdentity): Array<readonly [strin
     [`/${type}/`, 1],
     [`/${format}/`, 1],
   ];
+}
+
+/** 公开榜单的缓存键。榜单是「名字 + 本数」的聚合，低频变化，缓存 1 小时。 */
+export function creditsCacheKey(): string {
+  return `${CACHE_HOST}/public-credits`;
 }

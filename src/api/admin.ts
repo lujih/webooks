@@ -37,6 +37,7 @@ import {
   sha256Hex,
 } from '../lib/metadata';
 import { davCache, purgeEntries } from '../lib/cache';
+import { purgeCreditCache } from './requests';
 
 const BATCH_SIZE = 50;
 const MAX_LIST_LIMIT = 1000;
@@ -260,6 +261,8 @@ async function deleteBooks(env: Env, cfg: Settings, request: Request): Promise<R
       );
     }
     await purgeEntries(targets);
+    // 榜单缓存失效（首页 /api/credits 缓存 1 小时）
+    await purgeCreditCache();
   }
 
   return jsonResponse({ deleted, deletedCount: deleted.length, missing });

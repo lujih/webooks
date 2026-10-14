@@ -140,6 +140,62 @@ ${themeCss()}
   .arrow{margin-left:auto;color:var(--glow);font-size:1.1rem;opacity:0;transform:translateX(-6px);transition:.2s}
   .shelf:hover .arrow{opacity:1;transform:none}
 
+  /* ── 上传者榜单 ──
+     位置：书架之后、使用方式之前。
+     「去哪找书」（功能导航）→ 「谁在维护这个库」（社区信号）→ 「怎么连」（技术说明）
+
+     视觉：借阅卡。图书馆借书卡上是一行行手写/打印的借阅记录，
+     这里用横线分隔的密集行，而不是一排圆角卡片 ——
+     卡片是 SaaS 的默认语汇，而借阅卡是这个场景本来的东西。
+
+     克制：颜色只用纸色，琥珀只用在「本数」上（那是唯一值得强调的数字）。
+     榜单是配角，不能和书架抢注意力。 */
+  .roll{margin:3rem 0 0;padding-top:1.5rem;border-top:1px solid var(--line)}
+  .roll-head{display:flex;align-items:baseline;gap:.7rem;flex-wrap:wrap;margin-bottom:1rem}
+  .roll-head h2{
+    font-family:var(--serif);font-weight:400;font-size:1.1rem;
+    letter-spacing:.12em;color:var(--paper);margin:0;
+  }
+  /* 说明文字用「分行小字」而不是 eyebrow 标签 —— 首页其它区块
+     已经有 mark/tag 这套标签语汇了，这里再用一个就变成模板腔。 */
+  .roll-head .note{font-size:.82rem;color:var(--paper-dim)}
+
+  /* 借阅记录：每行一条，横向密排 */
+  .roll-list{
+    list-style:none;display:flex;flex-wrap:wrap;
+    border-top:1px solid var(--line-soft);
+  }
+  .roll-list li{
+    display:flex;align-items:baseline;gap:.5rem;
+    padding:.55rem .9rem .5rem 0;
+    border-bottom:1px solid var(--line-soft);
+    /* 借阅卡的横向分隔感：每条占一格，右侧留白当"折线" */
+    margin-right:.4rem;
+    font-size:.92rem;
+    opacity:0;animation:up .5s var(--ease) forwards;
+  }
+  .roll-list li:nth-child(1){animation-delay:.85s}
+  .roll-list li:nth-child(2){animation-delay:.9s}
+  .roll-list li:nth-child(3){animation-delay:.95s}
+  .roll-list li:nth-child(4){animation-delay:1s}
+  .roll-list li:nth-child(n+5){animation-delay:1.05s}
+  /* 名字：纸色，衬线（是人名，与书名同类） */
+  .roll-list .who{font-family:var(--serif);color:var(--paper);letter-spacing:.04em}
+  /* 本数：琥珀，唯一的强调 —— 这是唯一值得被注意的数字 */
+  .roll-list .n{
+    font-family:var(--mono);font-size:.78rem;color:var(--glow);
+    font-variant-numeric:tabular-nums;
+  }
+  .roll-list .n::before{content:"· ";opacity:.5}
+
+  /* 没有署名者时的说明 —— 措辞是邀请，不是陈述 */
+  .roll-empty{
+    padding:1.1rem 0;font-size:.9rem;color:var(--paper-dim);line-height:1.8;
+  }
+  .roll-empty a{color:var(--glow)}
+  /* 加载中：留一个占位高度，避免内容到达时页面跳动 */
+  .roll-skeleton{height:2.4rem}
+
   /* ── 使用方式 ── */
   .howto{margin:3.2rem 0 0;padding-top:1.6rem;border-top:1px solid var(--line)}
   .howto h2{font-family:var(--serif);font-weight:400;font-size:1.25rem;letter-spacing:.1em;color:var(--paper);margin-bottom:1.1rem}
@@ -191,6 +247,15 @@ ${themeCss()}
 ${shelfHtml}
   </section>
 
+  <section class="roll reveal" style="animation-delay:.8s">
+    <div class="roll-head">
+      <h2>谁在传书</h2>
+      <span class="note" id="rollNote"></span>
+    </div>
+    <ul class="roll-list" id="rollList"></ul>
+    <div class="roll-empty" id="rollEmpty" hidden></div>
+  </section>
+
   <section class="howto">
     <h2>两种打开方式</h2>
     <ol>
@@ -209,6 +274,72 @@ ${shelfHtml}
   </footer>
 
 </div>
+
+<script>
+/**
+ * 上传者榜单。
+ *
+ * 为什么用 fetch 而不是服务端直出：
+ *   首页是流量最大的入口，而榜单数据来自 D1 聚合查询。直出意味着
+ *   **每次**首页访问都要查一次 —— 而 /api/credits 已经在服务端
+ *   缓存 1 小时，客户端再取一次是零成本的。
+ *
+ * 失败时保持静默：榜单是配角，取不到就不显示，不能让它影响首页可用性。
+ */
+(function () {
+  'use strict';
+  var list = document.getElementById('rollList');
+  var empty = document.getElementById('rollEmpty');
+  var note = document.getElementById('rollNote');
+
+  // XSS 防线：credit 是匿名用户自己填的，必须转义后再进 DOM。
+  // 注意：这里用 textContent 而不是 innerHTML，天然免疫。
+  function li(name, books) {
+    var el = document.createElement('li');
+    var who = document.createElement('span');
+    who.className = 'who';
+    who.textContent = name;
+    var n = document.createElement('span');
+    n.className = 'n';
+    n.textContent = books + ' 本';
+    el.appendChild(who);
+    el.appendChild(n);
+    return el;
+  }
+
+  fetch('/api/credits', { headers: { accept: 'application/json' } })
+    .then(function (r) { return r.ok ? r.json() : null; })
+    .then(function (d) {
+      if (!d) return;
+      var cs = d.contributors || [];
+      if (cs.length) {
+        var frag = document.createDocumentFragment();
+        cs.forEach(function (c) { frag.appendChild(li(c.name, c.books)); });
+        list.appendChild(frag);
+        // 有署名者时说清楚比例，让「有多少人参与」可读
+        note.textContent = cs.length + ' 人留了名，'
+          + (d.namedBooks || 0) + ' / ' + (d.totalBooks || 0) + ' 本';
+      } else {
+        list.hidden = true;
+        empty.hidden = false;
+        // 措辞是邀请而不是陈述 —— 这里没有数据不代表没有人在传
+        empty.innerHTML = '';
+        empty.appendChild(document.createTextNode('现在还没有人留名。'));
+        var a = document.createElement('a');
+        a.href = '/upload';
+        a.textContent = '传第一本，让它记上你的名字';
+        empty.appendChild(document.createTextNode(' —— '));
+        empty.appendChild(a);
+        empty.appendChild(document.createTextNode('。留空也会记成「雷锋」。'));
+      }
+    })
+    .catch(function () {
+      // 静默：榜单是配角，取不到就不显示
+      list.hidden = true;
+      empty.hidden = true;
+    });
+})();
+</script>
 </body>
 </html>`;
 }

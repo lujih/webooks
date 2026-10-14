@@ -18,6 +18,7 @@
 
 import type { Env } from '../config';
 import { jsonResponse } from '../lib/http';
+import { creditsCacheKey, davCache } from '../lib/cache';
 import { guardWrite } from '../lib/throttle';
 import {
   DEFAULT_CREDIT_NAME,
@@ -212,4 +213,110 @@ export async function handleCreditBoard(request: Request, env: Env, url: URL): P
     namedContributors: credited?.n ?? 0,
     contributors: results ?? [],
   });
+}
+
+// ── 公开的上传者榜单（匿名）─────────────────────────────────────────────
+
+/**
+ * 上传者榜单 —— 首页公开展示，**不需要**任何鉴权。
+ *
+ * 为什么要有这个公开端点，而不是让首页直接读 admin 接口：
+ *   · admin 接口需要口令（fail-closed），首页是匿名的
+ *   · 榜单本身就是「公开署名」的聚合结果 —— 它**不是**管理信息
+ *     （不含 IP、时间戳、留言、书籍 id），公开不构成风险
+ *   · 与 lib/requests.ts 的求书墙同一个定位：让社区行为可见，
+ *     从而鼓励更多人参与
+ *
+ * ⚠️ 预算：D1 Free 是 500 万行读/天，首页是流量最大的入口。
+ *   所以这个查询必须走索引（idx_books_credit）且**必须**缓存。
+ *   实测 @20,000 本的全表 GROUP BY 约 20,000 行读 —— 不缓存的话
+ *   250 次首页访问就打满一天额度。这里用 Cache API 存 60 分钟。
+ *
+ * ⚠️ 只返回「名字 + 本数」。任何其它字段都不要加进来 —— 一旦
+ *   开始返回更多信息，就该重新审视它是否还该公开。
+ */
+export async function handleCreditPublic(request: Request, env: Env): Promise<Response> {
+  if (request.method !== 'GET' && request.method !== 'HEAD') {
+    return jsonResponse({ error: 'method-not-allowed' }, 405);
+  }
+
+  const cache = davCache();
+  const cacheKey = creditsCacheKey();
+  if (cache) {
+    const hit = await cache.match(cacheKey);
+    if (hit) {
+      // 命中也要回 200 而不是 304：浏览器会自己按 cache-control 处理，
+      // 304 只会让匿名客户端更难处理。
+      return new Response(await hit.text(), {
+        headers: hit.headers,
+      });
+    }
+  }
+
+  // 「雷锋」是留空时的默认署名，不是真人 —— 不计入榜单，
+  // 否则一个人占满整个榜单会显得很假。
+  const { results } = await env.DB
+    .prepare(
+      `SELECT credit AS name, COUNT(*) AS books
+         FROM books
+        WHERE status = 'published'
+          AND credit IS NOT NULL AND credit <> ''
+          AND credit <> ?
+        GROUP BY credit
+        ORDER BY books DESC, credit ASC
+        LIMIT 12`,
+    )
+    .bind(DEFAULT_CREDIT_NAME)
+    .all<{ name: string; books: number }>();
+
+  const totals = await env.DB
+    .prepare(
+      `SELECT
+         COUNT(*) AS total,
+         SUM(CASE WHEN credit IS NOT NULL AND credit <> '' AND credit <> ? THEN 1 ELSE 0 END) AS named
+       FROM books WHERE status = 'published'`,
+    )
+    .bind(DEFAULT_CREDIT_NAME)
+    .first<{ total: number; named: number }>();
+
+  const payload = {
+    totalBooks: totals?.total ?? 0,
+    namedBooks: totals?.named ?? 0,
+    contributors: results ?? [],
+  };
+
+  const body = JSON.stringify(payload);
+  const headers = {
+    'content-type': 'application/json; charset=utf-8',
+    'cache-control': 'public, max-age=600',
+  };
+  if (cache) {
+    try {
+      // Cache API 存 60 分钟。失效点在上传 complete 里打（见 purgeCreditCache）——
+      // 上传是低频操作，每次多花一次 cache.delete 完全可接受。
+      await cache.put(
+        cacheKey,
+        new Response(body, { headers: { ...headers, 'cache-control': 'public, max-age=3600' } }),
+      );
+    } catch {
+      /* 缓存写失败不影响功能 */
+    }
+  }
+  return new Response(body, { headers });
+}
+
+/**
+ * 上传/删除后让榜单缓存失效（1 次 Cache API 调用）。
+ *
+ * ⚠️ Cache API 在 Workers Free 有 50 次/请求的上限（见 purgeEntries 的注释），
+ *   所以这里是**单独一次**调用，不与条目缓存的失效混在一起。
+ */
+export async function purgeCreditCache(): Promise<void> {
+  const cache = davCache();
+  if (!cache) return;
+  try {
+    await cache.delete(creditsCacheKey());
+  } catch {
+    /* 忽略 */
+  }
 }

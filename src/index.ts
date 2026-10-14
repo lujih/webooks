@@ -5,6 +5,7 @@
  *   /dav/**            WebDAV（Class 1，读为主）
  *   /requests          求书墙（页面）
  *   /api/requests      求书（匿名公开 API）
+ *   /api/credits       上传者榜单（匿名公开 API）
  *   /api/admin/**      管理接口（需要 ADMIN_TOKEN）
  *   /health            健康检查
  *   /                  首页
@@ -12,7 +13,7 @@
 
 import { handleAdmin } from './api/admin';
 import { handleUploadComplete, handleUploadInit } from './api/upload';
-import { handleRequests } from './api/requests';
+import { handleCreditPublic, handleRequests } from './api/requests';
 import { requestsHtml } from './requests-page';
 import { settings, type Env, type Settings } from './config';
 import { textResponse, withSecurityHeaders } from './lib/http';
@@ -100,6 +101,11 @@ async function route(request: Request, env: Env): Promise<Response> {
           'cache-control': 'public, max-age=3600',
         },
       });
+    }
+
+    // 上传者榜单（匿名公开，只返回名字与计数）
+    if (path === '/api/credits') {
+      return handleCreditPublic(request, env);
     }
 
     // 求书墙

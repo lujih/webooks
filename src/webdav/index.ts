@@ -31,6 +31,7 @@ import { checkPreconditions } from '../lib/preconditions';
 import { parseEpub, coverExtFor, PARSE_SIZE_CAP, type EpubMeta } from '../lib/epub';
 import { sniffKindFromBucket } from '../lib/kind-sniff';
 import { bookCacheTargets, purgeEntries } from '../lib/cache';
+import { purgeCreditCache } from '../api/requests';
 import {
   acquireLock,
   allLiveLocks,
@@ -1022,6 +1023,8 @@ async function handleDelete(env: Env, node: DavNode, davPath: string): Promise<R
         formatBucket: book.format_bucket,
       }),
     );
+    // 榜单缓存失效：书没了，首页的 /api/credits 也要更新（它缓存 1 小时）
+    await purgeCreditCache();
 
     return new Response(null, { status: 204 });
   }
@@ -1081,6 +1084,8 @@ async function handleDelete(env: Env, node: DavNode, davPath: string): Promise<R
       ['/', 1],
       [`/${collectionSegment(collection)}/`, 1],
     ]);
+    // 同上：集合删除也要更新上传者榜单
+    await purgeCreditCache();
     return new Response(null, { status: 204 });
   }
 
