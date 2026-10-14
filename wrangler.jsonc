@@ -7,56 +7,38 @@
     "enabled": true
   },
 
-  // ── 预算相关的可调参数 ────────────────────────────────────────────────
-  // 这些值直接决定 Workers Free 每天 100,000 请求的消耗速度。
+  // ═══════════════════════════════════════════════════════════════════════
+  // 只有**必须由部署者填**的值才写在这里。
+  //
+  // 其余参数（挂载前缀、单目录上限、缓存 TTL、上传体积、写配额、深度策略）
+  // 全部走 src/config.ts 里的默认值 —— 它们的值已调整过，每一项都有
+  // 实测或官方文档支撑，理由都写在那个文件的注释里。
+  //
+  // 以前这里重复了 6 个值，与代码默认值完全一致，纯属冗余，而且有
+  // 漂移风险：改了一处忘了另一处，两边就不一致了。更糟的是
+  // MAX_UPLOAD_BYTES —— 代码里已经 clamp 到 Cloudflare 的请求体上限，
+  // 配置文件里写一个更大的值**不会生效**，只会让人误以为可以放宽。
+  //
+  // 想调整某个参数？改 src/config.ts 里对应的常量，或用
+  // `wrangler deploy --var KEY=VALUE` 临时覆盖（不要写回本文件）。
+  // ═══════════════════════════════════════════════════════════════════════
   "vars": {
-    // R2 桶的公开自定义域（必须绑自定义域，不要用 r2.dev：官方明示不适用于生产）
-    // GET 会 302 跳到这里，从而不占用 Worker 的 CPU/内存。
-    // 换域名部署时改这一行即可；也可以去掉它，改在 Dashboard 的
-    // Variables 里设（Dashboard 的值不会被 wrangler 覆盖）。
-    "R2_PUBLIC_BASE": "https://books.cszxorx.dpdns.org",
-
-    // WebDAV 挂载前缀。会原样出现在 207 响应的 D:href 里。
-    "DAV_MOUNT": "/dav",
-
-    // 单目录最多返回多少个子项。既控制 PROPFIND 响应体积，也保证 XML 生成
-    // 在 Workers Free 的 10ms CPU 限制内（200 条约 1–3ms）。
-    "MAX_ENTRIES": "200",
-
-    // PROPFIND 结果的 Cache API TTL（秒）。这是免费方案的关键：
-    // 未命中的 PROPFIND 要读约 200 行 D1，而 D1 免费额度只有 500 万行/天。
-    "PROPFIND_TTL": "300",
-
-    // "downgrade"（默认，把 infinity 当 Depth:1 处理，兼容性好）
-    // "deny"（按 RFC 4918 返回 403 + DAV:propfind-finite-depth）
-    "DEPTH_INFINITY": "downgrade",
-
-    // 单文件大小上限（字节）。只作用于 **WebDAV PUT**；"0" 表示不限制。
+    // R2 桶的公开自定义域 —— **唯一必填项**。
     //
-    // ⚠️ 这必须是 100MiB 而不是 200MiB：Cloudflare 的请求体上限按**账户套餐**
-    //    计算，Free / Pro 都是 100MB，超限在代理层就回 413，请求**根本到不了
-    //    Worker**（官方文档 workers/platform/limits 的 Request body size limits）。
-    //    设成 200MiB 只会造成「配置说支持、实际永远失败」的死路径。
+    // GET 会 302 跳到这里，从而下载的字节完全不经过 Worker（不占 CPU/内存、
+    // 不受请求体上限约束）。换域名部署时改这一行即可。
     //
-    //    网页上传不受此限 —— 它预签名直传 R2，字节不过 Worker，
-    //    上限由 UPLOAD_MAX_BYTES 单独控制（默认 200 MiB）。
-    //
-    // 免费层 R2 只有 10GB 且 WebDAV 完全匿名开放，没有上限时一个脚本就能写满
-    // 配额并触发计费。实测：超限时 PUT 返回 413 且不写库。
-    "MAX_UPLOAD_BYTES": "104857600",
-
-    // 每 IP 每日写操作上限；"0" 表示不限制。见 src/lib/throttle.ts。
-    // 300 次对正常使用（含批量导入整套书）绰绰有余，但让脚本无限灌文件不划算。
-    "DAILY_WRITE_QUOTA": "300"
+    // ⚠️ 不要用 r2.dev —— Cloudflare 官方明示它不适用于生产。
+    //   症状：目录能列、一点下载就 530。
+    // ⚠️ 必须是 https，且不带尾部斜杠。
+    "R2_PUBLIC_BASE": "https://books.cszxorx.dpdns.org"
   },
 
-  // ── 资源绑定：故意不写 ID / 名称 ──────────────────────────────────────
-  // 这是 wrangler 的「自动资源创建」（2025-10-24 上线的 open beta，需 wrangler ≥ 4.45）。
-  // 好处：配置文件不含任何账号相关信息，仓库可以直接公开，别人 fork 后一条命令就能部署。
-  //   · wrangler dev    → 本地自动创建
-  //   · wrangler deploy → 调用 Cloudflare API 创建并绑定，并把生成的 ID 写回本文件
-  // 想改回手动模式：先 `wrangler d1 create` / `wrangler r2 bucket create`，再把
-  // database_name / database_id / bucket_name 填回来。
+  // ── 资源绑定 ────────────────────────────────────────────────────────
+  // bucket_name / database_name 用的是**语义化名字**而非随机 ID：
+  // wrangler 的「自动资源创建」（2025-10-24 上线，需 wrangler ≥ 4.45）
+  // 会按名字查找，找不到就创建。好处是 fork 后一条命令就能部署，
+  // 而配置文件里不含任何账号相关信息。
   "r2_buckets": [
     {
       "binding": "BUCKET",
@@ -68,11 +50,20 @@
     {
       "binding": "DB",
       "database_name": "webooks-db",
+      // database_id 是 wrangler 自动创建后写回的。⚠️ 它是账号相关的，
+      //   换账号部署时 wrangler 会覆盖成新值（见 CHANGELOG）。
       "database_id": "b0edfbd4-f6f1-468f-abb8-481dda7b1721",
       "migrations_dir": "migrations"
     }
   ]
 
-  // ADMIN_TOKEN 不在 vars 里 —— 它必须用 `wrangler secret put ADMIN_TOKEN` 设置，
-  // 绝不进代码仓库。
+  // 令牌类全部用 secret，绝不进仓库：
+  //   ADMIN_TOKEN           保护 /api/admin/*     必填（未配置则全部 404）
+  //   WRITE_TOKEN           保护删除/覆盖        强烈建议（未配置则不保护）
+  //   TURNSTILE_SITE_KEY    上传页的验证码公钥
+  //   TURNSTILE_SECRET      服务端校验用
+  //   R2_ACCESS_KEY_ID      预签名直传
+  //   R2_SECRET_ACCESS_KEY  预签名直传
+  //
+  // 全部用 `npx wrangler secret put <名字>` 设置，详见 docs/DEPLOY.md。
 }

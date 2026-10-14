@@ -179,7 +179,7 @@ GET https://books.<域名>/books/<id>
 每 IP 每日配额实际根本没实现。已移除死常量，改为真正实现（见 5.2）。
 
 ### 5.2 新增写入节流
-`src/lib/throttle.ts` + `DAILY_WRITE_QUOTA`（默认 300 次/IP/日，`0` = 不限）：
+`src/lib/throttle.ts` + `DEFAULT_DAILY_WRITE_QUOTA`（300 次/IP/日，`0` = 不限）：
 - 大小上限管「单次伤害」，节流管「总量」
 - 用 **Cache API** 实现，不消耗 D1 写入配额（免费层仅 10 万行/天）或 KV 写入配额
   （免费层仅 1000 次/天）
@@ -480,8 +480,9 @@ src/lib/http.ts        安全响应头
 src/lib/throttle.ts    新增：写入节流
 src/lib/locks.ts       sweepExpiredLocks
 src/index.ts           安全头统一注入（最外层）
-src/config.ts          maxUploadBytes / dailyWriteQuota
-wrangler.jsonc         MAX_UPLOAD_BYTES / DAILY_WRITE_QUOTA
+src/config.ts          maxUploadBytes / dailyWriteQuota（含 clamp 与默认值）
+wrangler.jsonc         仅 R2_PUBLIC_BASE（其余参数走 config.ts 默认值，
+                       仍可用 `wrangler deploy --var KEY=VALUE` 临时覆盖）
 scripts/security-probe.mjs  新增：34 项安全自查
 test/security.test.ts       新增：12 例安全回归
 test/epub.test.ts           +6 例封面类型回归

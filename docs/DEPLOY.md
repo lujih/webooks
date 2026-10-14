@@ -71,9 +71,22 @@ node -e "console.log(require('crypto').randomBytes(32).toString('base64url'))"
 
 ### 4. 资源是自动创建的
 
-`wrangler.jsonc` 里故意没写 D1 / R2 的 ID 和名称 —— 这是 wrangler 的
+`wrangler.jsonc` 里只写**语义化名字**（`webooks-db` / `webooks-bucket`），
+没有账号相关的 ID —— 这是 wrangler 的
 [自动资源创建](https://developers.cloudflare.com/changelog/post/2025-10-24-automatic-resource-provisioning/)
-（需 wrangler ≥ 4.45，当前 4.147 ✅）。首次部署时 wrangler 会调 API 建好 D1 和 R2 并绑定。
+（需 wrangler ≥ 4.45，当前 4.147 ✅）。首次部署时 wrangler 会按名字调 API
+查找/创建资源并绑定。
+
+配置文件的 vars 里**只有 R2_PUBLIC_BASE 一个必填项**。其余参数
+（挂载前缀、单目录上限、缓存 TTL、上传体积、写配额、Depth 策略）
+全部走 `src/config.ts` 的默认值 —— 那些值都是按实测定的，
+理由写在那个文件的注释里。要临时覆盖：
+
+```bash
+npx wrangler deploy --var PROPFIND_TTL=600
+```
+
+不必（也不建议）为此修改配置文件 —— 两处各写一份会产生漂移。
 
 想改回手动模式：先 `wrangler d1 create` / `wrangler r2 bucket create`，再把
 `database_name` / `database_id` / `bucket_name` 填回配置文件。

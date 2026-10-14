@@ -26,9 +26,15 @@ npx wrangler secret put ADMIN_TOKEN
 npm run deploy
 ```
 
-`wrangler.jsonc` 里**故意不写 D1 / R2 的 ID 和名称** —— 用的是 wrangler 的
+`wrangler.jsonc` 里只写**语义化名字**（`webooks-db` / `webooks-bucket`），
+不带任何账号相关的 ID —— 用的是 wrangler 的
 [自动资源创建](https://developers.cloudflare.com/changelog/post/2025-10-24-automatic-resource-provisioning/)
 （需 ≥ 4.45）。好处是仓库不含任何账号信息，别人 fork 后一条命令就能部署。
+
+配置文件里**只有一个必填项**（`R2_PUBLIC_BASE`）。挂载前缀、单目录上限、
+缓存 TTL、上传体积、写配额这些都走 `src/config.ts` 里的默认值 ——
+理由和实测数据都写在那个文件的注释里。想临时覆盖用
+`wrangler deploy --var KEY=VALUE`，不必改文件。
 
 ⚠️ **还要做一件事**：给 R2 桶绑一个**公开自定义域**，填进 `wrangler.jsonc` 的
 `R2_PUBLIC_BASE`。不做的症状是「能列目录，一点下载就 530」。

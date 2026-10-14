@@ -1,6 +1,7 @@
 /** 纯函数单元测试：路径解析、分桶、元数据推导、PROPFIND 请求体解析。 */
 
 import { describe, expect, it } from 'vitest';
+import { CF_REQUEST_BODY_LIMIT, settings } from '../src/config';
 import {
   bucketFromSegment,
   bucketSegment,
@@ -285,5 +286,62 @@ describe('resolveDepth', () => {
   it('infinity 默认降级为 1，配置 deny 时拒绝', () => {
     expect(resolveDepth('infinity', cfg())).toEqual({ depth: 1 });
     expect(resolveDepth('infinity', cfg({ depthInfinity: 'deny' }))).toEqual({ rejected: true });
+  });
+});
+
+/**
+ * 配置默认值的一致性（回归测试）。
+ *
+ * wrangler.jsonc 曾经重复声明 6 个参数（DAV_MOUNT / MAX_ENTRIES /
+ * PROPFIND_TTL / DEPTH_INFINITY / MAX_UPLOAD_BYTES / DAILY_WRITE_QUOTA），
+ * 值与 src/config.ts 的默认值完全一致 —— 纯冗余，且有漂移风险。
+ * 现在 wrangler.jsonc 只留唯一必填项 R2_PUBLIC_BASE，其余走代码默认值。
+ *
+ * 这条测试锁住两件事：
+ *  1. 不传 vars 时 settings() 的结果 == 旧配置文件声明的值
+ *  2. 代码里的常量与那些字面量一致
+ * 将来谁改了 config.ts 的默认值，这里会立刻指出「文档/注释里的数字过时了」。
+ */
+describe('配置默认值与 wrangler.jsonc 精简', () => {
+  const OLD_VARS = {
+    DAV_MOUNT: '/dav',
+    MAX_ENTRIES: '200',
+    PROPFIND_TTL: '300',
+    DEPTH_INFINITY: 'downgrade',
+    MAX_UPLOAD_BYTES: '104857600',
+    DAILY_WRITE_QUOTA: '300',
+  } as const;
+
+  const BASE = { R2_PUBLIC_BASE: 'https://books.example.com' } as never;
+
+  it('不传 vars 时，settings 结果与旧配置逐项相同', () => {
+    expect(settings(BASE)).toEqual(settings({ ...(BASE as object), ...OLD_VARS } as never));
+  });
+
+  it('代码默认值常量与旧配置字面量一致', () => {
+    const s = settings(BASE);
+    expect(s.mountPath).toBe(OLD_VARS.DAV_MOUNT);
+    expect(s.maxEntries).toBe(Number(OLD_VARS.MAX_ENTRIES));
+    expect(s.propfindTtl).toBe(Number(OLD_VARS.PROPFIND_TTL));
+    expect(s.depthInfinity).toBe(OLD_VARS.DEPTH_INFINITY);
+    expect(s.maxUploadBytes).toBe(Number(OLD_VARS.MAX_UPLOAD_BYTES));
+    expect(s.dailyWriteQuota).toBe(Number(OLD_VARS.DAILY_WRITE_QUOTA));
+  });
+
+  it('R2_PUBLIC_BASE 仍然是必填（没默认值可退回）', () => {
+    expect(() => settings({} as never)).toThrow(/R2_PUBLIC_BASE/);
+  });
+
+  it('仍然可以用 --var 临时覆盖任意参数', () => {
+    // 精简的是配置文件，不是能力：显式传值依然生效
+    const s = settings({ ...(BASE as object), PROPFIND_TTL: '60' } as never);
+    expect(s.propfindTtl).toBe(60);
+  });
+
+  it('MAX_UPLOAD_BYTES 被 clamp 到 Cloudflare 请求体上限（配更大也不生效）', () => {
+    // 这是删掉 wrangler.jsonc 那一项的直接理由之一：
+    // 配置里写 200MiB 不会放宽任何东西，只会造成「以为生效了」的错觉。
+    const s = settings({ ...(BASE as object), MAX_UPLOAD_BYTES: '209715200' } as never);
+    expect(s.maxUploadBytes).toBe(CF_REQUEST_BODY_LIMIT);
   });
 });
