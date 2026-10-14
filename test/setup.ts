@@ -26,6 +26,16 @@ export async function clearDavCache(paths: string[]): Promise<void> {
   }
 }
 
+/**
+ * 每个测试前把业务数据清空。
+ *
+ * ⚠️ 加新表时**必须**往这里加一行 —— 否则该表的数据会在测试之间累积，
+ * 表现为「单测逻辑全对，但涉及这张表的端到端测试莫名失败」。
+ * （requests 表就是这样踩过一次：resetLibrary 没清它，
+ *  「重复提交应合并成一条」于是看到 2 行。）
+ */
 export async function resetLibrary(): Promise<void> {
-  await testEnv.DB.exec('DELETE FROM books; DELETE FROM buckets; DELETE FROM locks;');
+  await testEnv.DB.exec(
+    'DELETE FROM books; DELETE FROM buckets; DELETE FROM locks; DELETE FROM requests;',
+  );
 }

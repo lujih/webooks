@@ -3,6 +3,8 @@
  *
  * 路由（挂载前缀可用 DAV_MOUNT 改，默认 /dav）：
  *   /dav/**            WebDAV（Class 1，读为主）
+ *   /requests          求书墙（页面）
+ *   /api/requests      求书（匿名公开 API）
  *   /api/admin/**      管理接口（需要 ADMIN_TOKEN）
  *   /health            健康检查
  *   /                  首页
@@ -10,6 +12,8 @@
 
 import { handleAdmin } from './api/admin';
 import { handleUploadComplete, handleUploadInit } from './api/upload';
+import { handleRequests } from './api/requests';
+import { requestsHtml } from './requests-page';
 import { settings, type Env, type Settings } from './config';
 import { textResponse, withSecurityHeaders } from './lib/http';
 import { indexHtml } from './home-page';
@@ -44,6 +48,11 @@ async function route(request: Request, env: Env): Promise<Response> {
 
     if (path === '/health') {
       return Response.json({ ok: true, service: 'webooks' });
+    }
+
+    // 求书（匿名公开接口，同样在 settings() 之前）
+    if (path === '/api/requests') {
+      return handleRequests(request, env);
     }
 
     // 上传通道（在 settings() 之前：上传即使没配 R2_PUBLIC_BASE 也应给出明确错误）
@@ -89,6 +98,18 @@ async function route(request: Request, env: Env): Promise<Response> {
         headers: {
           'content-type': 'text/html; charset=utf-8',
           'cache-control': 'public, max-age=3600',
+        },
+      });
+    }
+
+    // 求书墙
+    if (path === '/requests' || path === '/requests/') {
+      return new Response(requestsHtml(), {
+        status: 200,
+        headers: {
+          'content-type': 'text/html; charset=utf-8',
+          // 列表是动态拉的，页面本身可以缓存；但 ? 带参数不应被缓存
+          'cache-control': 'public, max-age=300',
         },
       });
     }
