@@ -115,4 +115,49 @@ describe('集合 DELETE（RFC 4918 §9.6.1）', () => {
     // 集合被清空后，A 桶不应再出现
     expect(await nav()).not.toContain(`/dav/${COL}/A/`);
   });
+
+  // ── 成员锁（RFC 4918 §9.6 + §7）──────────────────────────────────
+  //
+  // 集合 DELETE 等价于 Depth: infinity，所以受锁约束。修复前这里**完全
+  // 没有检查成员锁**：分发层的 handleLockedWrite 只看集合自身的 davPath，
+  // 于是 LOCK 住一本书之后 DELETE 整个集合照样成功，那本书就没了。
+  // 实测（修复前）：LOCK locked.epub → 200，DELETE /最近收录/ → 204，
+  // locked.epub 的 D1 行与 R2 对象双双消失。
+  it('成员被锁时拒绝删除整个集合（不能删一半）', async () => {
+    await dav('/最近收录/locked.epub', { method: 'PUT', body: 'LOCKED' }).then((r) => r.text());
+    await dav('/最近收录/free.epub', { method: 'PUT', body: 'FREE' }).then((r) => r.text());
+
+    const lock = await dav('/最近收录/locked.epub', {
+      method: 'LOCK',
+      headers: { 'content-type': 'application/xml', timeout: 'Second-300' },
+      body:
+        '<?xml version="1.0" encoding="utf-8" ?>'
+        + '<D:lockinfo xmlns:D="DAV:">'
+        + '<D:lockscope><D:exclusive/></D:lockscope>'
+        + '<D:locktype><D:write/></D:locktype>'
+        + '<D:owner>tester</D:owner>'
+        + '</D:lockinfo>',
+    });
+    await lock.text();
+    expect(lock.status).toBe(200);
+
+    const del = await dav('/最近收录/', { method: 'DELETE' });
+    await del.text();
+    expect(del.status, '有活锁成员的集合必须整体拒绝，而不是删一半').toBe(423);
+
+    const rows = await testEnv.DB
+      .prepare('SELECT leaf_name FROM books ORDER BY leaf_name')
+      .all<{ leaf_name: string }>();
+    expect((rows.results ?? []).map((r) => r.leaf_name)).toEqual(['free.epub', 'locked.epub']);
+  });
+
+  it('无锁时集合照常删除（锁检查不能误伤正常路径）', async () => {
+    await dav('/最近收录/a.epub', { method: 'PUT', body: 'A' }).then((r) => r.text());
+    await dav('/最近收录/b.epub', { method: 'PUT', body: 'B' }).then((r) => r.text());
+
+    const del = await dav('/最近收录/', { method: 'DELETE' });
+    await del.text();
+    expect(del.status).toBe(204);
+    expect(await countBooks()).toBe(0);
+  });
 });
