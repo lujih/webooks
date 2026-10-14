@@ -201,7 +201,12 @@ init 签发的预签名 URL（需先过 Turnstile）。已在报告中记录，�
 - **路径穿越**：`../../etc/passwd`、`%2e%2e%2f`、`/.env`、`/.git/config`、
   `/wrangler.jsonc` 全部 404/400，无内容泄露
 - **CORS**：不反射任意 Origin，未开 `credentials`
-- **管理端点**：无 token / 错误 token → 404（fail-closed），常量时间比较防时序侧信道
+- **管理端点**：无 token / 错误 token → 403（fail-closed），口令用**常量时间比较**
+  > ⚠️ 本条此前写的是「404（fail-closed）」，与代码不符：`src/api/admin.ts`
+  > 实际是「未配置 ADMIN_TOKEN → 404」「已配置但 token 不对 → 403」。代码是对的，
+  > 是文档表述需统一。另：`safeEqual` 在长度不等时立即返回，仍泄露口令长度
+  > （理论风险：边缘 RTT 抖动数十毫秒，远大于一次长度比较的耗时）。
+  > 2026-10-14 复核，实测 `/api/admin/stats` 无 token → **403**。
 - **XXE / 实体扩展**：DOCTYPE 外部实体未被展开；十亿笑声无慢响应（274ms）
 - **错误信息**：不泄露堆栈、不泄露密钥名
 - **R2 公开桶**：不可列举（`?list-type=2` → 404）
@@ -356,7 +361,23 @@ turnstileToken → siteverify 通过 → 返回 ticket（HMAC 签名、10 分钟
 | 验证码频率 | 从「每文件一次」→「每 10 分钟一次」 |
 | 绑定 | 通行证绑定签发时的 IP，换 IP 即失效 |
 | 伪造 | HMAC-SHA256 签名，篡改过期时间会导致签名不符 |
-| 兜底 | 匿名上传仍有每日写入次数节流；D1 写入额度也是硬约束 |
+| 兜底 | 匿名上传有每日写入次数节流；D1 写入额度也是硬约束 |
+
+> ⚠️ **2026-10-14 订正：这条结论此前是错的。** 核查发现 `allowWrite` 的
+> **唯一**调用点在 `handlePut` 里，`src/api/upload.ts` 全文零节流：
+> `· /api/upload/init` —— 拿到一张通行证即可 10 分钟内无限循环
+> `· /api/upload/complete` —— 最重的端点之一（2 次 R2 读 + 1 写 + D1 写 +
+>   `rebuildBuckets` 全表聚合），完全开放给任何人反复调用
+> `· WebDAV COPY` —— 分发处注释声称「走与 PUT 相同的节流」，实际一次都没走过
+>
+> 后果是直接冲击 R2 的 10GB 与 D1 的 10 万行/天额度 —— 这两条都是**硬停**，
+> 打满就是全站停摆到次日 UTC 0 点。
+>
+> 已修：抽出 `lib/throttle.ts` 的 `guardWrite` 作为**统一守卫**，
+> 所有写路径（PUT / COPY / upload init / upload complete）都走它，
+> 新增入口时漏不掉。同时补上 `complete` 缺失的扩展名白名单校验
+> （此前可 init 传 `.epub`、complete 传 `.exe` 绕过白名单）。
+> 回归测试见 `test/security.test.ts` 的「写节流：覆盖面与 IP 来源」。
 
 匿名开放书库里，验证码的作用是「提高自动化滥用成本」，而不是「精确计量每次上传」。
 每日节流已经在做后者。所以把验证码从「每次上传」降到「每批一次」，

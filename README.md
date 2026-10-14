@@ -65,7 +65,7 @@ scripts/
   budget.mjs            ★ 请求预算模拟器
   dav-probe.mjs         ★ 线上 DAV 一致性 / 边缘动词放行 / 100-continue 探针
   size-probe.mjs        ★ 请求体 100 MB 边界探针
-test/                   53 个测试（单元 + 端到端）
+test/                   253+ 个测试（单元 + 端到端 + 回归）
 ```
 
 ---
@@ -179,6 +179,14 @@ curl -H "Authorization: Bearer $ADMIN_TOKEN" "https://你的域名/api/admin/reb
 
 > `rebucket` **默认不动 `kind_bucket`**：它现在来自内容嗅探或人工修正，比「按扩展名猜」
 > 更权威。按扩展名重算会把扫描漫画打回「电子书」（真实踩过）。
+>
+> **`?sniff=1` 也一样** —— 迁移 0006 起每本书都记了 `kind_source`
+> （`sniffed` / `derived` / `manual`），`manual` 的值**任何自动化都不会覆盖**
+> （`rebucket` 会跳过并报告 `skippedManual`，覆盖上传也会保留）。
+> 这不是多余的约束：内容嗅探在两种真实情况下必然失效 ——
+> ① PDF 1.5+ 用对象流把字典压起来，标记根本看不到
+> ② 带 OCR 层的扫描漫画引入字体资源，让「零字体」判据直接崩
+> 这两类书只能靠人判断，而人判断恰恰是最容易被脚本覆盖掉的数据。
 
 分类规则一旦变化，**存量书不会自动跟上**（`title_letter` 等是入库时算好存起来的），
 所以改规则后要跑一次 `rebucket`。
@@ -215,9 +223,16 @@ curl -H "Authorization: Bearer $ADMIN_TOKEN" "https://你的域名/api/admin/reb
 ```
 
 通行证是**无状态**的（`<过期时间戳>.<HMAC(密钥, 过期时间|IP)>`），不占 D1 写入，
-不需要新表；IP 不写进通行证里，验证时用当前请求的 IP 重算签名比对，
-所以**无法被搬到别的 IP 上使用**。密钥默认复用 `TURNSTILE_SECRET`（想独立轮换
-再设 `UPLOAD_TICKET_SECRET`），不引入新的必填配置。
+不需要新表；IP 不写进通行证里，验证时用当前请求的 IP 重算签名比对 ——
+所以通行证**只能由签发它的那台机器使用**。
+
+> ⚠️ 这条保证依赖 IP 取自 `CF-Connecting-IP`（Cloudflare 边缘强制设置）。
+> 实现上**只信任这个头**、不回落到 `X-Forwarded-For`：后者完全由客户端提供，
+> 一旦回退生效，攻击者只要把 XFF 填成签发时的 IP 就能在别的机器上复用通行证。
+> 早期实现有那个回落，承诺实际上是失效的。
+>
+> 密钥默认复用 `TURNSTILE_SECRET`（想独立轮换再设 `UPLOAD_TICKET_SECRET`），
+> 不引入新的必填配置。
 
 同时 widget 设成 `appearance: 'interaction-only'`：正常用户根本看不到验证框，
 只有 Cloudflare 判定可疑时才弹出来要求交互。
@@ -328,7 +343,7 @@ curl -X POST "https://你的域名/api/admin/purge?path=/title/A/" -H "Authoriza
 ## Phase 0 必须实测的事
 
 **`r2-webdav` 的 litmus 一致性测试只跑过 `wrangler dev --local`，没有证明线上边缘行为。**
-本仓库的 53 个测试跑在 workerd（miniflare）里，同样不是 Cloudflare 边缘。
+本仓库的测试跑在 workerd（miniflare）里，同样不是 Cloudflare 边缘。
 
 所以部署到真实域名后，第一件事是跑这两个探针：
 
@@ -385,7 +400,7 @@ docker run --rm -it alpine:latest sh -c '
 
 | 项 | 现状 | 原因 |
 |---|---|---|
-| **MKCOL 返回 201 但不真的建目录** | 目录树是虚拟的，由 D1 推导 | 兼容层：拒绝会让部分客户端挂载失败。手工建的目录不会出现在树里 |
+| **MKCOL 一律拒绝（已映射的集合回 405，未映射回 403 + `valid-resourcetype`）** | 目录树是虚拟的，由 D1 推导，建了也不会出现在树里 | 假装 201 再让目录消失，比直接拒绝更糟：客户端会缓存「创建成功」这个事实，之后再也收不到正确的状态。收到 405 的客户端能正确理解为「已存在」并继续挂载 |
 | **Depth 缺失按 1 处理** | 有意偏离 RFC 4918 | 规范要求按 `infinity`，那会在大目录上炸掉 CPU |
 | **PROPFIND 缓存有最长 300 秒延迟** | 新增的书最多 5 分钟后才出现在列表里 | 换取命中率。`/api/admin/purge` 或 `/api/admin/rebucket` 可手动失效 |
 | **重命名书名会改变所在桶** | 书会从 `/按书名/A/` 移到 `/按书名/B/` | 目录树是派生视图 |
@@ -401,7 +416,7 @@ docker run --rm -it alpine:latest sh -c '
 ## 测试
 
 ```bash
-npm test          # 230 个测试
+npm test          # 297 个测试
 npm run typecheck
 npm run check:dav  -- --url https://你的域名/dav/   # 线上一致性探针
 npm run check:size -- --url https://你的域名/dav/   # 请求体体积边界
@@ -434,3 +449,5 @@ node scripts/verify-upload-chain.mjs --site https://你的域名                
 - [平台调研原始记录](docs/appendix-platform-research.md) —— 逐条引用与官方文档日期
 - [安全审计报告](docs/security-audit.md) —— 漏洞复现、修复与实测数据
 - [RFC 合规清单](docs/rfc-compliance.md) —— 逐条对照 RFC 4918 / 9110
+- [2026-10-14 全面审查与修复记录](docs/review-2026-10-14-fixes.md) —— **数据丢失、鉴权绕过、ReDoS、ZIP bomb、锁不可用**的修复全过程
+- [WebDAV RFC 深度审计](docs/webdav-rfc-audit-2026-10-14.md) —— 逐条对照 RFC 原文的完整审计

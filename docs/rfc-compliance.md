@@ -35,12 +35,31 @@ webdav.org 的规格清单里被标记为 *obsoleted* 的只有 **RFC 2518**，�
 | §18.2 | Class 2 = Class 1 + LOCK/UNLOCK | `DAV: 1, 2`，含完整锁（timeout / lock-token / If 刷新） | ✅ |
 | §9.10.1 | LOCK 响应体必须是 `prop` 元素里的 `lockdiscovery` | `<D:prop><D:lockdiscovery>…` | ✅ |
 | §8.2 | 所有 XML「MUST be, at minimum, well formed」 | 全部响应体经严格良构校验（`test/xml-wellformed.test.ts`） | ✅ |
+
+> ⚠️ 良构性**不等于**合规：`@cloudflare/vitest-pool-workers` 自带的良构检查
+> 只验证标签配对与命名空间，不验 DTD。元素名拼错（`<D:lock>` vs
+> `<D:activelock>`）、子元素顺序违反 sequence 这类问题它一律放过。
+> 合规性由 `test/lock-xml.test.ts` 单独按 DTD 断言。
 | §10.7 | `TimeType = ("Second-" DAVTimeOutVal \| "Infinite")` | 解析 `Second-600` 等真实写法 | ✅ |
-| §14.12 | lockdiscovery 结构（含 `lockroot`） | `lockscope/locktype/depth/locktoken/lockroot/timeout/owner` | ✅ |
+| §14.12 | lockdiscovery 结构（含 `lockroot`） | 元素名 `activelock`（不是 `lock`），子元素顺序 `lockscope/locktype/depth/owner?/timeout?/locktoken?/lockroot` | ✅ 已修正 |
+
+> **2026-10-14 订正**：本条此前标 ✅ 但结论是错的 —— 实现输出的是
+> `<D:lockdiscovery><D:lock>`，而 RFC 4918 §15.7 的 DTD 是
+> `<!ELEMENT lockdiscovery (activelock)* >`，元素名应为 `activelock`；
+> 且子元素顺序把 `timeout` 排在 `locktoken` 之后，违反 §14.1 的 sequence。
+> 严格客户端（.NET XmlDocument / SabreDAV / davfs2）按 `activelock` 取锁，
+> **一把都读不到**。原有测试只验 XML 良构性（标签配对）—— 而
+> `<D:lock>…</D:lock>` 恰恰是良构的，所以没拦住。
+> 现由 `test/lock-xml.test.ts` 按 DTD 逐条校验。
 | §14.14 | href 内是锁令牌 URI | 转义后写入，解析还原即裸 URI，与 `Lock-Token` 头一致 | ✅ |
 | §6.5 / §10.5 | `Lock-Token: "<" absolute-URI ">"` | 带尖括号形式 | ✅ |
-| §9.10.2 | 无 body + `If:` 头 = 刷新锁 | 支持，且刷新时不回 `Lock-Token` 头 | ✅ |
-| §9.10.6 | 已有不兼容锁 → 423（不是 412） | 423 + `no-conflicting-lock` | ✅ |
+| §9.10.2 | 无 body + `If:` 头 = 刷新锁 | 支持刷新 | ⚠️ 已修正 |
+
+> **2026-10-14 订正**：本条此前标 ✅，实测是错的：
+>   ① 刷新路径仍然回了 `Lock-Token` 头，违反 §9.10.2 的「not returned」
+>   ② 对**不存在的** token 回 200 并新造一把锁 —— §9.10.6 要求
+>      412 + `lock-token-matches-request-uri`
+| §9.10.6 | 已有不兼容锁 → 423（不是 412） | 423 + `lock-token-submitted` | ✅ 已修正 |
 | §11.3 | 对已锁资源写入 → 423 Locked | 423 | ✅ |
 | §9.1 | PROPFIND 不存在的资源 → 404 | 404 | ✅ |
 | §9.1 | Depth: infinity **MAY** 被禁用；拒绝时 SHOULD 用 403 + `propfind-finite-depth` | 降级为 Depth: 1 | ⚠️ 见偏离表 |
