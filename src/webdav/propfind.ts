@@ -28,7 +28,7 @@ import {
 } from '../lib/collections';
 import { findBookByLeaf, getBucketTotal, listBooks, listBucketTotals, type BookRow } from '../lib/db';
 import { httpDate, isoDate, multistatusResponse } from '../lib/http';
-import { davError, davResponse, encodeHref, escapeXml, multistatus } from '../lib/xml';
+import { davError, davResponse, encodeHref, escapeXml, extractTagNames, multistatus, readDavBody } from '../lib/xml';
 import { allLiveLocks, matchLocksToPaths, lockDiscoveryXml } from '../lib/locks';
 // ── 请求体解析 ──────────────────────────────────────────────────────────
 
@@ -39,27 +39,94 @@ interface PropRequest {
   names: string[];
 }
 
-const TAG_RE = /<(?:[A-Za-z0-9_.-]+:)?([A-Za-z0-9_.-]+)\b[^>]*?(\/?)>/g;
+// 标签名提取走 xml.ts 的 extractTagNames（线性扫描）。
+// 原先用正则 `<(?:ns:)?([A-Za-z0-9_.-]+)\b[^>]*?(\/?)>`：嵌套量词 + 回溯，
+// 对抗性输入下耗时按 n² 增长（24KB → 362ms），而 Workers Free 只有 10ms CPU
+// 且 PROPFIND 完全匿名。改成线性推进后 CPU 与长度成线性关系。
+// 配合 readDavBody 的 8KB 上限，构造不出高 CPU 请求。
 
 export function parsePropfindBody(body: string | null): PropRequest {
   const text = (body ?? '').trim();
   if (text.length === 0) return { mode: 'allprop', names: [] };
-  if (/<(?:[A-Za-z0-9_.-]+:)?propname\b/i.test(text)) return { mode: 'propname', names: [] };
-  if (/<(?:[A-Za-z0-9_.-]+:)?allprop\b/i.test(text)) return { mode: 'allprop', names: [] };
 
-  const block = text.match(
-    /<(?:[A-Za-z0-9_.-]+:)?prop\b[^>]*>([\s\S]*?)<\/(?:[A-Za-z0-9_.-]+:)?prop>/i,
-  );
-  if (!block) return { mode: 'allprop', names: [] };
+  // mode 的判定也改成「找标签名」而不是正则 —— `<...propname\b` 这种写法
+  // 同样能被构造出退化输入（大量 `<D:prop` 而没有闭合标签）。
+  const all = extractTagNames(text);
+  if (all.includes('propname')) return { mode: 'propname', names: [] };
+  if (all.includes('allprop')) return { mode: 'allprop', names: [] };
 
-  const names: string[] = [];
-  for (const tag of block[1]!.matchAll(TAG_RE)) {
-    const name = tag[1]!;
-    if (name === 'prop') continue;
-    names.push(name);
-  }
+  const inner = betweenPropTags(text);
+  const names = inner ? extractTagNames(inner).filter((n) => n !== 'prop') : [];
   if (names.length === 0) return { mode: 'allprop', names: [] };
   return { mode: 'prop', names: [...new Set(names)].sort() };
+}
+
+/**
+ * 取出 `<prop>…</prop>` 之间的内容（线性扫描，不用正则）。
+ *
+ * 原先用 `[\s\S]*?` 惰性量词找结束标签：输入里只有开标签没有闭标签时，
+ * 引擎会尝试每个可能的结束位置，回溯量与输入长度平方成正比。
+ */
+function betweenPropTags(text: string): string | null {
+  const open = findTag(text, 'prop');
+  if (open < 0) return null;
+  const gt = text.indexOf('>', open);
+  if (gt < 0) return null;
+  if (text[gt - 1] === '/') return null; // <prop/> 空元素
+  // 从开标签之后找**结束标签**：这里要跳过 `</`，所以用 findCloseTag
+  const closeTag = findCloseTag(text, 'prop', gt);
+  if (closeTag < 0) return null;
+  return text.slice(gt + 1, closeTag);
+}
+
+/**
+ * 找 `</ns:tag>` 的 '<' 位置。
+ *
+ * 不能复用 findTag —— 它遇到 '/' 开头就返回 -1（那是「跳过结束标签」的行为），
+ * 而这里要找的正是结束标签。
+ */
+function findCloseTag(text: string, tag: string, from: number): number {
+  let i = from;
+  while (i < text.length) {
+    const idx = text.indexOf('</', i);
+    if (idx < 0) return -1;
+    let j = idx + 2;
+    while (j < text.length) {
+      const c = text[j]!;
+      if (c === ' ' || c === '>' || c === '/' || c === '\t' || c === '\n' || c === '\r') break;
+      j++;
+    }
+    let name = text.slice(idx + 2, j);
+    const colon = name.indexOf(':');
+    if (colon >= 0) name = name.slice(colon + 1);
+    // 精确相等：`prop` 不能匹配 `propertyupdate` 的结束标签
+    if (name.toLowerCase() === tag) return idx;
+    i = idx + 2;
+  }
+  return -1;
+}
+
+/** 找 `<ns:tagname` 的 '<' 位置。from 之后开始找；结束标签返回 -1。 */
+function findTag(text: string, tag: string, from = 0): number {
+  let i = from;
+  while (i < text.length) {
+    const lt = text.indexOf('<', i);
+    if (lt < 0) return -1;
+    if (text[lt + 1] === '/') return -1; // 结束标签
+    let j = lt + 1;
+    while (j < text.length) {
+      const c = text[j]!;
+      if (c === ' ' || c === '>' || c === '/' || c === '\t' || c === '\n' || c === '\r') break;
+      j++;
+    }
+    let name = text.slice(lt + 1, j);
+    const colon = name.indexOf(':');
+    if (colon >= 0) name = name.slice(colon + 1);
+    // 必须精确等于 tag（`prop` 不能匹配 `propertyupdate`）
+    if (name.toLowerCase() === tag) return lt;
+    i = lt + 1;
+  }
+  return -1;
 }
 
 export function resolveDepth(
@@ -186,10 +253,19 @@ function renderProps(
       // 现在实现了完整 Class 2 锁：supportedlock 宣告 exclusive/write，
       // 让客户端知道我们对锁是真的支持的（而不是「不支持请忽略」）。
       case 'supportedlock':
+        // ⚠️ 两处都曾写错，且都属于「客户端照着做必然出错」的类型：
+        //   ① 元素名是 `lockentry`，不是 `supportedlockentry`
+        //      RFC 4918 §15.10 <!ELEMENT supportedlock (lockentry)* >
+        //   ② 第二个条目宣告了 `<D:locktype><D:read/>` ——
+        //      §14.15 的 DTD 是 <!ELEMENT locktype (write) >，
+        //      **RFC 4918 里没有 read 锁**（那是 WebDAV Class 3 才有的扩展）。
+        //      宣告一个不实现的锁类型，客户端会据此建立读锁，
+        //      然后与服务端的写锁语义冲突。
+        // shared / exclusive 的区别在 lockscope，两者都是 write 锁。
         found.push(
           '<D:supportedlock>' +
-            '<D:supportedlockentry><D:lockscope><D:exclusive/></D:lockscope><D:locktype><D:write/></D:locktype></D:supportedlockentry>' +
-            '<D:supportedlockentry><D:lockscope><D:shared/></D:lockscope><D:locktype><D:read/></D:locktype></D:supportedlockentry>' +
+            '<D:lockentry><D:lockscope><D:exclusive/></D:lockscope><D:locktype><D:write/></D:locktype></D:lockentry>' +
+            '<D:lockentry><D:lockscope><D:shared/></D:lockscope><D:locktype><D:write/></D:locktype></D:lockentry>' +
             '</D:supportedlock>',
         );
         break;
@@ -409,7 +485,7 @@ export async function handlePropfind(
   }
   const { depth } = depthResult;
 
-  const bodyText = await request.text().catch(() => '');
+  const { text: bodyText } = await readDavBody(request);
   const propReq = parsePropfindBody(bodyText);
 
   const cache = cfg.propfindTtl > 0 ? davCache() : null;

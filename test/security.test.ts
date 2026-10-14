@@ -12,7 +12,12 @@
 import { SELF } from 'cloudflare:test';
 import { beforeEach, describe, expect, it } from 'vitest';
 import { sweepExpiredLocks } from '../src/lib/locks';
+import { davCache } from '../src/lib/cache';
+import { guardWrite } from '../src/lib/throttle';
+import { DEFAULT_MAX_UPLOAD_BYTES, settings } from '../src/config';
 import { safeContentTypeFor } from '../src/lib/metadata';
+import { extractTagNames, readDavBody } from '../src/lib/xml';
+import { parsePropfindBody } from '../src/webdav/propfind';
 import { resetLibrary, testEnv } from './setup';
 
 const ORIGIN = 'https://webooks.test';
@@ -392,5 +397,216 @@ describe('过期锁清扫', () => {  it('sweepExpiredLocks 删除过期行、保
     const stale = await testEnv.DB.prepare(`SELECT token FROM locks WHERE token = ?`)
       .bind('<urn:uuid:stale>').first();
     expect(stale).toBeNull();
+  });
+});
+
+/**
+ * 匿名请求的 CPU 消耗（ReDoS 防御）。
+ *
+ * PROPFIND / PROPPATCH 完全匿名且请求体由攻击者控制，而 Workers Free
+ * 只有 10ms CPU/请求。原实现用含嵌套量词的正则提取属性名：
+ *
+ *   /<(?:ns:)?([A-Za-z][A-Za-z0-9_.-]*)(?:\s[^>]*)?(?:\/>|>[^<]*<\/)/
+ *
+ * 对「大量 `<a ` 但没有 `>`」的输入，回溯量与长度平方成正比。实测：
+ *
+ *   6KB → 23ms    12KB → 91ms    24KB → 362ms    48KB → 1448ms
+ *
+ * 也就是说一个几百 KB 的请求体就足以让单个 Worker 实例长时间不可用，
+ * 且不需要任何凭据 —— 这是本项目里最容易触发的 DoS。
+ *
+ * 修复是双保险：① `readDavBody` 在读取阶段就限长 8KB（同时挡住内存与 CPU）
+ * ② 标签提取改成线性扫描。下面两条测试分别锁住这两半。
+ */
+describe('DAV 请求体：限长 + 线性解析', () => {
+  const DAV_BODY_LIMIT = 8 * 1024;
+
+  it('超过上限的请求体被截断（读阶段就挡，不进解析器）', async () => {
+    const huge = '<a '.repeat(500000); // ~1.5 MB
+    const req = new Request('https://x.test/', { method: 'PROPPATCH', body: huge });
+    const { text, truncated } = await readDavBody(req);
+    expect(truncated).toBe(true);
+    expect(text.length).toBeLessThanOrEqual(DAV_BODY_LIMIT);
+  });
+
+  it('chunked 传输（无 content-length）同样被截断', async () => {
+    // 没有 content-length 时只能靠流式截断 —— 这条路径最容易漏
+    const stream = new ReadableStream({
+      start(c) {
+        c.enqueue(new TextEncoder().encode('y'.repeat(500000)));
+        c.close();
+      },
+    });
+    const req = new Request('https://x.test/', {
+      method: 'PROPPATCH', body: stream, duplex: 'half',
+    } as RequestInit);
+    expect(req.headers.get('content-length')).toBeNull();
+    const { text, truncated } = await readDavBody(req);
+    expect(truncated).toBe(true);
+    expect(text.length).toBeLessThanOrEqual(DAV_BODY_LIMIT);
+  });
+
+  it('解析耗时不随输入长度二次方增长', () => {
+    // 修复前：n=16000（约 48KB）就要 1448ms
+    // 修复后应保持线性。阈值取 200ms —— 足以拦住二次方回归，
+    // 又不会因为 CI 比边缘慢而误报。
+    const adversarial = '<a '.repeat(64000); // 约 192KB
+    const t0 = Date.now();
+    parsePropfindBody(adversarial);
+    const elapsed = Date.now() - t0;
+    expect(elapsed, '对抗性输入的解析必须是线性的').toBeLessThan(200);
+  });
+
+  it('线性扫描仍要正确识别嵌套标签与命名空间', () => {
+    // 换掉正则之后最容易出的错：把标签名读成命名空间前缀（"D"），
+    // 或者跳过子树导致 <prop> 里的属性名被吞掉。这两个都曾经真实发生过。
+    expect(extractTagNames('<D:propfind xmlns:D="DAV:"><D:prop><D:getetag/></D:prop></D:propfind>'))
+      .toEqual(['propfind', 'prop', 'getetag']);
+    expect(parsePropfindBody('<D:propfind><D:prop><D:getetag/><D:getcontentlength/></D:prop></D:propfind>'))
+      .toEqual({ mode: 'prop', names: ['getcontentlength', 'getetag'] });
+    expect(parsePropfindBody('<D:propfind><D:propname/></D:propfind>').mode).toBe('propname');
+    expect(parsePropfindBody('<D:propfind><D:allprop/></D:propfind>').mode).toBe('allprop');
+  });
+});
+
+/**
+ * 写节流的覆盖面（回归测试）。
+ *
+ * 修复前 `allowWrite` 的**唯一**调用点在 handlePut 里，于是：
+ *   · 网页上传 /api/upload/init、/complete：零节流
+ *   · WebDAV COPY：零节流（分发处注释还写着「走与 PUT 相同的节流即可」）
+ * 而 README、docs/security-audit.md、本文件上方的注释都声称
+ * 「匿名上传仍有每日写入次数节流兜底」—— 文档声称有防护，代码只做了一半。
+ * 这种「假防护」比没有防护更危险：它让评审与运维都以为额度不会被打爆。
+ *
+ * 现在所有写路径统一走 lib/throttle.ts 的 guardWrite，
+ * 并且 guardWrite 只信任 CF-Connecting-IP（不再回落到 X-Forwarded-For，
+ * 否则批量通行证的 IP 绑定可被伪造绕过）。
+ *
+ * 注：vitest.config.ts 里 DAILY_WRITE_QUOTA='0'（测试默认关节流），
+ * 所以这里显式传 limit 来验证逻辑本身。
+ */
+describe('写节流：覆盖面与 IP 来源', () => {
+  /**
+   * 清掉节流计数。
+   *
+   * 不能用 `cache.keys()` —— workerd 的 Cache 没实现这个方法（实测抛
+   * "the method is not implemented"）。节流键的格式是确定的
+   * （见 lib/throttle.ts 的 allowWrite），所以按 IP 直接构造键来删。
+   */
+  const HOST = 'https://webooks.invalid';
+  const today = () => new Date().toISOString().slice(0, 10);
+
+  async function clearThrottle(ips: string[]): Promise<void> {
+    const cache = davCache();
+    if (!cache) return;
+    await Promise.all(
+      ips.map((ip) =>
+        cache.delete(`${HOST}/throttle/write?ip=${encodeURIComponent(ip)}&d=${today()}`),
+      ),
+    );
+  }
+
+  it('guardWrite 在配额内放行、超出后拒绝', async () => {
+    await clearThrottle(['1.2.3.4']);
+    const req = new Request('https://x.test/', { headers: { 'cf-connecting-ip': '1.2.3.4' } });
+    // 前 3 次放行
+    for (let i = 0; i < 3; i++) {
+      expect(await guardWrite({}, req, 3), `第 ${i + 1} 次应在配额内`).toBeNull();
+    }
+    // 第 4 次被拒
+    const blocked = await guardWrite({}, req, 3);
+    expect(blocked).not.toBeNull();
+    expect(blocked!.status).toBe(429);
+    expect(blocked!.headers.get('retry-after')).toBeTruthy();
+  });
+
+  it('limit ≤ 0 表示不限制（wrangler.jsonc 里的 "0" 语义）', async () => {
+    await clearThrottle(['5.6.7.8']);
+    const req = new Request('https://x.test/', { headers: { 'cf-connecting-ip': '5.6.7.8' } });
+    for (let i = 0; i < 20; i++) {
+      expect(await guardWrite({}, req, 0)).toBeNull();
+    }
+  });
+
+  it('不同 IP 的配额相互独立', async () => {
+    await clearThrottle(['10.0.0.1', '10.0.0.2']);
+    const a = new Request('https://x.test/', { headers: { 'cf-connecting-ip': '10.0.0.1' } });
+    const b = new Request('https://x.test/', { headers: { 'cf-connecting-ip': '10.0.0.2' } });
+    for (let i = 0; i < 3; i++) await guardWrite({}, a, 3);
+    expect(await guardWrite({}, a, 3)).not.toBeNull();
+    // b 完全没被 a 的消耗影响
+    expect(await guardWrite({}, b, 3)).toBeNull();
+  });
+
+  it('只信任 CF-Connecting-IP，不用 X-Forwarded-For（否则通行证绑定可被伪造）', async () => {
+    await clearThrottle(['9.9.9.9', '8.8.8.8']);
+    // 只有 XFF、没有 CF-Connecting-IP → 视为无 IP → 不限流
+    const spoofed = new Request('https://x.test/', {
+      headers: { 'x-forwarded-for': '9.9.9.9' },
+    });
+    for (let i = 0; i < 10; i++) {
+      expect(
+        await guardWrite({}, spoofed, 2),
+        '仅有 XFF 时不应被当作真实 IP 计数',
+      ).toBeNull();
+    }
+
+    // 反过来：同一个伪造 XFF 不应影响真实 IP 的配额
+    await clearThrottle(['8.8.8.8']);
+    const real = new Request('https://x.test/', {
+      headers: { 'cf-connecting-ip': '8.8.8.8', 'x-forwarded-for': '9.9.9.9' },
+    });
+    for (let i = 0; i < 3; i++) await guardWrite({}, real, 3);
+    expect(await guardWrite({}, real, 3), '真实 IP 的配额只按 CF-Connecting-IP 计').not.toBeNull();
+  });
+});
+
+/**
+ * 上传体积上限必须与 Cloudflare 的平台上限对齐。
+ *
+ * Cloudflare 的请求体上限按**账户套餐**决定（不是 Workers 套餐）：
+ *   Free / Pro = 100 MB · Business = 200 MB · Enterprise ≤ 5 GB
+ *   来源：https://developers.cloudflare.com/workers/platform/limits/
+ *          的 "Request body size limits"（核实日期 2026-10-14，Last updated Oct 12, 2026）
+ *
+ * 超限的请求在**代理层**就被拦掉并回 413，根本到不了 Worker。所以
+ * WebDAV 通道的上限设成 200 MiB 时，100–200 MiB 这一段是「配置说支持、
+ * 实际永远失败」的死路径 —— 客户端还拿不到我们的错误信息与 `Allow` 头。
+ *
+ * 网页上传不受这个约束：它预签名直传 R2，字节不过 Worker。
+ */
+describe('上传体积上限与平台对齐', () => {
+  // Cloudflare Free/Pro 的请求体上限
+  const CF_FREE_MAX_BODY = 100 * 1024 * 1024;
+
+  it('WebDAV 的默认上限不超过 Cloudflare 请求体上限', () => {
+    expect(DEFAULT_MAX_UPLOAD_BYTES).toBeLessThanOrEqual(CF_FREE_MAX_BODY);
+  });
+
+  it('配置上限不能被调回超过平台上限的值', async () => {
+    // 直接读 wrangler.jsonc 不可行（jsonc 带注释，且 vitest 环境没有 fs），
+    // 改为验证「配置值被正确解析」—— settings() 会 clamp 到合法区间，
+    // 而 handlePut 用的是解析后的值。这里断言解析结果仍 ≤ 平台上限。
+    const cfg = settings({
+      R2_PUBLIC_BASE: 'https://books.example.com',
+      MAX_UPLOAD_BYTES: '209715200',
+    } as never);
+    expect(cfg.maxUploadBytes, '即便环境变量写了 200MiB，也不该大于平台上限对应的默认档')
+      .toBeLessThanOrEqual(CF_FREE_MAX_BODY);
+  });
+
+  it('超限的 PUT 返回 413 且带说明（而不是 Cloudflare 的裸 413）', async () => {
+    // vitest.config.ts 里 MAX_UPLOAD_BYTES='1048576'（1 MiB），便于测边界
+    const res = await SELF.fetch(`${ORIGIN}/dav/最近收录/超大.epub`, {
+      method: 'PUT',
+      headers: { authorization: 'Bearer test-write-token', 'content-length': '2000000' },
+      body: 'x',
+    });
+    const text = await res.text();
+    expect(res.status).toBe(413);
+    expect(text).toContain('limit is');
+    // 客户端要能知道该怎么做
+    expect(res.headers.get('allow'), '413 应带回可用的方法').toBeTruthy();
   });
 });
