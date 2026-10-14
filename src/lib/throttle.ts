@@ -58,3 +58,61 @@ export async function allowWrite(ip: string, limit: number): Promise<boolean> {
   }
   return true;
 }
+
+/**
+ * 写操作的统一守卫：**每条**写路径都必须先过它。
+ *
+ * 为什么要有这个函数：曾经只有 handlePut 调 allowWrite，于是
+ * 「匿名上传有每日写次数节流」这个承诺在其它入口上**完全落空** ——
+ *   · 网页上传 /api/upload/init、/api/upload/complete：零节流
+ *   · WebDAV COPY：零节流（分发处注释还写着「走与 PUT 相同的节流即可」）
+ * 结果文档、注释、README 三处都说有节流，代码里却只有一处。
+ *
+ * 这类「文档声称有防护、实际只做了一半」比完全没有防护更危险：
+ * 它让评审和运维都以为额度不会被打爆。
+ *
+ * 现在所有写路径统一走 guardWrite，新增入口时漏不掉 —— 因为
+ * 「写路径必须调用 guardWrite」现在是一条可以在 review 里检查的规则。
+ *
+ * @param env   用于取 DAILY_WRITE_QUOTA（两条链路的配置来源一致）
+ * @param request 用于取客户端 IP
+ * @param limit 每日上限；≤0 表示不限制
+ * @returns 允许时为 null，被拒时是一个可直接返回的 429 响应
+ */
+export async function guardWrite(
+  env: { DAILY_WRITE_QUOTA?: string },
+  request: Request,
+  limit: number,
+  allowHeaders?: { allow?: string; retryAfter?: string },
+): Promise<Response | null> {
+  const quota = Number.parseInt(env.DAILY_WRITE_QUOTA ?? '', 10);
+  const effective = Number.isFinite(quota) ? quota : limit;
+  const ip = clientIpFromRequest(request);
+  if (await allowWrite(ip, effective)) return null;
+  return new Response('Too Many Requests: daily write quota exceeded\n', {
+    status: 429,
+    headers: {
+      'content-type': 'text/plain; charset=utf-8',
+      'retry-after': allowHeaders?.retryAfter ?? '3600',
+      ...(allowHeaders?.allow ? { allow: allowHeaders.allow } : {}),
+    },
+  });
+}
+
+/**
+ * 取客户端 IP。
+ *
+ * ⚠️ **只信任 CF-Connecting-IP**，缺失时返回空串（→ 节流被跳过）。
+ *
+ * 原实现在 upload.ts 里是 `CF-Connecting-IP ?? X-Forwarded-For ?? ''`。
+ * `X-Forwarded-For` 完全由客户端提供，一旦 Cloudflare 没设前者就回落到它，
+ * 于是：批量上传通行证的 IP 绑定可以被 `X-Forwarded-For: <原IP>` 伪造绕过 ——
+ * 通行证在 A 机签发，在 B 机上带上 A 的 XFF 就能用。
+ * 回到规范：「无法被搬到别的 IP 上使用」这个承诺在那个回退分支下不成立。
+ *
+ * 空 IP 的后果是「不限流」而不是「拒绝」：宁可放过，也不误伤
+ * 真正走 Cloudflare 边缘却拿不到头的请求（比如本地 wrangler dev）。
+ */
+export function clientIpFromRequest(request: Request): string {
+  return request.headers.get('CF-Connecting-IP') ?? '';
+}
