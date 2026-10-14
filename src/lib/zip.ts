@@ -94,9 +94,69 @@ export function readZipDirectory(buf: ArrayBuffer): Map<string, ZipEntry> {
   return entries;
 }
 
-async function inflate(raw: Uint8Array): Promise<ArrayBuffer> {
-  const decompressed = new Blob([raw]).stream().pipeThrough(new DecompressionStream('deflate-raw'));
-  return await new Response(decompressed).arrayBuffer();
+/**
+ * 单个条目解压后的体积上限。
+ *
+ * Workers isolate 的内存是 **128MB**，而 EPUB 解析里还同时持有
+ * 原始 buf（PARSE_SIZE_CAP 允许到 50MB）、封面缓冲等。没有上限时，
+ * 一个 408KB 的 EPUB 就能解压出 400MB —— 膨胀比 1029×，
+ * 直接把 isolate 打爆（Error 1102）。实测这个构造：
+ *
+ *   zip 体积      = 407,999 字节   （远低于 50MB 的 PARSE_SIZE_CAP）
+ *   c.opf 解压后  = 419,430,400 字节
+ *
+ * 注意 PARSE_SIZE_CAP 约束的是**压缩前**的文件大小，管不到解压后 ——
+ * 两者之间差着膨胀比，这就是绕过它的原因。
+ *
+ * 8MB 足够任何 OPF / container.xml（真实文件都在几百 KB 量级），
+ * 同时给封面留出余量（COVER_CAP 也是 8MB）。
+ */
+export const ENTRY_INFLATE_CAP = 8 * 1024 * 1024;
+
+/**
+ * 膨胀比上限：解压后 / 压缩后。
+ *
+ * 正常 EPUB 里图片（JPEG）本来就压缩比很高，但 **文本**（XML/HTML）
+ * 通常在 2–20 倍。取 200 足以覆盖所有真实文件，同时能挡住
+ * 「声明 1MB 实际 200MB」这种畸形条目 —— 那种 ratio 必然远超 200。
+ */
+const MAX_INFLATION_RATIO = 200;
+
+/**
+ * 解压，同时限制输出体积。
+ *
+ * 关键在于**流式限量消费**：逐块读取，一旦超过上限就 `cancel()` 掉，
+ * 而不是让 DecompressionStream 全部物化进内存（原来的写法正是后者）。
+ * 提前 cancel 是这里唯一有意义的防护 —— 数据已经读进来了才检查就晚了。
+ */
+async function inflate(raw: Uint8Array, cap: number): Promise<ArrayBuffer> {
+  const stream = new Blob([raw]).stream().pipeThrough(new DecompressionStream('deflate-raw'));
+  const reader = stream.getReader();
+
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    if (!value) continue;
+    total += value.byteLength;
+    if (total > cap) {
+      // 立刻停止读取：这是唯一能在内存被撑爆之前拦住它的位置
+      await reader.cancel().catch(() => {});
+      throw new ZipReadError(
+        `inflated entry exceeds ${cap} bytes (zip bomb or malformed archive)`,
+      );
+    }
+    chunks.push(value);
+  }
+
+  const out = new Uint8Array(total);
+  let off = 0;
+  for (const c of chunks) {
+    out.set(c, off);
+    off += c.byteLength;
+  }
+  return out.buffer;
 }
 
 /**
@@ -104,14 +164,36 @@ async function inflate(raw: Uint8Array): Promise<ArrayBuffer> {
  * @param buf  整个 zip 的字节
  * @param entries readZipDirectory 的结果
  * @param name  条目名（绝对路径，含前导目录）
+ * @param cap   该条目允许的最大体积（默认 ENTRY_INFLATE_CAP）
  */
 export async function readZipEntry(
   buf: ArrayBuffer,
   entries: Map<string, ZipEntry>,
   name: string,
+  cap: number = ENTRY_INFLATE_CAP,
 ): Promise<ArrayBuffer | null> {
   const entry = entries.get(name);
   if (!entry) return null;
+
+  // ── 声明值预检：在**分配任何内存之前**就能挡掉大部分畸形条目 ──
+  // 中央目录里的 uncompressedSize 是解析器读出来的（zip.ts 里
+  // readZipDirectory 已经解析），此前从未被使用过。它可以撒谎
+  // （比真实值小），所以只能当快速筛子，最终仍以流式上限为准。
+  if (entry.uncompressedSize > cap) {
+    throw new ZipReadError(
+      `entry ${name} declares ${entry.uncompressedSize} bytes, over cap ${cap}`,
+    );
+  }
+  // 膨胀比预检：声明值可疑时直接拒（ratio > 200 的文本条目必然是 bomb）
+  if (
+    entry.compressedSize > 0 &&
+    entry.uncompressedSize / entry.compressedSize > MAX_INFLATION_RATIO
+  ) {
+    throw new ZipReadError(
+      `entry ${name} declares suspicious inflation ratio `
+      + `(${entry.uncompressedSize}/${entry.compressedSize})`,
+    );
+  }
 
   // 本地文件头里再读一次 name/extra 长度（可能与中央目录略有出入），定位数据起点
   const view = new DataView(buf);
@@ -121,14 +203,23 @@ export async function readZipEntry(
   const lhNameLen = view.getUint16(lh + 26, true);
   const lhExtraLen = view.getUint16(lh + 28, true);
   const dataStart = lh + 30 + lhNameLen + lhExtraLen;
+
+  // 越界检查：中央目录里的 compressedSize 可以伪造，直接 new Uint8Array
+  // 会抛 RangeError（不致命，但会走异常路径）。显式挡掉更干净。
+  if (dataStart + entry.compressedSize > buf.byteLength) {
+    throw new ZipReadError(`entry ${name} data range exceeds archive bounds`);
+  }
   const data = new Uint8Array(buf, dataStart, entry.compressedSize);
 
   if (entry.method === 0) {
     // stored：直接拷贝（不共享底层视图，避免调用方持有整个大 buf）
+    if (data.byteLength > cap) {
+      throw new ZipReadError(`stored entry ${name} exceeds cap ${cap}`);
+    }
     return data.slice().buffer;
   }
   if (entry.method === 8) {
-    return await inflate(data);
+    return await inflate(data, cap);
   }
   throw new ZipReadError(`unsupported compression method ${entry.method} for ${name}`);
 }

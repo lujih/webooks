@@ -186,7 +186,15 @@ export async function parseEpub(buf: ArrayBuffer): Promise<EpubMeta | null> {
 
   const containerName = findEntry(entries, ['META-INF/container.xml']);
   if (!containerName) return null;
-  const containerBuf = await readZipEntry(buf, entries, containerName);
+  // 读取失败（含 ZIP bomb 被拒、超出体积上限）一律退回文件名推导，
+  // 不能让异常冒泡打断上传 —— 解析是锦上添花，不是上架的前提。
+  let containerBuf: ArrayBuffer | null;
+  try {
+    containerBuf = await readZipEntry(buf, entries, containerName);
+  } catch (err) {
+    if (err instanceof ZipReadError) return null;
+    throw err;
+  }
   if (!containerBuf) return null;
   const containerXml = new TextDecoder().decode(new Uint8Array(containerBuf));
 
@@ -195,7 +203,13 @@ export async function parseEpub(buf: ArrayBuffer): Promise<EpubMeta | null> {
   if (!opfPath) return null;
   const opfDir = opfPath.includes('/') ? opfPath.slice(0, opfPath.lastIndexOf('/') + 1) : '';
 
-  const opfBuf = await readZipEntry(buf, entries, opfPath);
+  let opfBuf: ArrayBuffer | null;
+  try {
+    opfBuf = await readZipEntry(buf, entries, opfPath);
+  } catch (err) {
+    if (err instanceof ZipReadError) return null;
+    throw err;
+  }
   if (!opfBuf) return null;
   const opf = new TextDecoder().decode(new Uint8Array(opfBuf));
 
@@ -258,7 +272,13 @@ export async function parseEpub(buf: ArrayBuffer): Promise<EpubMeta | null> {
     const href = (itemAttrs.match(/\bhref\s*=\s*"([^"]+)"/i)?.[1]) ?? null;
     if (href) {
       const coverPath = resolveZipPath(opfDir, href);
-      const coverBuf = await readZipEntry(buf, entries, coverPath);
+      // 封面同样可能是一颗 bomb（体积上限 COVER_CAP），解析失败只丢封面
+      let coverBuf: ArrayBuffer | null = null;
+      try {
+        coverBuf = await readZipEntry(buf, entries, coverPath, COVER_CAP);
+      } catch (err) {
+        if (!(err instanceof ZipReadError)) throw err;
+      }
       if (coverBuf && coverBuf.byteLength <= COVER_CAP) {
         // 安全关键：**忽略 OPF 里声明的 media-type**，只按字节魔数判定类型。
         // 声明值由上传者控制，信任它等于允许把 text/html 存进公开桶。
