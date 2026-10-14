@@ -1,0 +1,156 @@
+# Deploy to Cloudflare —— GitHub Actions 方案
+#
+# 为什么用 Actions 而不是 Cloudflare Builds：
+#   Workers Builds 是付费功能（每月 6000 分钟额度），本账号已被限制：
+#   「Your account is blocked from using Workers Builds」
+#   所以走 GitHub Actions —— 免费额度对公开仓库无限。
+#
+# ────────────────────────────────────────────────────────────────────────
+# 需要在仓库 Settings → Secrets and variables → Actions 里配两个 secret：
+#
+#   CLOUDFLARE_API_TOKEN   权限范围见下方注释
+#   CLOUDFLARE_ACCOUNT_ID  Cloudflare 控制台右侧栏可见
+#
+# API Token 需要的权限（Dashboard → My Profile → API Tokens → Create Token
+# → Edit Cloudflare Workers template，再补两项）：
+#
+#   Account  · Workers Scripts    : Edit    部署 Worker
+#   Account  · D1                  : Edit    应用数据库迁移
+#   Account  · Workers R2 Storage  : Edit    读写 R2 绑定
+#   Account  · Account Settings    : Read    wrangler 需要（读 account_id）
+#
+# token 绝不能写进仓库或 workflow 文件，只能放 Actions secrets。
+#
+# 另外建议配一个仓库变量（Secrets and variables → Actions → Variables）：
+#   WORKER_URL = https://你的域名
+# 用于部署后的线上验证（见最后一个 job）。
+# ────────────────────────────────────────────────────────────────────────
+
+name: Deploy to Cloudflare
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      deploy:
+        description: '是否执行部署（关闭则只跑检查）'
+        type: boolean
+        default: true
+
+# 同一时间只允许一个部署，避免并发写 D1
+concurrency:
+  group: deploy-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    name: 类型检查与测试
+    runs-on: ubuntu-latest
+    outputs:
+      deploy_ready: ${{ steps.check.outputs.ready }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+
+      - name: 类型检查
+        run: npm run typecheck
+
+      - name: 单元与端到端测试
+        run: npm test
+
+      - name: 预算模型自检
+        run: npm run budget
+
+      # 没配密钥时不让 CI 变红，而是明确跳过并给出提示。
+      - name: 检查部署密钥是否已配置
+        id: check
+        env:
+          CF_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CF_ACCOUNT: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          if [ -n "$CF_TOKEN" ] && [ -n "$CF_ACCOUNT" ]; then
+            echo "ready=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+            echo "::notice title=跳过部署::未配置 CLOUDFLARE_API_TOKEN / CLOUDFLARE_ACCOUNT_ID。"
+            echo "::notice title=查看说明::配置方法见本文件顶部注释。"
+          fi
+
+  deploy:
+    name: 部署到 Cloudflare
+    needs: verify
+    # 三种跳过：PR、没配密钥、手动触发时明确关掉了部署。
+    # skipped 不会让仓库显示红叉，符合预期。
+    if: >-
+      needs.verify.outputs.deploy_ready == 'true' &&
+      github.event_name != 'pull_request' &&
+      (github.event_name != 'workflow_dispatch' || inputs.deploy)
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+
+      - name: 应用 D1 迁移（必须在部署之前）
+        # 顺序：先迁移、后部署。
+        #
+        # 反过来（deploy && migrate）会出一个真实的故障窗口：
+        #   新代码先上线，但 D1 还没有新列（迁移 0006 的 kind_source）
+        #   → 代码 SELECT kind_source → "no such column" → 站点返回 503
+        #
+        # 先迁移则旧代码根本不用那一列，完全不受影响，零窗口期。
+        # 代价：migrations apply 要求 database_id 已存在 —— wrangler.jsonc 里
+        # 已经写着（b0edfbd4-…），前置条件满足。
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: npx wrangler d1 migrations apply DB --remote
+
+      - name: 部署 Worker
+        uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          packageManager: npm
+          command: deploy
+
+  # 部署后验证「线上真的换了版本」—— 不能只看 CI 变绿。
+  # 这一步曾被长期忽略：测试全绿、deploy 显示 success，线上却还是旧代码，
+  # 而且没有任何地方报错。
+  verify-live:
+    name: 线上版本验证
+    needs: [verify, deploy]
+    if: >-
+      always() &&
+      needs.verify.outputs.deploy_ready == 'true' &&
+      github.event_name != 'pull_request' &&
+      needs.deploy.result == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: 用行为探针确认线上是新代码
+        env:
+          WORKER_URL: ${{ vars.WORKER_URL }}
+        run: |
+          if [ -z "$WORKER_URL" ]; then
+            echo "::warning::未设置仓库变量 WORKER_URL，跳过线上验证"
+            exit 0
+          fi
+          node scripts/verify-deploy.mjs --url "$WORKER_URL"
