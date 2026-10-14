@@ -12,6 +12,9 @@ import {
   mediaKindOfFormat,
 } from '../lib/collections';
 import {
+  adjustBuckets,
+  bucketDeltas,
+  bucketIdentityOf,
   adminListBooks,
   adminTotals,
   deleteBook,
@@ -128,9 +131,19 @@ async function updateBook(env: Env, request: Request): Promise<Response> {
   if (!leafName) return jsonResponse({ error: 'leaf-name-required' }, 400);
 
   const row = await env.DB
-    .prepare(`SELECT id, title, author, format_bucket FROM books WHERE leaf_name = ?`)
+    // title_letter / author_letter 要一并取出：改了书名或作者后需要知道
+    // 旧桶是什么，才能算出该 -1 哪个桶（见 adjustBuckets 的 before 快照）
+    .prepare(`SELECT id, title, author, format_bucket, title_letter, author_letter
+                FROM books WHERE leaf_name = ?`)
     .bind(leafName)
-    .first<{ id: string; title: string; author: string | null; format_bucket: string }>();
+    .first<{
+      id: string;
+      title: string;
+      author: string | null;
+      format_bucket: string;
+      title_letter: string;
+      author_letter: string;
+    }>();
   if (!row) return jsonResponse({ error: 'not-found' }, 404);
 
   // 只更新明确传了的字段；空字符串表示「清空作者」
@@ -153,6 +166,12 @@ async function updateBook(env: Env, request: Request): Promise<Response> {
     }
     patch.push('kind_bucket = ?');
     binds.push(kind);
+    // ⚠️ 人工改过之后必须标记来源（迁移 0006），否则：
+    //   · rebucket?sniff=1 会把它打回按扩展名猜的值
+    //   · 覆盖上传同一个文件也会重置它
+    // 这正是修复前实测到的静默数据丢失。
+    patch.push('kind_source = ?');
+    binds.push('manual');
   }
   if (patch.length === 0) return jsonResponse({ error: 'nothing-to-update' }, 400);
 
@@ -163,7 +182,23 @@ async function updateBook(env: Env, request: Request): Promise<Response> {
     .bind(...binds)
     .run();
 
-  await rebuildBuckets(env.DB);
+  // 增量更新分桶：管理员改了 title/author/format 时，只有受影响的桶要动。
+  // 走全量重算的话每次后台改一个字都要扫一遍 books 全表。
+  await adjustBuckets(
+    env.DB,
+    bucketDeltas(
+      bucketIdentityOf({
+        titleLetter: row.title_letter,
+        authorLetter: row.author_letter,
+        formatBucket: row.format_bucket,
+      }),
+      {
+        titleLetter: patch.includes('title_letter') ? (binds[patch.indexOf('title_letter')] as string) : row.title_letter,
+        authorLetter: patch.includes('author_letter') ? (binds[patch.indexOf('author_letter')] as string) : row.author_letter,
+        formatBucket: patch.includes('format_bucket') ? (binds[patch.indexOf('format_bucket')] as string) : row.format_bucket,
+      },
+    ),
+  );
   // 分类变了，读者侧缓存要立刻失效，否则要等 TTL
   await purgeEntries([
     ['/', 1],
@@ -236,7 +271,10 @@ function securityStatus(env: Env): Array<{ key: string; ok: boolean; label: stri
     env.R2_ACCESS_KEY_ID && env.R2_SECRET_ACCESS_KEY && env.R2_ACCOUNT_ID && env.R2_BUCKET_NAME
   );
   const quota = Number.parseInt(env.DAILY_WRITE_QUOTA ?? '', 10) || 300;
-  const sizeCap = Number.parseInt(env.MAX_UPLOAD_BYTES ?? '', 10) || 209715200;
+  // 与 WebDAV 一致（DEFAULT_MAX_UPLOAD_BYTES = 100 MiB）：reindex 扫的是
+  // 已经落进 R2 的对象，用 WebDAV 的标准判断才不会把「WebDAV 传不进来的
+  // 大文件」当成正常数据静默跳过。
+  const sizeCap = Number.parseInt(env.MAX_UPLOAD_BYTES ?? '', 10) || 100 * 1024 * 1024;
 
   let turnstileHint: string;
   if (hasSiteKey && hasSecret) turnstileHint = '已启用：网页上传需通过验证码';
@@ -321,7 +359,8 @@ async function rebucket(env: Env, url: URL): Promise<Response> {
 
   const { results } = await env.DB
     .prepare(
-      `SELECT id, title, author, format_bucket, title_letter, author_letter, kind_bucket, r2_key
+      `SELECT id, title, author, format_bucket, title_letter, author_letter,
+              kind_bucket, kind_source, r2_key
          FROM books ORDER BY id LIMIT ? OFFSET ?`,
     )
     .bind(limit, offset)
@@ -333,6 +372,8 @@ async function rebucket(env: Env, url: URL): Promise<Response> {
       title_letter: string;
       author_letter: string;
       kind_bucket: string;
+      /** 人工标注的书不得被 sniff 覆盖（迁移 0006） */
+      kind_source: string;
       r2_key: string;
     }>();
 
@@ -341,6 +382,7 @@ async function rebucket(env: Env, url: URL): Promise<Response> {
   const statements: D1PreparedStatement[] = [];
   let changed = 0;
   let resniffed = 0;
+  let skippedManual = 0;
   const moved: Array<{ title: string; from: string; to: string }> = [];
 
   for (const r of rows) {
@@ -354,9 +396,31 @@ async function rebucket(env: Env, url: URL): Promise<Response> {
     // （TXT 没有元数据，但很多中文小说开头就写着「作者：XXX」）。
     if (doSniff) {
       const sniffed = await sniffKindFromBucket(env.BUCKET, r.r2_key, r.format_bucket);
-      // EPUB 的固定版式判断需要解压 OPF，代价高，交给上传路径处理
-      kindBucket = sniffed ?? mediaKindOfFormat(r.format_bucket);
-      if (kindBucket !== r.kind_bucket) resniffed++;
+
+      // ⚠️ 人工标注不得被覆盖（迁移 0006 引入 kind_source）。
+      //
+      // 原实现无条件写 `kindBucket = sniffed ?? mediaKindOfFormat(...)`，
+      // 而这个回退分支**丢弃了原值**。实测：
+      //   人工把扫描漫画 PDF 标成 comic → rebucket?sniff=1 → 变回 ebook
+      //
+      // 为什么人工标注值得保护：内容嗅探在两种真实情况下必然失效 ——
+      //   ① PDF 1.5+ 用对象流把字典压起来 → 标记看不到 → 判不出
+      //   ② 带 OCR 层的扫描漫画引入字体资源 → 「零字体」判据直接崩
+      // 这两类书只能靠人判断，而人判断恰恰是最脆弱的数据。
+      //
+      // README 早就写了「rebucket 默认不动 kind_bucket，比按扩展名猜更权威」，
+      // 但 `?sniff=1` 一直在打破这个承诺，且没有任何警告。
+      if (r.kind_source === 'manual') {
+        // 保持原值，只统计以便管理员知道有多少本被跳过
+        skippedManual++;
+      } else {
+        // EPUB 的固定版式判断需要解压 OPF，代价高，交给上传路径处理
+        const next = sniffed ?? mediaKindOfFormat(r.format_bucket);
+        if (next !== r.kind_bucket) {
+          kindBucket = next;
+          resniffed++;
+        }
+      }
 
       if (!author && r.format_bucket === 'txt') {
         try {
@@ -414,6 +478,10 @@ async function rebucket(env: Env, url: URL): Promise<Response> {
     scanned: rows.length,
     changed,
     resniffed,
+    // 跳过了多少本人工标注的书。暴露出来而不是静默跳过 ——
+    // 否则管理员会以为「跑了一次 sniff 就全都重新判定过了」，
+    // 实际上有一部分书根本没被碰。
+    skippedManual,
     sniffed: doSniff,
     offset,
     nextOffset: rows.length === limit ? offset + limit : null,
