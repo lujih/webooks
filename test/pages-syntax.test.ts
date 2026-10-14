@@ -222,3 +222,76 @@ describe('页面脚本引用的元素必须真实存在', () => {
     expect(script).toMatch(/页面缺少元素/);
   });
 });
+
+describe('上传页：可交互元素不能被拖放区吞掉点击', () => {
+  /**
+   * 真实 bug：留名输入框被放在 #drop 内部。
+   *
+   * #drop 是一整块 role="button" 区域，onclick 触发 fileInput.click()。
+   * 于是「点输入框准备打字」→ 弹出文件选择器 → 一个字都输不进去。
+   *
+   * 这个 bug 的三个特点让它极易复发：
+   *   · 只在真浏览器里看得见（DOM 结构完全合法）
+   *   · TypeScript / 语法检查 / 端到端测试全都不报错
+   *   · 加新输入框的人不会想到「这里不能放东西」
+   *
+   * 所以用两条断言盯住：**结构**上不能在里面，**代码**上要有兜底。
+   */
+  async function uploadPage(): Promise<string> {
+    return (await SELF.fetch(`${ORIGIN}/upload`, { headers: { accept: 'text/html' } })).text();
+  }
+
+  it('留名输入框在 #drop 之外', async () => {
+    const html = await uploadPage();
+    const dropStart = html.indexOf('id="drop"');
+    expect(dropStart).toBeGreaterThan(-1);
+
+    // 用 div 深度算出 #drop 的**真实**结束位置。
+    // ⚠️ 不能用固定字符窗口：#drop 有 400 多字符，但 creditbar 若在它
+    //   内部，靠窗也会「看起来在外面」—— 曾经写出过这种假阴性断言。
+    const tagRe = /<div\b|<\/div>/g;
+    // 从 #drop 的**开标签**开始数（id="drop" 前面就是那个 <div）
+    tagRe.lastIndex = html.lastIndexOf('<div', dropStart);
+    let depth = 0;
+    let dropEnd = -1;
+    for (let m = tagRe.exec(html); m !== null; m = tagRe.exec(html)) {
+      depth += m[0] === '</div>' ? -1 : 1;
+      if (depth === 0) { dropEnd = m.index; break; }
+    }
+    expect(dropEnd, '没能定位 #drop 的结束位置').toBeGreaterThan(dropStart);
+
+    const dropBlock = html.slice(dropStart, dropEnd);
+    expect(
+      dropBlock.includes('creditbar') || dropBlock.includes('id="credit"'),
+      '留名输入框又在 #drop 里了 —— 点它会弹文件选择器',
+    ).toBe(false);
+    expect(html.indexOf('id="credit"')).toBeGreaterThan(dropEnd);
+  });
+
+  it('#drop 的点击处理会跳过内部的可交互元素（兜底）', async () => {
+    const html = await uploadPage();
+    const script = inlineScripts(html).join('\n');
+    // 有结构性兜底：命中 input/button/select/textarea/a/label 就不触发
+    expect(script).toMatch(/closest\(\s*INTERACTIVE\s*\)/);
+    expect(script).toMatch(/INTERACTIVE\s*=\s*'[^']*input[^']*'/);
+    // 键盘路径也要挡：焦点在内部控件时 Enter 归那个控件
+    expect(script).toMatch(/keydown[\s\S]{0,400}e\.target\s*!==\s*drop/);
+  });
+
+  it('#drop 仍然是可点击打开文件选择器（修完没把功能改坏）', async () => {
+    const html = await uploadPage();
+    const script = inlineScripts(html).join('\n');
+    // 普通点击（目标是 drop 自身或其非交互子元素）仍然要打开选择器
+    expect(script).toMatch(/drop\.onclick[\s\S]{0,300}fileInput\.click\(\)/);
+    // 键盘 Enter/Space 仍然可用（role="button" 的可访问性要求）
+    expect(script).toMatch(/key === 'Enter'/);
+  });
+
+  it('留名输入框本身是可聚焦的文本框', async () => {
+    const html = await uploadPage();
+    const input = html.match(/<input[^>]*id="credit"[^>]*>/)?.[0] ?? '';
+    expect(input, '找不到留名输入框').toContain('id="credit"');
+    expect(input).toContain('maxlength="32"');
+    expect(input).not.toContain('disabled');
+  });
+});

@@ -49,17 +49,20 @@ ${themeCss()}
   .droptitle a{color:var(--glow);border-bottom:1px solid var(--glow);text-decoration:none}
   .droptitle a:hover{color:#ffc978}
   /* 留名行：放在拖放区下方，明确是「可选的署名」而不是上传的必填项 */
+  /* 留名行：在拖放区**外面**，独立成一条。
+     视觉上刻意弱于拖放区（无虚线大边框、字号更小）——
+     它是可选的附注，不是主操作。 */
   .creditbar{
     display:flex;align-items:center;gap:10px;flex-wrap:wrap;
-    margin:var(--s3) 0 0;padding:11px 14px;
-    border:1px dashed var(--line);border-radius:10px;
-    background:rgba(255,180,77,.03);
+    margin:var(--s3) 0 0;padding:10px 14px;
+    border:1px solid var(--line-soft);border-radius:var(--r1);
+    background:rgba(0,0,0,.18);
   }
   .creditbar label{font-size:.86rem;color:var(--paper-dim);white-space:nowrap}
   .creditbar input{
-    flex:1;min-width:160px;padding:7px 11px;font:inherit;font-size:.92rem;
+    flex:1;min-width:150px;padding:8px 11px;font:inherit;font-size:.92rem;
     color:var(--paper);background:var(--ink-2);
-    border:1px solid var(--line);border-radius:7px;
+    border:1px solid var(--line);border-radius:var(--r1);
   }
   .creditbar input:focus{outline:2px solid var(--glow);outline-offset:1px}
   .creditbar .tip{font-size:.8rem;color:var(--paper-dim);opacity:.75}
@@ -147,13 +150,20 @@ ${themeCss()}
     <div class="droptitle">把书籍文件拖到这里，或 <a href="#" id="pick">点此选择</a></div>
     <div class="hint">支持一次多选、连续拖入；只会接受电子书与漫画格式</div>
     <input type="file" id="file" multiple accept="${accept}">
+  </div>
 
-    <!-- 留名：可选。留空统一记作「雷锋」（见 migrations/0007 的说明） -->
-    <div class="creditbar">
-      <label for="credit">留个名</label>
-      <input id="credit" maxlength="32" placeholder="留空记作「雷锋」" autocomplete="nickname">
-      <span class="tip">会显示在书卡片上</span>
-    </div>
+  <!-- 留名：可选。留空统一记作「雷锋」（见 migrations/0007 的说明）
+
+       ⚠️ 必须在 #drop **外面**。#drop 是 role="button" 的整块区域，
+          任何落在它内部的点击都会打开文件选择器 ——
+          而「在输入框里打字」正好是一次点击。
+          （曾经放在 #drop 内部，于是点输入框就弹文件框，一个字都输不进去。
+            这个 bug 只在真浏览器里看得见；结构测试查不出来，
+            所以下面 pages-syntax.test.ts 里有一条断言盯着它。） -->
+  <div class="creditbar reveal" style="animation-delay:.22s">
+    <label for="credit">留个名</label>
+    <input id="credit" maxlength="32" placeholder="留空记作「雷锋」" autocomplete="nickname">
+    <span class="tip">会显示在书卡片上；留空统一记作「雷锋」</span>
   </div>
 
   <div class="eligible reveal" style="animation-delay:.2s">
@@ -204,9 +214,24 @@ let queue = [];
 let running = false;
 
 const drop = $('drop'), fileInput = $('file');
-drop.onclick = () => fileInput.click();
-// 键盘可达：#drop 是 role="button" tabindex="0"，必须支持 Enter/Space
+// 第二道防线：即使将来有人把这个元素挪回 #drop 内部，点它也不会弹文件框。
+//
+// #drop 是一整块 role="button" 区域，onclick 会触发 fileInput.click()。
+// 任何**可交互**的元素落在它内部都会被吞掉这次点击 —— 输入框、按钮、
+// 甚至复选框。真实的 bug：留名输入框曾放在 #drop 里，于是点它就弹文件
+// 选择器，一个字都输不进去。
+//
+// 为什么保留 stopPropagation 而不是只靠 DOM 结构：
+//   · 结构正确是「约定」，约定会被下一个人打破
+//   · 这里成本极低（一行），而失效后果是「输入框完全不能用」
+const INTERACTIVE = 'input,button,select,textarea,a,label,[contenteditable]';
+drop.onclick = (e) => {
+  if (e.target && e.target.closest && e.target.closest(INTERACTIVE)) return;
+  fileInput.click();
+};
+// 键盘路径同理：焦点在内部控件上时，Enter 应交给那个控件
 drop.addEventListener('keydown', (e) => {
+  if (e.target !== drop) return;
   if (e.key === 'Enter' || e.key === ' ' || e.key === 'Spacebar') { e.preventDefault(); fileInput.click(); }
 });
 $('pick').onclick = (e) => { e.stopPropagation(); fileInput.click(); };
