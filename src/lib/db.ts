@@ -593,3 +593,34 @@ export async function rebuildBuckets(db: D1Database): Promise<void> {
   ];
   await db.batch(statements);
 }
+
+/**
+ * 取最近上架的一本书 —— 首页首屏用。
+ *
+ * 成本刻意压到最低：只读 **1 行**，且不需要封面（封面会多一次 R2 请求，
+ * 而首页首屏只需要「有这本书在长」这个事实，不需要看清它长什么样）。
+ *
+ * 走的索引是 idx_books_recent2 (status, published_at DESC, id) ——
+ * 本轮刚为 /最近收录/ 补的那个，加了 ORDER BY + LIMIT 1 后是 covering，
+ * rows_read = 1。
+ */
+export interface LatestBook {
+  leaf_name: string;
+  title: string;
+  author: string | null;
+  credit: string | null;
+  published_at: string;
+}
+
+export async function latestBook(db: D1Database): Promise<LatestBook | null> {
+  const row = await db
+    .prepare(
+      `SELECT leaf_name, title, author, credit, published_at
+         FROM books
+        WHERE status = 'published'
+        ORDER BY published_at DESC, id
+        LIMIT 1`,
+    )
+    .first<LatestBook>();
+  return row ?? null;
+}

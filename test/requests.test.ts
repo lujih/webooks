@@ -246,13 +246,18 @@ describe('XSS 防线', () => {
       .first<{ title: string }>();
     expect(row?.title).toBe('<img src=x onerror=alert(1)>');
 
-    // 页面脚本里必须有 esc()，且所有插入点都走它
+    // 页面脚本必须用 textContent 渲染，而不是 innerHTML 拼字符串。
+    //
+    // ⚠️ 这是比上一版更强的防线：上一版是「innerHTML + 记得调 esc()」，
+    //   忘记调用就是 XSS。现在根本没有 esc() 这个可以被忘记的东西。
     const page = await SELF.fetch(`${ORIGIN}/requests`);
     const html = await page.text();
-    expect(html).toContain('function esc(s)');
-    // 列表渲染处必须用 esc(...) 而不是直接拼字符串
-    expect(html).toContain("esc(r.title)");
-    expect(html).toContain("esc(r.author)");
+    const script = html.match(/<script>([\s\S]*?)<\/script>/)![1];
+    expect(script).not.toMatch(/innerHTML\s*=[\s\S]{0,200}esc\(/);
+    expect(script).toContain('title.textContent = r.title');
+    expect(script).toContain('author.textContent = r.author');
+    // 旧的内联拼接写法不该还在
+    expect(script).not.toContain('<div class="rtitle">');
   });
 
   it('求书墙页面本身返回 200 且是 HTML', async () => {

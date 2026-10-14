@@ -64,8 +64,10 @@ ${themeCss()}
   td.name{word-break:break-word;max-width:22rem}
   td.name .t{font-family:var(--serif)}
   td.name .a{color:var(--paper-dim);font-size:.78rem}
+  /* 格式标签：方角（--r1），与全站方正语汇一致。
+     胶囊是 badge 的默认形状，但这里它不承担「可点」的暗示。 */
   .pill{display:inline-block;font-family:var(--mono);font-size:.68rem;letter-spacing:.04em;
-    padding:.1rem .4rem;border-radius:999px;border:1px solid var(--line);color:var(--glow)}
+    padding:.1rem .4rem;border-radius:var(--r1);border:1px solid var(--line-soft);color:var(--glow)}
   .muted{color:var(--paper-dim);font-size:.78rem;font-family:var(--mono)}
   .rowsel{width:1.5rem}
   input[type=checkbox]{width:1rem;height:1rem;accent-color:var(--glow);cursor:pointer}

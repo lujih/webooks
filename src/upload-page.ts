@@ -47,8 +47,7 @@ ${themeCss()}
   .dropmark{color:var(--glow);opacity:.85;margin-bottom:var(--s3)}
   .droptitle{font-family:var(--serif);font-size:1.15rem;letter-spacing:.05em}
   .droptitle a{color:var(--glow);border-bottom:1px solid var(--glow);text-decoration:none}
-  .droptitle a:hover{color:#ffc978}
-  /* 留名行：放在拖放区下方，明确是「可选的署名」而不是上传的必填项 */
+  .droptitle a:hover{color:var(--glow-bright)}
   /* 留名行：在拖放区**外面**，独立成一条。
      视觉上刻意弱于拖放区（无虚线大边框、字号更小）——
      它是可选的附注，不是主操作。 */

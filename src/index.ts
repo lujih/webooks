@@ -18,6 +18,7 @@ import { requestsHtml } from './requests-page';
 import { settings, type Env, type Settings } from './config';
 import { textResponse, withSecurityHeaders } from './lib/http';
 import { indexHtml } from './home-page';
+import { latestBook } from './lib/db';
 import { adminHtml } from './admin-page';
 import { uploadHtml } from './upload-page';
 import { handleDav } from './webdav';
@@ -94,7 +95,9 @@ async function route(request: Request, env: Env): Promise<Response> {
     }
 
     if (path === '/' || path === '') {
-      return new Response(indexHtml(cfg.mountPath, cfg.r2PublicBase), {
+      // 首屏那张「活书脊」要读 1 行 —— 只在首页这一次请求里，不缓存。
+      const latest = await latestBook(env.DB);
+      return new Response(indexHtml(cfg.mountPath, cfg.r2PublicBase, latest), {
         status: 200,
         headers: {
           'content-type': 'text/html; charset=utf-8',

@@ -239,11 +239,15 @@ ${themeCss()}
     word-break:break-word;
   }
   .cauthor{font-size:.8rem;color:var(--paper-dim);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-  /* 署名：刻意做得比作者更淡 —— 它是「谁传的」，不是作品信息 */
+  /* 署名：刻意做得比作者更淡 —— 它是「谁传的」，不是作品信息。
+
+     用方角（--r1）而不是胶囊：整个站是纸与木的方正语汇，
+     胶囊只留给两个地方 —— 上传进度条（4px 高，胶囊是唯一合理形状）
+     与首页的集体署名行。 */
   .ccredit{
-    display:inline-block;margin-top:.25rem;padding:1px 7px;font-size:.72rem;
+    display:inline-block;margin-top:.3rem;padding:0 .4rem;font-size:.72rem;
     color:var(--glow);background:rgba(255,180,77,.09);
-    border:1px solid rgba(255,180,77,.28);border-radius:999px;
+    border-left:2px solid rgba(255,180,77,.45);
     max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
   }
   .cmeta{font-size:.75rem;color:var(--paper-dim);font-family:var(--mono);letter-spacing:.02em}

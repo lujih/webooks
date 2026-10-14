@@ -28,6 +28,7 @@ export function themeCss(): string {
     --paper-dim:#cfc4ad;    /* 旧纸（次要文字） ≈8:1 */
     --glow:#ffb44d;         /* 琥珀烛光（强调） */
     --glow-deep:#d97a1a;    /* 深琥珀（描边/阴影） */
+    --glow-bright:#ffc978;  /* 烛光变亮（hover）—— 之前 4 处出现了 3 个不同的值 */
     --line:rgba(255,180,77,.5);       /* 交互控件/卡片边框 —— 3.3:1，满足 WCAG 1.4.11 */
     --line-soft:rgba(255,180,77,.18); /* 纯装饰分隔线（不承载识别功能） */
     --ok:#7dc98f;

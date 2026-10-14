@@ -295,3 +295,144 @@ describe('上传页：可交互元素不能被拖放区吞掉点击', () => {
     expect(input).not.toContain('disabled');
   });
 });
+
+describe('首屏那张「活书脊」', () => {
+  const SAMPLE = {
+    leaf_name: '搜神记.epub',
+    title: '搜神记',
+    author: '干宝',
+    credit: '雷锋',
+    published_at: '2026-10-14T11:22:33.000Z',
+  };
+
+  it('有书时渲染，空书库时不渲染', async () => {
+    const { indexHtml } = await import('../src/home-page');
+    const withBook = indexHtml('/dav', null, SAMPLE);
+    const noBook = indexHtml('/dav', null, null);
+    expect(withBook).toContain('class="fresh"');
+    expect(withBook).toContain('搜神记');
+    // 一个没有书的书库不该假装有 —— 整块不渲染
+    expect(noBook).not.toContain('class="fresh"');
+  });
+
+  it('链接指向那本书的真实位置，且没有双斜杠', async () => {
+    const { indexHtml } = await import('../src/home-page');
+    const html = indexHtml('/dav', null, SAMPLE);
+    const href = html.match(/class="fresh" href="([^"]+)"/)![1]!;
+    // encodeHref 已经返回带前导斜杠的路径；再拼一次就是双斜杠坏链
+    expect(href).not.toContain('//');
+    expect(decodeURIComponent(href)).toBe('/dav/最近收录/搜神记.epub');
+  });
+
+  it('中文路径被百分号编码（文件名可能含 # 等会截断 URL 的字符）', async () => {
+    const { indexHtml } = await import('../src/home-page');
+    const html = indexHtml('/dav', null, { ...SAMPLE, leaf_name: 'C# 程序设计#2.epub' });
+    const href = html.match(/class="fresh" href="([^"]+)"/)![1]!;
+    // 裸的 # 会把后面的内容当成 fragment
+    expect(href).not.toContain('#');
+    expect(href).toContain('%23');
+  });
+
+  it('署名缺失时回落到「雷锋」，不显示空', async () => {
+    const { indexHtml } = await import('../src/home-page');
+    const html = indexHtml('/dav', null, { ...SAMPLE, credit: null });
+    expect(html).toContain('雷锋 传来');
+    expect(html).not.toMatch(/undefined|NaN/);
+  });
+
+  it('书名/作者被转义（XSS 防线）', async () => {
+    const { indexHtml } = await import('../src/home-page');
+    const html = indexHtml('/dav', null, {
+      ...SAMPLE,
+      title: '<img src=x onerror=alert(1)>',
+      author: '<script>bad()</script>',
+    });
+    expect(html).not.toContain('<img src=x');
+    expect(html).not.toContain('<script>bad()');
+    expect(html).toContain('&lt;img');
+  });
+
+  it('没有作者时给一句人话而不是留空', async () => {
+    const { indexHtml } = await import('../src/home-page');
+    const html = indexHtml('/dav', null, { ...SAMPLE, author: null });
+    expect(html).toContain('未署名作者');
+  });
+
+  it('线上首页确实带上了这本书（端到端）', async () => {
+    const res = await SELF.fetch(`${ORIGIN}/`);
+    const html = await res.text();
+    // 书库里有书时，首屏就该有这张卡；没有时也**不能报错**
+    expect(res.status).toBe(200);
+    if (html.includes('class="fresh"')) {
+      expect(html).toMatch(/class="freshtitle">[^<]+</);
+    }
+  });
+});
+
+describe('设计系统一致性', () => {
+  /**
+   * 这一组断言挡的是「某个页面自成一套 CSS」——
+   * 上一版求书墙就是这样变成了另一个产品：自造 .wrap/header/panel/button、
+   * 19 个硬编码圆角、max-width 960px（全局是 56rem）。
+   *
+   * 页面模块各自写 CSS，不可能靠人记住「用 token 而非硬编码」。
+   * 只能测。
+   */
+  const PAGES: ReadonlyArray<readonly [string, string]> = [
+    ['/', 'home'],
+    ['/requests', 'requests'],
+    ['/upload', 'upload'],
+    ['/admin', 'admin'],
+    [`/dav/${encodeURIComponent('最近收录')}`, 'browse'],
+  ];
+
+  for (const [path, label] of PAGES) {
+    it(`${label} 页：圆角走 --r1/2/3，不硬编码 px`, async () => {
+      const html = await (
+        await SELF.fetch(`${ORIGIN}${path}`, { headers: { accept: 'text/html' } })
+      ).text();
+      const css = html.match(/<style>([\s\S]*?)<\/style>/)![1]!;
+
+      // 胶囊（999px）只在两种情况下是**对的**：
+      //   · theme 的 .lamps i（烛光小圆点）
+      //   · 4px 高以内的进度条 —— 这么窄的条，胶囊是唯一说得通的形状
+      // 其余地方出现大圆角 = badge/卡片的默认语汇，与本站的方正不符。
+      const ALLOWED = /body::|\.lamps|\.qbar|\.qbar2/i;
+      const pageCss = css
+        .split('}')
+        .filter((b) => !ALLOWED.test(b))
+        .join('}');
+      const bad = [...pageCss.matchAll(/border-radius:\s*(\d+(?:\.\d+)?)px/g)]
+        .map((m) => Number(m[1]))
+        .filter((n) => n > 12);
+      expect(
+        bad,
+        `${path} 里有硬编码的大圆角 ${bad.join('/')}px —— 应该用 --r1/2/3`,
+      ).toEqual([]);
+    });
+
+    it(`${label} 页：没有自造 .wrap（宽度必须来自 theme）`, async () => {
+      const html = await (
+        await SELF.fetch(`${ORIGIN}${path}`, { headers: { accept: 'text/html' } })
+      ).text();
+      const css = html.match(/<style>([\s\S]*?)<\/style>/)![1]!;
+      // 允许 theme 里的那个 .wrap，页面自己再定义一个就是自造
+      const wraps = [...css.matchAll(/(^|\})\s*\.wrap\s*\{/g)];
+      expect(wraps.length, `${path} 重复定义了 .wrap`).toBeLessThanOrEqual(1);
+    });
+  }
+
+  it('五个页面共用同一份 .wrap 宽度（不该各写各的）', async () => {
+    const widths = new Set<string>();
+    for (const [path] of [
+      ['/'], ['/requests'], ['/upload'], ['/admin'],
+    ] as ReadonlyArray<readonly [string]>) {
+      const html = await (
+        await SELF.fetch(`${ORIGIN}${path}`, { headers: { accept: 'text/html' } })
+      ).text();
+      const m = html.match(/\.wrap\{[^}]*max-width:\s*([^;}]+)/);
+      if (m) widths.add(m[1]!.trim());
+    }
+    expect(widths.size, `不同的内容宽度：${[...widths].join(' / ')}`).toBeLessThanOrEqual(1);
+  });
+});

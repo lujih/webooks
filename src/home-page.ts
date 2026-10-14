@@ -15,8 +15,57 @@
 
 import { themeCss } from './lib/theme';
 import { collectionSegment, type CollectionId } from './lib/collections';
+import type { LatestBook } from './lib/db';
+import { encodeHref } from './lib/xml';
 
-export function indexHtml(mountPath: string, r2PublicBase: string | null): string {
+function esc(s: string): string {
+  return s.replace(/[&<>"']/g, (c) =>
+    ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c] as string,
+  );
+}
+
+/**
+ * 首屏那张「活书脊」。
+ *
+ * 为什么用它当首屏而不是一句宣传语：
+ * 这个站点最不寻常的事实是**它自己在长大** —— 任何人随时能放一本书
+ * 进来，没有审核、没有门槛。以前的首屏写「一间不熄灯的公共书库」，
+ * 那是在**描述**书库；这张卡片是在**展示**它，而且明天就会不一样。
+ *
+ * 它也是全页唯一一个会变的元素 —— 其余部分（书架、榜单、使用方式）
+ * 都是安静的辅助信息。注意力预算都花在这里。
+ */
+function freshShelf(book: LatestBook, mountPath: string): string {
+  // ⚠️ encodeHref 返回的是**带前导斜杠**的完整路径，不能再拼一个 '/' ——
+  //   否则会产出 `/最近收录//搜神记.epub` 这种双斜杠链接（能跳转，但是坏链）。
+  const href = esc(
+    `${mountPath}/${collectionSegment('recent')}${encodeHref(`/${book.leaf_name}`)}`,
+  );
+  const credit = book.credit || '雷锋';
+  const when = book.published_at.slice(0, 10);
+  return `
+  <a class="fresh" href="${href}" style="animation-delay:.15s">
+    <span class="freshspine" aria-hidden="true"></span>
+    <span class="freshbody">
+      <span class="freshlabel">最近上架</span>
+      <span class="freshtitle">${esc(book.title)}</span>
+      <span class="freshmeta">${book.author ? esc(book.author) : '未署名作者'} · ${esc(credit)} 传来 · ${esc(when)}</span>
+    </span>
+  </a>`;
+}
+
+/**
+ * 首页 HTML。
+ *
+ * `latest` 是最近上架的那本书（首屏那张「活书脊」）。
+ * 由调用方传入而不是在这里查 —— 页面模块保持纯函数，
+ * 渲染与取数分开，测试时也不需要 D1。
+ */
+export function indexHtml(
+  mountPath: string,
+  r2PublicBase: string | null,
+  latest: LatestBook | null,
+): string {
   const mount = `${mountPath}/`;
   // 集合路径段用中文：WebDAV 客户端与浏览器都以「路径末段」作为文件夹显示名，
   // 所以想让它们显示中文，路径本身就必须是中文（displayname 属性很多客户端不读）。
@@ -28,6 +77,10 @@ export function indexHtml(mountPath: string, r2PublicBase: string | null): strin
     { path: `${mount}${seg('author')}/`, title: '按作者', sub: '寻找同一位作者', icon: '著' },
     { path: `${mount}${seg('format')}/`, title: '按格式', sub: 'EPUB / PDF / CBZ…', icon: '式' },
   ];
+  // 首屏那张「活书脊」：最近上架的那一本。
+  // 取不到（书库为空）时整块不渲染 —— 一个没有书的书库不该假装有。
+  const freshHtml = latest ? freshShelf(latest, mountPath) : '';
+
   const shelfHtml = shelves
     .map((s, i) => {
       return `
@@ -51,12 +104,54 @@ export function indexHtml(mountPath: string, r2PublicBase: string | null): strin
 <meta name="description" content="webooks —— 架在 Cloudflare Workers Free + R2 上的开放 WebDAV 电子书库。任何人都可以上传、浏览、下载。">
 <style>
 ${themeCss()}
-  /* 顶栏 */
-  header{display:flex;align-items:baseline;gap:.8rem;flex-wrap:wrap}
-  .mark{font-family:var(--serif);font-size:1.15rem;letter-spacing:.35em;color:var(--glow)}
-  .mark b{font-weight:400}
-  .tag{font-size:.72rem;letter-spacing:.18em;color:var(--paper-dim);text-transform:uppercase}
-  .est{margin-left:auto;font-family:var(--serif);font-size:.72rem;color:var(--paper-dim);letter-spacing:.1em}
+  /* 顶栏：与其余页面统一用 .bar-head（browse / upload / admin / requests）
+     —— 上一版这里自成一套 .mark/.tag/.est，导致同一站点有两种页头。 */
+  .bar-head{display:flex;align-items:baseline;gap:var(--s3);flex-wrap:wrap;margin-bottom:var(--s5)}
+  .mk{font-family:var(--serif);font-size:1.05rem;letter-spacing:.3em;color:var(--glow)}
+  .mk a{color:inherit;text-decoration:none}
+  /* 站点的一句自我说明，不是 eyebrow 标签。
+     刻意**不加** uppercase + 大 letter-spacing ——
+     那是模板腔（每个标题上面都顶一个 ALL-CAPS 小标签）。 */
+  .tag{font-size:.82rem;color:var(--paper-dim)}
+  .back{margin-left:auto;font-size:.8rem;font-family:var(--serif);letter-spacing:.08em}
+
+  /* ── 首屏那张「活书脊」──
+     全页唯一的记忆点。它的高度（约 120px）刻意略大于 h1，
+     但字号更小 —— 用面积而不是字号来建立优先级，这样 h1 仍是标题。
+
+     书脊用纯 CSS 画：一道 8px 宽的竖条 + 上下两道细边。
+     不画完整书封 —— 那是浏览页的活（那里有真实封面）。 */
+  .fresh{
+    display:flex;align-items:stretch;gap:var(--s4);
+    max-width:34rem;margin:var(--s5) 0 0;
+    padding:var(--s3) var(--s4) var(--s3) var(--s3);
+    text-decoration:none;color:var(--paper);
+    border:1px solid var(--line-soft);
+    border-radius:var(--r1);
+    background:linear-gradient(100deg,rgba(255,180,77,.05) 0%,transparent 55%);
+    position:relative;overflow:hidden;
+    opacity:0;animation:up .7s var(--ease) forwards;
+    transition:border-color var(--dur) var(--ease),background var(--dur) var(--ease);
+  }
+  .fresh:hover,.fresh:focus-visible{
+    border-color:var(--line);background:linear-gradient(100deg,rgba(255,180,77,.1) 0%,transparent 60%);
+    text-decoration:none;color:var(--paper);
+  }
+  /* 书脊：一条实心竖条，上下留出装订线的细边 */
+  .freshspine{
+    flex:0 0 auto;width:8px;border-radius:2px;
+    background:linear-gradient(180deg,var(--glow) 0%,var(--glow-deep) 100%);
+    box-shadow:0 0 14px rgba(255,180,77,.35);
+  }
+  .freshbody{display:flex;flex-direction:column;gap:.2rem;min-width:0}
+  /* 「最近上架」是这条信息的**类别**，不是标题 —— 用最小号的次要色，
+     不用 eyebrow 标签的全大写+大字距那套模板腔。 */
+  .freshlabel{font-size:.72rem;color:var(--paper-dim);letter-spacing:.14em}
+  .freshtitle{
+    font-family:var(--serif);font-size:1.35rem;letter-spacing:.02em;
+    line-height:1.3;word-break:break-word;
+  }
+  .freshmeta{font-size:.8rem;color:var(--paper-dim);font-variant-numeric:tabular-nums}
 
   /* ── 主标题 ── */
   .hero{margin:3rem 0 1rem}
@@ -68,7 +163,9 @@ ${themeCss()}
     letter-spacing:.02em;
     color:var(--paper);
   }
-  .hero h1 .glow{color:var(--glow)}
+  /* ⚠️ 这里刻意**没有**「只给一个词上色」的规则。
+     「一间<span class=glow>不熄灯</span>的公共书库」是最典型的模板腔 ——
+     加粗一个词/短语来制造强调。中文标题靠**字号与留白**建立层级就够了。 */
   .hero p{margin-top:1.1rem;max-width:34rem;color:var(--paper-dim);font-size:1rem;line-height:1.85}
   .hero p b{color:var(--paper);font-weight:600}
 
@@ -87,7 +184,7 @@ ${themeCss()}
     position:relative;
   }
   .seal::after{content:"";position:absolute;inset:3px;border:1px solid rgba(20,15,10,.35);border-radius:1px;pointer-events:none}
-  .seal:hover{transform:rotate(0deg) translateY(-2px);background:#ffc36d;box-shadow:0 0 0 1px var(--glow-deep),0 10px 34px rgba(255,150,40,.42)}
+  .seal:hover{transform:rotate(0deg) translateY(-2px);background:var(--glow-bright);box-shadow:0 0 0 1px var(--glow-deep),0 10px 34px rgba(255,150,40,.42)}
   .seal .dot{width:7px;height:7px;border-radius:50%;background:var(--ink);opacity:.7}
   .ghost{
     display:inline-flex;align-items:center;gap:.5rem;
@@ -214,7 +311,7 @@ ${themeCss()}
     font-size:.8rem;color:var(--glow);text-decoration:none;
     border-bottom:1px solid var(--line);white-space:nowrap;
   }
-  .roll-list li.collective .join:hover{color:#ffc978;border-color:var(--glow)}
+  .roll-list li.collective .join:hover{color:var(--glow-bright);border-color:var(--glow)}
   /* 个人条目那一行的「留名」链接，弱化到几乎看不见 */
   .roll-list li.personal .n{color:var(--paper-dim);opacity:.75}
 
@@ -256,16 +353,17 @@ ${themeCss()}
 <body>
 <div class="wrap">
 
-  <header class="reveal" style="animation-delay:.05s">
-    <div class="mark"><b>we·books</b></div>
-    <div class="tag">public ebook library</div>
-    <div class="est">开架 · 免审 · 匿名</div>
-  </header>
+  <div class="bar-head reveal" style="animation-delay:.03s">
+    <span class="mk"><a href="/">we·books</a></span>
+    <span class="tag">公共电子书库 · 开架免审 · 匿名</span>
+  </div>
 
-  <section class="hero reveal" style="animation-delay:.15s">
-    <h1>一间<span class="glow">不熄灯</span>的<br>公共书库</h1>
-    <p>架在 Cloudflare Workers + R2 上的开放电子书库。<b>任何人都能上传、浏览、下载</b> —— 无需注册、无需密码，WebDAV / 网页 / 阅读器直连。</p>
+  <section class="hero reveal" style="animation-delay:.1s">
+    <h1>一间不熄灯的<br>公共书库</h1>
+    <p>任何人随时能放一本书进来，<b>不需要注册，也不用等审核</b>。
+       浏览器直接看，或用 WebDAV 客户端连上。</p>
   </section>
+${freshHtml}
 
   <div class="cta reveal" style="animation-delay:.3s">
     <a class="seal" href="/upload"><span class="dot"></span>上架一本书</a>
