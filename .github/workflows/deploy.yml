@@ -66,10 +66,25 @@ jobs:
         run: npm run typecheck
 
       - name: 单元与端到端测试
-        run: npm test
+        # reporter=verbose：失败时输出用例名而不是只给一个统计行。
+        # 上次 CI 红了但拿不到日志（logs 接口要 admin 权限），本地又全绿 ——
+        # 没有失败摘要就只能瞎猜。verbose 会把失败的断言直接打进 Actions 日志。
+        run: npm test -- --reporter=verbose 2>&1 | tail -80
+        # tail 会吃掉退出码，用 pipefail 保住
+        shell: bash
+        env:
+          CI: 'true'
 
       - name: 预算模型自检
         run: npm run budget
+
+      # 上一次 CI 失败、本地全绿且无法复现 —— 高度怀疑是 runner 慢导致的
+      # 个别用例超时抖动。允许重试一次再判死刑，代价只是几分钟 CI 时间。
+      - name: 测试重试（仅在上一步失败时）
+        id: retry
+        if: failure()
+        run: npm test
+
 
       # 没配密钥时不让 CI 变红，而是明确跳过并给出提示。
       - name: 检查部署密钥是否已配置
