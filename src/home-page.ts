@@ -188,6 +188,36 @@ ${themeCss()}
   }
   .roll-list .n::before{content:"· ";opacity:.5}
 
+  /* ── 雷锋：集体署名，单独一行，跨整行 ──
+     它是「所有没有留名的人」的共同署名，必须永远在第一位。
+     视觉上刻意与个人条目分开：
+       · 独占一行（其他人是横向密排的）
+       · 纸色而不是纸色加粗 —— 它不是「某个人」，不能被当成一个人看
+       · 用「人人可署名」说明它的性质，而不是只写本数
+     琥珀只用在「加入」链接上，那是唯一可点的地方。 */
+  .roll-list li.collective{
+    grid-column:1/-1;margin-right:0;padding:.7rem 0 .65rem;
+    border-bottom:1px solid var(--line);
+  }
+  .roll-list li.collective .who{
+    color:var(--paper);letter-spacing:.16em;
+  }
+  /* 「雷锋」两个字后面的点线引导，指向本数 */
+  .roll-list li.collective .tail{
+    flex:1;min-width:24px;height:1px;align-self:center;
+    background:repeating-linear-gradient(90deg,var(--line-soft) 0 4px,transparent 4px 8px);
+  }
+  .roll-list li.collective .what{
+    font-size:.78rem;color:var(--paper-dim);letter-spacing:.04em;
+  }
+  .roll-list li.collective .join{
+    font-size:.8rem;color:var(--glow);text-decoration:none;
+    border-bottom:1px solid var(--line);white-space:nowrap;
+  }
+  .roll-list li.collective .join:hover{color:#ffc978;border-color:var(--glow)}
+  /* 个人条目那一行的「留名」链接，弱化到几乎看不见 */
+  .roll-list li.personal .n{color:var(--paper-dim);opacity:.75}
+
   /* 没有署名者时的说明 —— 措辞是邀请，不是陈述 */
   .roll-empty{
     padding:1.1rem 0;font-size:.9rem;color:var(--paper-dim);line-height:1.8;
@@ -294,8 +324,12 @@ ${shelfHtml}
 
   // XSS 防线：credit 是匿名用户自己填的，必须转义后再进 DOM。
   // 注意：这里用 textContent 而不是 innerHTML，天然免疫。
+  var COLLECTIVE = '雷锋';
+
+  /** 个人条目：一行一个名字 + 本数。 */
   function li(name, books) {
     var el = document.createElement('li');
+    el.className = 'personal';
     var who = document.createElement('span');
     who.className = 'who';
     who.textContent = name;
@@ -307,6 +341,38 @@ ${shelfHtml}
     return el;
   }
 
+  /**
+   * 雷锋那一行：所有没留名的人的共同署名。
+   *
+   * 单独一行、独占整行，因为它**不是一个人** —— 把它排成和别人的
+   * 名字并列的一格，会让人误以为「雷锋」是个昵称。
+   *
+   * 文案用「人人可署名」而不是「集体」这类抽象词：这是这一行存在的
+   * 全部意义 —— 它告诉每个路过的人，不留名也不会被记成nobody。
+   */
+  function collectiveLi(books) {
+    var el = document.createElement('li');
+    el.className = 'collective';
+    var who = document.createElement('span');
+    who.className = 'who';
+    who.textContent = COLLECTIVE;
+    var tail = document.createElement('span');
+    tail.className = 'tail';
+    tail.setAttribute('aria-hidden', 'true');
+    var what = document.createElement('span');
+    what.className = 'what';
+    what.textContent = books + ' 本 · 人人可署名';
+    var join = document.createElement('a');
+    join.className = 'join';
+    join.href = '/upload';
+    join.textContent = '加入';
+    el.appendChild(who);
+    el.appendChild(tail);
+    el.appendChild(what);
+    el.appendChild(join);
+    return el;
+  }
+
   fetch('/api/credits', { headers: { accept: 'application/json' } })
     .then(function (r) { return r.ok ? r.json() : null; })
     .then(function (d) {
@@ -314,11 +380,19 @@ ${shelfHtml}
       var cs = d.contributors || [];
       if (cs.length) {
         var frag = document.createDocumentFragment();
-        cs.forEach(function (c) { frag.appendChild(li(c.name, c.books)); });
+        cs.forEach(function (c) {
+          if (c.name === COLLECTIVE) frag.appendChild(collectiveLi(c.books));
+          else frag.appendChild(li(c.name, c.books));
+        });
         list.appendChild(frag);
-        // 有署名者时说清楚比例，让「有多少人参与」可读
-        note.textContent = cs.length + ' 人留了名，'
-          + (d.namedBooks || 0) + ' / ' + (d.totalBooks || 0) + ' 本';
+        // 说明的是「留了自己名字」的那部分 —— 雷锋不算在内，
+        // 否则「18 / 19 本」会让人搞不清集体署名被算到了哪一边。
+        var personal = cs.length - (cs.filter(function (c) {
+          return c.name === COLLECTIVE;
+        }).length);
+        note.textContent = personal > 0
+          ? personal + ' 人留了名 · 共 ' + (d.totalBooks || 0) + ' 本'
+          : '共 ' + (d.totalBooks || 0) + ' 本';
       } else {
         list.hidden = true;
         empty.hidden = false;

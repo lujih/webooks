@@ -486,33 +486,56 @@ describe('上传者榜单（公开端点）', () => {
     expect(res.headers.get('content-type')).toContain('application/json');
   });
 
-  it('按贡献数倒序，且「雷锋」不计入榜单', async () => {
+  it('「雷锋」计入榜单且永久置顶（集体署名）', async () => {
+    // ⚠️ 这里曾经断言「雷锋不计入榜单」—— 那个判断是错的。
+    //
+    // 雷锋不是一个「未填写」的占位符，而是**所有没有留名的人的共同署名**。
+    // 把它藏起来，等于让书库看起来像是人人都在署名，而事实相反。
     await putBook('榜单甲.epub', 'Alice');
     await putBook('榜单乙.epub', 'Alice');
     await putBook('榜单丙.epub', 'Bob');
-    await putBook('榜单丁.epub', '雷锋'); // 留空的默认署名，不是真人
+    await putBook('榜单丁.epub', '雷锋');
 
     const res = await SELF.fetch(`${ORIGIN}/api/credits`);
     const body = (await res.json()) as {
       contributors: { name: string; books: number }[];
       namedBooks: number;
       totalBooks: number;
+      collectiveBooks: number;
     };
-    expect(body.contributors[0]).toEqual({ name: 'Alice', books: 2 });
-    expect(body.contributors[1]).toEqual({ name: 'Bob', books: 1 });
-    expect(
-      body.contributors.some((c) => c.name === '雷锋'),
-      '默认署名「雷锋」不是真人，不该占榜位',
-    ).toBe(false);
-    expect(body.namedBooks).toBe(3);
+    expect(body.contributors[0]).toEqual({ name: '雷锋', books: 1 });
+    expect(body.contributors[1]).toEqual({ name: 'Alice', books: 2 });
+    expect(body.contributors[2]).toEqual({ name: 'Bob', books: 1 });
+    expect(body.namedBooks).toBe(3);      // 留了自己名字的
+    expect(body.collectiveBooks).toBe(1); // 雷锋那一栏的
     expect(body.totalBooks).toBe(4);
+  });
+
+  it('即使有人传得比雷锋多，雷锋仍然排第一', async () => {
+    // 「永久置顶」必须是**真的**置顶，而不是「碰巧排第一」：
+    // 如果只按本数排，某天有人传了 200 本而雷锋只有 3 本，
+    // 集体署名就会掉到底下 —— 那会让它看起来像个冷门选项。
+    for (const n of ['多甲.epub', '多乙.epub', '多丙.epub', '多丁.epub', '多戊.epub']) {
+      await putBook(n, '高产者');
+    }
+    await putBook('集体.epub', '雷锋');
+
+    const res = await SELF.fetch(`${ORIGIN}/api/credits`);
+    const body = (await res.json()) as { contributors: { name: string; books: number }[] };
+    expect(body.contributors[0]!.name, '集体署名必须永远在最前').toBe('雷锋');
+    expect(body.contributors[1]).toEqual({ name: '高产者', books: 5 });
   });
 
   it('只返回名字与本数 —— 不泄漏任何管理信息', async () => {
     const res = await SELF.fetch(`${ORIGIN}/api/credits`);
     const body = (await res.json()) as Record<string, unknown>;
     // 这是一个**匿名公开**端点，出现任何额外字段都要重新审视
-    expect(Object.keys(body).sort()).toEqual(['contributors', 'namedBooks', 'totalBooks']);
+    expect(Object.keys(body).sort()).toEqual([
+      'collectiveBooks',
+      'contributors',
+      'namedBooks',
+      'totalBooks',
+    ]);
     const contributors = (body.contributors as Record<string, unknown>[] | undefined) ?? [];
     for (const c of contributors) {
       expect(
@@ -573,5 +596,36 @@ describe('上传者榜单（公开端点）', () => {
     const after = await SELF.fetch(`${ORIGIN}/api/credits`);
     const body = (await after.json()) as { contributors: { name: string }[] };
     expect(body.contributors.some((c) => c.name === 'Carol')).toBe(false);
+  });
+});
+
+describe('首页的雷锋行', () => {
+  it('雷锋渲染成独立的「集体」行，且带「人人可署名」与加入链接', async () => {
+    const html = await (await SELF.fetch(`${ORIGIN}/`)).text();
+    const script = html.match(/<script>([\s\S]*?)<\/script>/)![1];
+    // 有专门的渲染函数
+    expect(script).toContain('collectiveLi');
+    // 措辞：说清它是集体而不是一个人
+    expect(script).toContain('人人可署名');
+    // 有加入的入口
+    expect(script).toMatch(/join\.href\s*=\s*'\/upload'/);
+    // ⚠️ 说明文案里不能把雷锋算进「留了名的人数」——
+    //   否则「18 / 19 本」会让人搞不清集体署名被算到了哪一边。
+    expect(script).toMatch(/personal\s*>\s*0/);
+  });
+
+  it('CSS 里有把集体行与个人行区分开的样式', async () => {
+    const html = await (await SELF.fetch(`${ORIGIN}/`)).text();
+    // 独占整行 —— 排成和别人的名字并列的一格，会让人以为那是昵称
+    expect(html).toMatch(/\.roll-list li\.collective\{[^}]*grid-column:\s*1\/-1/);
+    expect(html).toContain('.roll-list li.personal');
+  });
+
+  it('没有数据时不报错（书库空时榜单依然能渲染）', async () => {
+    const res = await SELF.fetch(`${ORIGIN}/api/credits`);
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as Record<string, unknown>;
+    expect(body.totalBooks).toBe(0);
+    expect(body.collectiveBooks).toBe(0);
   });
 });

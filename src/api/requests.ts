@@ -254,34 +254,49 @@ export async function handleCreditPublic(request: Request, env: Env): Promise<Re
   }
 
   // 「雷锋」是留空时的默认署名，不是真人 —— 不计入榜单，
-  // 否则一个人占满整个榜单会显得很假。
+  // ⚠️ 「雷锋」**要计入榜单，且永久置顶** —— 这是一个刻意的产品决策。
+  //
+  // 它不是「未填写」的占位符，而是**一个集体署名**：所有没有留名的人
+  // （忘记留的、选择不写的）共同持有它。人人都可以是雷锋。
+  //
+  // 我最初把它排除在外，理由是「一个人占满榜单显得很假」。那个判断
+  // 是错的 —— 它掩盖的恰恰是这个书库最真实的状态：绝大多数书是匿名
+  // 传上来的。把「雷锋」藏起来，等于让书库看起来像是人人都在署名，
+  // 而事实相反。
+  //
+  // 排序也必须是**真的置顶**，而不是「碰巧排第一」：如果某天有人传了
+  // 200 本而雷锋只有 3 本，按本数排雷锋就该掉到底下 —— 那会让这个
+  // 集体署名看起来像个冷门选项。用 `ORDER BY` 的 CASE 强制置顶。
   const { results } = await env.DB
     .prepare(
       `SELECT credit AS name, COUNT(*) AS books
          FROM books
-        WHERE status = 'published'
-          AND credit IS NOT NULL AND credit <> ''
-          AND credit <> ?
+        WHERE status = 'published' AND credit IS NOT NULL AND credit <> ''
         GROUP BY credit
-        ORDER BY books DESC, credit ASC
+        ORDER BY (credit = ?) DESC, books DESC, credit ASC
         LIMIT 12`,
     )
     .bind(DEFAULT_CREDIT_NAME)
     .all<{ name: string; books: number }>();
 
+  // namedBooks 改为「**留了自己名字**」的书的数量 —— 也就是排除了雷锋的。
+  // 首页文案要说清这一点，否则「18 / 19 本」会让人搞不清雷锋算哪边。
   const totals = await env.DB
     .prepare(
       `SELECT
          COUNT(*) AS total,
-         SUM(CASE WHEN credit IS NOT NULL AND credit <> '' AND credit <> ? THEN 1 ELSE 0 END) AS named
+         SUM(CASE WHEN credit IS NOT NULL AND credit <> '' AND credit <> ? THEN 1 ELSE 0 END) AS named,
+         SUM(CASE WHEN credit = ? THEN 1 ELSE 0 END) AS collective
        FROM books WHERE status = 'published'`,
     )
-    .bind(DEFAULT_CREDIT_NAME)
-    .first<{ total: number; named: number }>();
+    .bind(DEFAULT_CREDIT_NAME, DEFAULT_CREDIT_NAME)
+    .first<{ total: number; named: number; collective: number }>();
 
   const payload = {
     totalBooks: totals?.total ?? 0,
     namedBooks: totals?.named ?? 0,
+    // 雷锋那一栏的书的数量。前端用它写「人人可署名」。
+    collectiveBooks: totals?.collective ?? 0,
     contributors: results ?? [],
   };
 
