@@ -25,6 +25,7 @@ import {
 } from '../lib/db';
 import { sniffKindFromBucket } from '../lib/kind-sniff';
 import { hasAdminToken } from '../lib/auth';
+import { handleAdminRequests, handleCreditBoard } from './requests';
 import { jsonResponse, textResponse } from '../lib/http';
 import {
   deriveMetadata,
@@ -72,7 +73,14 @@ export async function handleAdmin(
       return updateBook(env, request);
     case 'purge':
       return purge(env, cfg, url);
+    case 'credits':
+      return handleCreditBoard(request, env, url);
     default:
+      // `requests` 与 `requests/<id>` 都要走同一个处理器（列表 vs 标记状态），
+      // 所以不能放在上面的精确匹配里 —— 标记状态需要 path 里带 id。
+      if (action === 'requests' || action.startsWith('requests/')) {
+        return handleAdminRequests(request, env, url);
+      }
       return textResponse(404, `Unknown admin action: ${action}`);
   }
 }

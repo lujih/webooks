@@ -183,6 +183,7 @@ ${themeCss()}
 
   <div class="cta reveal" style="animation-delay:.3s">
     <a class="seal" href="/upload"><span class="dot"></span>上架一本书</a>
+    <a class="ghost" href="/requests">找不到想看的？挂求书</a>
     <a class="ghost" href="${mount}">进入书柜 →</a>
   </div>
 

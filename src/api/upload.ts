@@ -24,6 +24,7 @@ import { sniffKindFromBucket } from '../lib/kind-sniff';
 import { adjustBuckets, bucketDeltas, bucketIdentityOf, upsertBook } from '../lib/db';
 import { shortId } from '../lib/http';
 import { clientIpFromRequest, guardWrite } from '../lib/throttle';
+import { sanitiseCredit } from '../lib/requests';
 import { createPresignedPutUrl } from '../lib/sigv4';
 import { parseEpub, coverExtFor, PARSE_SIZE_CAP } from '../lib/epub';
 import { jsonResponse, textResponse } from '../lib/http';
@@ -303,6 +304,8 @@ interface CompleteBody {
   filename: string;
   size: number;
   contentType?: string;
+  /** 上传者留名（可选，留空记作「雷锋」）。见 lib/requests.ts 的 sanitiseCredit。 */
+  credit?: string;
 }
 
 export async function handleUploadComplete(request: Request, env: Env): Promise<Response> {
@@ -325,6 +328,7 @@ export async function handleUploadComplete(request: Request, env: Env): Promise<
   }
 
   const { key, filename, size } = body;
+  const credit = sanitiseCredit(body.credit);
   if (typeof key !== 'string' || !key.startsWith('uploads/')) {
     return jsonResponse({ error: 'bad-key' }, 400);
   }
@@ -471,6 +475,7 @@ export async function handleUploadComplete(request: Request, env: Env): Promise<
     ...(sniffedKind ? { kindBucket: sniffedKind, kindSource: 'sniffed' as const } : {}),
     publishedAt: new Date().toISOString(),
     coverKey,
+    credit,
   });
   // 增量更新分桶计数（不是全量重算）—— 理由见 lib/db.ts 的 adjustBuckets 注释。
   // 网页上传同样是匿名入口（一次 Turnstile 换 10 分钟通行证），
@@ -496,6 +501,7 @@ export async function handleUploadComplete(request: Request, env: Env): Promise<
     format,
     size: actualSize,
     leafName: safeName,
+    credit,
     // 封面绝对 URL：上传页立刻可预览
     coverUrl: coverKey ? `${env.R2_PUBLIC_BASE}/${coverKey}` : null,
     parsed: format === 'epub' && actualSize <= PARSE_SIZE_CAP,

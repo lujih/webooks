@@ -131,12 +131,17 @@ export function renderBrowsePage(
         const fmt = FORMAT_LABEL[e.meta.format ?? ''] ?? (e.meta.format ?? '').toUpperCase();
         const size = formatSize(e.meta.contentLength ?? 0);
         const author = e.meta.author ? `<span class="cauthor">${esc(e.meta.author)}</span>` : '';
+        // 署名：留名上传的显示真实名字，其余显示「雷锋」（服务端已归一，
+        // 这里只做兜底 —— 数据可能是迁移前的老行，credit 为 null）
+        const creditName = e.meta.credit || '雷锋';
+        const credit = `<span class="ccredit" title="上传：${esc(creditName)}">${esc(creditName)}</span>`;
         return `
       <a class="card bookcard" href="${href}" style="animation-delay:${delay}" title="${esc(e.meta.displayName)}">
         <span class="cover">${cover}</span>
         <span class="cbody">
           <span class="ctitle">${esc(e.meta.displayName)}</span>
           ${author}
+          ${credit}
           <span class="cmeta"><b class="fmt">${esc(fmt)}</b> · ${size}</span>
         </span>
       </a>`;
@@ -234,6 +239,13 @@ ${themeCss()}
     word-break:break-word;
   }
   .cauthor{font-size:.8rem;color:var(--paper-dim);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  /* 署名：刻意做得比作者更淡 —— 它是「谁传的」，不是作品信息 */
+  .ccredit{
+    display:inline-block;margin-top:.25rem;padding:1px 7px;font-size:.72rem;
+    color:var(--glow);background:rgba(255,180,77,.09);
+    border:1px solid rgba(255,180,77,.28);border-radius:999px;
+    max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
+  }
   .cmeta{font-size:.75rem;color:var(--paper-dim);font-family:var(--mono);letter-spacing:.02em}
   .cmeta .fmt{color:var(--glow);font-weight:600}
 

@@ -174,6 +174,8 @@ interface ResourceMeta {
   /** 浏览器目录页用的展示字段（不参与 WebDAV 协议，只在 HTML 渲染时读） */
   author?: string | null;
   coverUrl?: string | null;
+  /** 上传者署名（迁移 0007）；WebDAV 客户端不读这个字段，仅供浏览页用 */
+  credit?: string | null;
   format?: string | null;
 }
 
@@ -340,6 +342,7 @@ function bookEntry(collection: CollectionId, bucket: string, book: BookRow, r2Pu
       author: book.author,
       format: book.format_bucket || book.format,
       coverUrl: book.cover_key ? `${r2PublicBase}/${book.cover_key}` : null,
+      credit: book.credit,
     },
   };
 }

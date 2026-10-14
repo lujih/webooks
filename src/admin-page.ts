@@ -141,7 +141,25 @@ ${themeCss()}
       <span class="stat" id="stat"></span>
     </div>
 
-    <div id="listWrap"><div class="empty">加载中…</div></div>
+    <!-- 求书看板：谁在求什么，书到了就标记划掉 -->
+    <h2 style="font-family:var(--serif);font-weight:400;font-size:1rem;letter-spacing:.08em;
+               color:var(--paper-dim);margin:var(--s4) 0 var(--s3)">求书看板</h2>
+    <div class="toolbar">
+      <select id="reqFilter">
+        <option value="all">全部</option>
+        <option value="open">待收录</option>
+        <option value="fulfilled">已收录</option>
+        <option value="ignored">已忽略</option>
+      </select>
+      <button class="btn" id="reqRefresh">刷新求书</button>
+      <span class="stat" id="reqStat"></span>
+    </div>
+    <div id="reqWrap"><div class="empty">加载中…</div></div>
+
+    <!-- 上传者榜单：留名的贡献者 -->
+    <h2 style="font-family:var(--serif);font-weight:400;font-size:1rem;letter-spacing:.08em;
+               color:var(--paper-dim);margin:var(--s4) 0 var(--s3)">上传者榜单</h2>
+    <div id="creditWrap"><div class="empty">加载中…</div></div>
     <div class="toast" id="msg"></div>
     <div class="toast save" id="toast2" role="status" aria-live="polite"></div>
   </section>
@@ -266,6 +284,83 @@ async function load() {
   const data = await api('/api/admin/books?limit=200&q=' + q);
   renderSecurity(data.security || []);
   renderList(data);
+  // 求书与榜单独立加载：这两块失败不该拖垮书目列表（它们是辅助信息）
+  loadRequests().catch(() => {});
+  loadCredits().catch(() => {});
+}
+
+// ── 求书看板 ────────────────────────────────────────────────────────
+const REQ_STATUS_TEXT = { open: '待收录', fulfilled: '已收录', ignored: '已忽略' };
+
+async function loadRequests() {
+  const status = $('reqFilter').value;
+  const data = await api('/api/admin/requests?limit=100&status=' + encodeURIComponent(status));
+  $('reqStat').textContent = data.total ? '共 ' + data.total + ' 条' : '';
+  const wrap = $('reqWrap');
+  if (!data.requests || !data.requests.length) {
+    wrap.innerHTML = '<div class="empty">没有求书记录</div>';
+    return;
+  }
+  const rows = data.requests.map(function (r) {
+    return '<tr>'
+      + '<td>' + esc(r.title) + (r.author ? '<br><small style="opacity:.6">' + esc(r.author) + '</small>' : '') + '</td>'
+      + '<td>' + r.hits + ' 人</td>'
+      + '<td>' + esc(REQ_STATUS_TEXT[r.status] || r.status) + '</td>'
+      + '<td style="white-space:nowrap">'
+        + (r.status === 'open' ? markBtn(r, 'fulfilled', '已收录') : '')
+        + (r.status !== 'ignored' ? markBtn(r, 'ignored', '忽略') : '')
+        + (r.status !== 'open' ? markBtn(r, 'open', '撤销') : '')
+      + '</td>'
+      + '</tr>';
+  }).join('');
+  wrap.innerHTML = '<table><thead><tr><th>书名</th><th>需求</th><th>状态</th><th></th></tr></thead>'
+    + '<tbody>' + rows + '</tbody></table>';
+}
+
+function markBtn(r, status, label) {
+  // onclick 里用 JSON.stringify 转义 —— 求书内容是匿名提交的，
+  // 直接拼进 JS 字符串会被 script 闭合标签截断，或被注入。
+  // ⚠️ 这里**故意不写出闭合标签的字面量** —— 它出现在本文件的模板字符串里，
+  //    会被 HTML 解析器当成真的闭合标签，导致后面的 JS 全变成正文。
+  //    （踩过一次：pages-syntax.test.ts 报 "Unexpected end of input"。）
+  const payload = JSON.stringify({ status: status, bookId: r.fulfilledBookId || null });
+  return '<button class="btn" style="padding:3px 9px;font-size:.78rem" data-rid="'
+    + esc(r.id) + '" data-payload="' + esc(payload) + '">' + label + '</button> ';
+}
+
+document.addEventListener('click', async function (ev) {
+  const btn = ev.target.closest('button[data-rid]');
+  if (!btn) return;
+  btn.disabled = true;
+  try {
+    await api('/api/admin/requests/' + encodeURIComponent(btn.dataset.rid), {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: btn.dataset.payload,
+    });
+    toast($('msg'), '已更新', true);
+    await loadRequests();
+  } catch (e) {
+    toast($('msg'), '更新失败：' + e.message, false);
+    btn.disabled = false;
+  }
+});
+
+// ── 上传者榜单 ──────────────────────────────────────────────────────
+async function loadCredits() {
+  const data = await api('/api/admin/credits?limit=50');
+  const wrap = $('creditWrap');
+  if (!data.contributors || !data.contributors.length) {
+    wrap.innerHTML = '<div class="empty">还没有数据</div>';
+    return;
+  }
+  const rows = data.contributors.map(function (c) {
+    return '<tr><td>' + esc(c.name) + '</td><td>' + c.books + ' 本</td></tr>';
+  }).join('');
+  wrap.innerHTML = '<p style="font-size:.82rem;color:var(--paper-dim);margin:0 0 var(--s2)">'
+    + '共 ' + data.totalBooks + ' 本，其中 ' + data.namedContributors + ' 本有署名上传'
+    + '</p><table><thead><tr><th>上传者</th><th>贡献</th></tr></thead><tbody>'
+    + rows + '</tbody></table>';
 }
 
 /**
@@ -306,6 +401,10 @@ $('loginBtn').onclick = async () => {
   }
 };
 $('tok').addEventListener('keydown', (e) => { if (e.key === 'Enter') $('loginBtn').click(); });
+
+$('reqRefresh').onclick = () => loadRequests().catch((e) =>
+  toast($('msg'), '求书加载失败：' + e.message, false));
+$('reqFilter').onchange = () => loadRequests().catch(() => {});
 
 $('refreshBtn').onclick = async () => {
   try { await load(); toast($('msg'), '已刷新', true); }

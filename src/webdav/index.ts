@@ -18,6 +18,7 @@ import {
   listBooksInBucket,
   findBookByLeaf,
   adjustBuckets,
+  DEFAULT_CREDIT,
   bucketDeltas,
   bucketIdentityOf,
   rebuildBuckets,
@@ -859,6 +860,10 @@ async function handlePut(request: Request, env: Env, node: DavNode, davPath: str
     ...(sniffedKind ? { kindBucket: sniffedKind, kindSource: 'sniffed' as const } : {}),
     publishedAt: new Date().toISOString(),
     coverKey,
+    // WebDAV 通道没有「留名」的载体（客户端 PUT 只是传文件），
+    // 所以署名固定为默认。好在 ON CONFLICT 用 COALESCE 保护：
+    // 覆盖上传不会抹掉网页上传时留的署名。
+    credit: DEFAULT_CREDIT,
   });
 
   // 分桶计数：**增量更新**，只重算这本书所属/曾所属的桶。

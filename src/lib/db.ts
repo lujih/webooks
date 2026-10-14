@@ -3,6 +3,9 @@
 import type { CollectionId } from './collections';
 import { mediaKindOfFormat } from './collections';
 
+/** 未留名时的默认署名 */
+export const DEFAULT_CREDIT = '雷锋';
+
 export interface BookRow {
   id: string;
   leaf_name: string;
@@ -31,11 +34,13 @@ export interface BookRow {
   status: string;
   cover_key: string | null;
   description: string | null;
+  /** 上传者留名（留空时存 '雷锋'），迁移 0007 */
+  credit: string | null;
 }
 
 const BOOK_COLUMNS = `id, leaf_name, title, author, language, format, content_type, size,
   sha256, r2_key, etag, title_letter, author_letter, format_bucket, kind_bucket, kind_source,
-  published_at, created_at, updated_at, status, cover_key, description`;
+  published_at, created_at, updated_at, status, cover_key, description, credit`;
 
 /** 导航页数据源：桶 + 计数。行数 ≤ 28，非常便宜。 */
 export async function listBucketTotals(
@@ -319,6 +324,14 @@ export interface UpsertBookInput {
    * 省略时默认 'derived'（最弱来源，可被覆盖），保持向后兼容。
    */
   kindSource?: 'sniffed' | 'derived' | 'manual';
+  /**
+   * 上传者留名（迁移 0007）。留空则存 '雷锋'。
+   *
+   * ⚠️ 覆盖上传时**不覆盖**原值（在 ON CONFLICT 里用 COALESCE 保护）——
+   *   否则 B 覆盖上传 A 传的书，A 的署名就没了。署名属于「谁第一个
+   *   把它放进书库」，不是「谁最后一次改了文件」。
+   */
+  credit?: string | null;
   publishedAt: string | null;
   coverKey?: string | null;
   description?: string | null;
@@ -335,8 +348,8 @@ export function upsertBookStatement(db: D1Database, b: UpsertBookInput): D1Prepa
     .prepare(
       `INSERT INTO books (id, leaf_name, title, author, language, format, content_type, size,
          sha256, r2_key, etag, title_letter, author_letter, format_bucket, kind_bucket, kind_source,
-          published_at, cover_key, description, created_at, updated_at, status)
-       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+          published_at, cover_key, description, credit, created_at, updated_at, status)
+       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
        ON CONFLICT(id) DO UPDATE SET
          leaf_name = excluded.leaf_name,
          title = excluded.title,
@@ -378,6 +391,10 @@ export function upsertBookStatement(db: D1Database, b: UpsertBookInput): D1Prepa
          -- 新解析出的封面与简介永远不会写进去（真实踩过：重传带封面的 EPUB，
          -- R2 里封面对象已存在，但 D1 行的 cover_key 始终保持旧值 null）。
          cover_key = excluded.cover_key,
+         -- ⚠️ 署名不随覆盖上传而改变：谁第一个把它放进书库，谁就是署名者。
+         --   B 覆盖上传 A 传的书时，A 的署名必须保留。
+         --   COALESCE 让「上传时没留名」不会抹掉已有的署名。
+         credit = COALESCE(books.credit, excluded.credit),
          description = excluded.description,
          updated_at = excluded.updated_at,
          status = excluded.status`,
@@ -387,6 +404,7 @@ export function upsertBookStatement(db: D1Database, b: UpsertBookInput): D1Prepa
       b.sha256, b.r2Key, b.etag, b.titleLetter, b.authorLetter, b.formatBucket, kind, kindSource,
       b.publishedAt,
       b.coverKey ?? null, b.description ?? null,
+      b.credit ?? DEFAULT_CREDIT,
       now, now, b.status ?? 'published',
     );
 }

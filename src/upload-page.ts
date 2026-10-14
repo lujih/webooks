@@ -48,6 +48,21 @@ ${themeCss()}
   .droptitle{font-family:var(--serif);font-size:1.15rem;letter-spacing:.05em}
   .droptitle a{color:var(--glow);border-bottom:1px solid var(--glow);text-decoration:none}
   .droptitle a:hover{color:#ffc978}
+  /* 留名行：放在拖放区下方，明确是「可选的署名」而不是上传的必填项 */
+  .creditbar{
+    display:flex;align-items:center;gap:10px;flex-wrap:wrap;
+    margin:var(--s3) 0 0;padding:11px 14px;
+    border:1px dashed var(--line);border-radius:10px;
+    background:rgba(255,180,77,.03);
+  }
+  .creditbar label{font-size:.86rem;color:var(--paper-dim);white-space:nowrap}
+  .creditbar input{
+    flex:1;min-width:160px;padding:7px 11px;font:inherit;font-size:.92rem;
+    color:var(--paper);background:var(--ink-2);
+    border:1px solid var(--line);border-radius:7px;
+  }
+  .creditbar input:focus{outline:2px solid var(--glow);outline-offset:1px}
+  .creditbar .tip{font-size:.8rem;color:var(--paper-dim);opacity:.75}
   .hint{color:var(--paper-dim);font-size:.83rem;margin-top:var(--s3)}
   input[type=file]{display:none}
 
@@ -132,6 +147,13 @@ ${themeCss()}
     <div class="droptitle">把书籍文件拖到这里，或 <a href="#" id="pick">点此选择</a></div>
     <div class="hint">支持一次多选、连续拖入；只会接受电子书与漫画格式</div>
     <input type="file" id="file" multiple accept="${accept}">
+
+    <!-- 留名：可选。留空统一记作「雷锋」（见 migrations/0007 的说明） -->
+    <div class="creditbar">
+      <label for="credit">留个名</label>
+      <input id="credit" maxlength="32" placeholder="留空记作「雷锋」" autocomplete="nickname">
+      <span class="tip">会显示在书卡片上</span>
+    </div>
   </div>
 
   <div class="eligible reveal" style="animation-delay:.2s">
@@ -165,6 +187,7 @@ ${themeCss()}
 
 <script>
 const $ = (id) => document.getElementById(id);
+const creditEl = $('credit');
 const ACCEPT = ${JSON.stringify(ALLOWED_UPLOAD_FORMATS)};
 let siteKey = ${JSON.stringify(turnstileSiteKey)};
 
@@ -431,6 +454,8 @@ async function uploadOne(item){
     body: JSON.stringify({
       key: initJson.key, filename: item.file.name,
       size: item.file.size, contentType: item.file.type || '',
+      // 留名：整批共用一个署名（在拖放区下方统一填），服务端会清洗
+      credit: creditEl ? creditEl.value : '',
     }),
   });
   const doneJson = await doneRes.json().catch(() => ({}));
