@@ -25,7 +25,7 @@ import {
 } from '../lib/db';
 import { sniffKindFromBucket } from '../lib/kind-sniff';
 import { hasAdminToken } from '../lib/auth';
-import { handleAdminRequests, handleCreditBoard } from './requests';
+import { handleAdminRequests, handleCreditBoard, handleCreditPurge } from './requests';
 import { jsonResponse, textResponse } from '../lib/http';
 import {
   deriveMetadata,
@@ -76,6 +76,8 @@ export async function handleAdmin(
       return purge(env, cfg, url);
     case 'credits':
       return handleCreditBoard(request, env, url);
+    case 'credits/purge':
+      return handleCreditPurge(request);
     default:
       // `requests` 与 `requests/<id>` 都要走同一个处理器（列表 vs 标记状态），
       // 所以不能放在上面的精确匹配里 —— 标记状态需要 path 里带 id。

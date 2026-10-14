@@ -467,19 +467,20 @@ describe('求书墙链接可达', () => {
   });
 });
 
+const DAV = `${ORIGIN}/dav/${encodeURIComponent('最近收录')}`;
+
+/** 放一本书并指定署名（PUT 走 WebDAV，然后直接改 credit 模拟「留了名」） */
+async function putBook(leafName: string, credit: string): Promise<void> {
+  await SELF.fetch(`${DAV}/${encodeURIComponent(leafName)}`, {
+    method: 'PUT',
+    body: 'x',
+    headers: { authorization: 'Bearer test-write-token' },
+  });
+  await testEnv.DB.prepare('UPDATE books SET credit = ? WHERE leaf_name = ?')
+    .bind(credit, leafName).run();
+}
+
 describe('上传者榜单（公开端点）', () => {
-  const DAV = `${ORIGIN}/dav/${encodeURIComponent('最近收录')}`;
-
-  async function putBook(leafName: string, credit: string): Promise<void> {
-    await SELF.fetch(`${DAV}/${encodeURIComponent(leafName)}`, {
-      method: 'PUT',
-      body: 'x',
-      headers: { authorization: 'Bearer test-write-token' },
-    });
-    await testEnv.DB.prepare('UPDATE books SET credit = ? WHERE leaf_name = ?')
-      .bind(credit, leafName).run();
-  }
-
   it('匿名可访问，不需要口令', async () => {
     const res = await SELF.fetch(`${ORIGIN}/api/credits`);
     expect(res.status).toBe(200);
@@ -627,5 +628,99 @@ describe('首页的雷锋行', () => {
     const body = (await res.json()) as Record<string, unknown>;
     expect(body.totalBooks).toBe(0);
     expect(body.collectiveBooks).toBe(0);
+  });
+});
+
+describe('「没留名」的各种形态都归到雷锋', () => {
+  /**
+   * 「没留名」在数据里有三种形态，散落在不同写入路径：
+   *   NULL      0007 加列之前就存在的存量书
+   *   ''        某些路径把空串直接存了进去
+   *   '雷锋'    正常上传流程
+   *
+   * 如果只归一 (1)，(2) 就既不在榜、也不算总数 ——
+   * 表现为「书库里有这本书，账算不平」。
+   *
+   * 迁移 0008 是幂等的，三种形态都能收拢。
+   */
+  async function insertRaw(leafName: string, credit: string | null): Promise<void> {
+    await testEnv.DB.prepare(
+      `INSERT INTO books (id,leaf_name,title,author,language,format,content_type,size,sha256,r2_key,
+        title_letter,author_letter,format_bucket,kind_bucket,kind_source,published_at,created_at,updated_at,status,credit)
+       VALUES (?,?,?,NULL,'zh','epub','application/epub+zip',100,'s',?,?,?, 'ebook','ebook','derived',
+        '2026-01-01','2026-01-01','2026-01-01','published',?)`,
+    )
+      .bind(`raw-${leafName}`, leafName, leafName, `books/raw-${leafName}`,
+            'L', 'L', credit)
+      .run();
+  }
+
+  it('回填语句能把 NULL / 空串 / 纯空白都收拢', async () => {
+    // 直接跑迁移里的 UPDATE，验证幂等性与覆盖面
+    await insertRaw('空值.epub', null);
+    await insertRaw('空串.epub', '');
+    await insertRaw('空白.epub', '   ');
+    await insertRaw('正常.epub', '张三');
+
+    await testEnv.DB.exec("UPDATE books SET credit = '雷锋' WHERE credit IS NULL OR TRIM(credit) = ''");
+
+    const rows = await testEnv.DB.prepare(
+      'SELECT leaf_name, credit FROM books ORDER BY leaf_name',
+    ).all<{ leaf_name: string; credit: string }>();
+    const byName = new Map(rows.results.map((r) => [r.leaf_name, r.credit]));
+    expect(byName.get('空值.epub')).toBe('雷锋');
+    expect(byName.get('空串.epub')).toBe('雷锋');
+    expect(byName.get('空白.epub')).toBe('雷锋');
+    expect(byName.get('正常.epub'), '真的留了名的不能被动').toBe('张三');
+  });
+
+  it('回填是幂等的（重复执行结果不变）', async () => {
+    await insertRaw('幂等.epub', null);
+    const sql = "UPDATE books SET credit = '雷锋' WHERE credit IS NULL OR TRIM(credit) = ''";
+    await testEnv.DB.exec(sql);
+    const first = await testEnv.DB.prepare('SELECT credit FROM books WHERE leaf_name = ?')
+      .bind('幂等.epub').first<{ credit: string }>();
+    await testEnv.DB.exec(sql);
+    const second = await testEnv.DB.prepare('SELECT credit FROM books WHERE leaf_name = ?')
+      .bind('幂等.epub').first<{ credit: string }>();
+    expect(second?.credit).toBe(first?.credit);
+  });
+
+  it('管理端榜单与公开榜单结果一致（都含雷锋、都置顶）', async () => {
+    await putBook('一致甲.epub', '雷锋');
+    await putBook('一致乙.epub', '雷锋');
+    await putBook('一致丙.epub', 'Carol');
+
+    const pub = await (await SELF.fetch(`${ORIGIN}/api/credits`)).json() as {
+      contributors: { name: string; books: number }[];
+    };
+    const adm = await (await SELF.fetch(`${ORIGIN}/api/admin/credits?limit=50`, {
+      headers: { authorization: 'Bearer test-token' },
+    })).json() as { contributors: { name: string; books: number }[] };
+
+    // ⚠️ 两个端点曾经不一致：公开的含雷锋，管理的排除。
+    //   同一个事实给出两种答案，后台看板就会和首页对不上。
+    expect(adm.contributors.map((c) => c.name)).toEqual(pub.contributors.map((c) => c.name));
+    expect(adm.contributors[0]!.name).toBe('雷锋');
+  });
+
+  it('管理端有手动清缓存的入口', async () => {
+    const no = await SELF.fetch(`${ORIGIN}/api/admin/credits/purge`);
+    expect(no.status).toBe(403);
+    await no.text();
+
+    const res = await SELF.fetch(`${ORIGIN}/api/admin/credits/purge`, {
+      method: 'POST',
+      headers: { authorization: 'Bearer test-token' },
+    });
+    expect(res.status).toBe(200);
+    expect(((await res.json()) as { ok: boolean }).ok).toBe(true);
+
+    // GET 不行 —— 它是有副作用的操作
+    const wrong = await SELF.fetch(`${ORIGIN}/api/admin/credits/purge`, {
+      headers: { authorization: 'Bearer test-token' },
+    });
+    expect(wrong.status).toBe(405);
+    await wrong.text();
   });
 });

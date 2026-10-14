@@ -186,14 +186,15 @@ export async function handleCreditBoard(request: Request, env: Env, url: URL): P
   const limit = clampInt(url.searchParams.get('limit'), 50, 1, 200);
   const { results } = await env.DB
     .prepare(
+      // 与公开端点保持一致：雷锋计入且永久置顶（见 handleCreditPublic 的说明）
       `SELECT credit AS name, COUNT(*) AS books
          FROM books
         WHERE status = 'published' AND credit IS NOT NULL AND credit <> ''
         GROUP BY credit
-        ORDER BY books DESC, credit ASC
+        ORDER BY (credit = ?) DESC, books DESC, credit ASC
         LIMIT ?`,
     )
-    .bind(limit)
+    .bind(DEFAULT_CREDIT_NAME, limit)
     .all<{ name: string; books: number }>();
 
   const total = await env.DB
@@ -207,10 +208,20 @@ export async function handleCreditBoard(request: Request, env: Env, url: URL): P
     .bind(DEFAULT_CREDIT_NAME)
     .first<{ n: number }>();
 
+  const collective = await env.DB
+    .prepare(
+      `SELECT COUNT(*) AS n FROM books
+        WHERE status='published' AND credit = ?`,
+    )
+    .bind(DEFAULT_CREDIT_NAME)
+    .first<{ n: number }>();
+
   return jsonResponse({
     totalBooks: total?.n ?? 0,
-    // 有多少人真的留了名（排除默认的「雷锋」）
+    // 留了自己名字的书数（不含集体署名）
     namedContributors: credited?.n ?? 0,
+    // 集体署名的书数
+    collectiveBooks: collective?.n ?? 0,
     contributors: results ?? [],
   });
 }
@@ -334,4 +345,22 @@ export async function purgeCreditCache(): Promise<void> {
   } catch {
     /* 忽略 */
   }
+}
+
+/**
+ * 手动打掉榜单缓存（管理端用）。
+ *
+ * 为什么需要：/api/credits 缓存 1 小时。上线改动、或刚调整了
+ * 某些书的署名之后，管理员会立刻看到**旧数据**，而访客看到的也是。
+ * 没有这个端点就只能干等一小时。
+ *
+ * ⚠️ 它不能替代 purgeCreditCache() —— 那是自动的（挂在写路径上）。
+ *   这个是给「改了数据但没走写路径」的场景兜底，比如手工执行 SQL。
+ */
+export async function handleCreditPurge(request: Request): Promise<Response> {
+  if (request.method !== 'POST') {
+    return jsonResponse({ error: 'method-not-allowed' }, 405);
+  }
+  await purgeCreditCache();
+  return jsonResponse({ ok: true, note: '榜单缓存已清除，下一次请求会重新聚合' });
 }
