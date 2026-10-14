@@ -19,8 +19,13 @@ export interface Env {
   WRITE_TOKEN?: string;
   /** Turnstile 公钥（前端 widget 用），来自 Dashboard */
   TURNSTILE_SITE_KEY?: string;
-  /** Turnstile 私钥（服务端 siteverify 用），必须是 secret */
+  /** Turnstile 私钥（服务端 siteverify 用）。⚠️ 仅在开启人机验证时才必填 */
   TURNSTILE_SECRET?: string;
+  /**
+   * 网页上传是否强制 Turnstile 人机验证。默认 false（关闭）。
+   * 理由与取舍见 src/api/upload.ts 的 requireTurnstile()。
+   */
+  UPLOAD_REQUIRE_TURNSTILE?: string;
   /**
    * 批量上传通行证的签名密钥。**可选** —— 不配就退回 TURNSTILE_SECRET，
    * 不引入新的必填配置。想独立轮换通行证密钥时再单独设置。

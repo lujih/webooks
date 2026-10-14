@@ -127,10 +127,40 @@ function todayKey(): string {
 /** 通行证有效期：够传完一批，又不至于被长期复用 */
 const TICKET_TTL_SECONDS = 600;
 
+/**
+ * 网页上传是否强制 Turnstile 人机验证。
+ *
+ * 默认 **false**（关闭）。理由：
+ *
+ *  1. **防的到底是什么？** 人机验证防的是「脚本批量上传」。
+ *     但 R2 预签名 URL 的签发本身已有 IP 限流（见 lib/throttle.ts 的
+ *     guardWrite）与每日写配额，而 WebDAV PUT 走的是完全相同的配额 ——
+ *     也就是说**真正的匿名写入口本来就没被验证码保护**，
+ *     挡住网页上传挡不住 WebDAV。
+ *
+ *  2. **验证码的实际成本高得多。** Turnstile 要求站点域名在控制台
+ *     逐一登记，且实测在部分网络/浏览器环境下会一直转圈（Error 1101），
+ *     表现为「网站上传坏了」而查不到原因 —— 对一个**开架书库**来说，
+ *     拦住真实的上传者是纯粹的负收益。
+ *
+ *  3. **WebDAV 通道本来就没有它。** 所以关掉它并不会降低整体防护水平，
+ *     只是让两个入口的门槛一致。
+ *
+ * 想临时打开（比如担心被刷）：设环境变量 UPLOAD_REQUIRE_TURNSTILE=1
+ * —— 但那样必须同时配好 TURNSTILE_SECRET，否则会 fail-closed
+ * （上传完全不可用），这正是当初设计它的本意。
+ */
+function requireTurnstile(env: Env): boolean {
+  const v = (env.UPLOAD_REQUIRE_TURNSTILE ?? '').trim().toLowerCase();
+  return v === '1' || v === 'true' || v === 'yes';
+}
+
 function ticketSecret(env: Env): string | null {
-  // 优先用专用密钥；没配就退回 TURNSTILE_SECRET（上传能跑就一定有它），
-  // 这样不引入新的必填配置。
-  return env.UPLOAD_TICKET_SECRET || env.TURNSTILE_SECRET || null;
+  // ⚠️ 这里**曾经**回落到 TURNSTILE_SECRET。当网页上传关闭 Turnstile 后
+  //    （见 UPLOAD_REQUIRE_TURNSTILE），TURNSTILE_SECRET 就不再是必填项，
+  //    回落链会断 —— 表现为「上传能发起，但永远拿不到通行证」。
+  //    所以改为回落到站点自己的密钥，优先复用已经配好的那个。
+  return env.UPLOAD_TICKET_SECRET || env.WRITE_TOKEN || env.ADMIN_TOKEN || null;
 }
 
 async function hmacHex(secret: string, data: string): Promise<string> {
@@ -209,12 +239,17 @@ export async function handleUploadInit(request: Request, env: Env): Promise<Resp
 
   // 凭据检查：没有 R2 凭据就明确报错，而不是签一个坏 URL
   const { R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY, R2_ACCOUNT_ID, R2_BUCKET_NAME, TURNSTILE_SECRET } = env;
+  const needTurnstile = requireTurnstile(env);
   const missing: string[] = [];
   if (!R2_ACCESS_KEY_ID) missing.push('R2_ACCESS_KEY_ID');
   if (!R2_SECRET_ACCESS_KEY) missing.push('R2_SECRET_ACCESS_KEY');
   if (!R2_ACCOUNT_ID) missing.push('R2_ACCOUNT_ID');
   if (!R2_BUCKET_NAME) missing.push('R2_BUCKET_NAME');
-  if (!TURNSTILE_SECRET) missing.push('TURNSTILE_SECRET');
+  // TURNSTILE_SECRET 只在**开启**人机验证时才必填。
+  // 关着的时候要求它，是把一次「域名没登记导致上传全挂」变成必然事件。
+  if (needTurnstile && !TURNSTILE_SECRET) missing.push('TURNSTILE_SECRET');
+  // 通行证签名密钥：没有它就发不出通行证，上传无法进行。
+  if (!ticketSecret(env)) missing.push('UPLOAD_TICKET_SECRET');
   if (missing.length > 0) {
     return jsonResponse(
       { error: 'upload-not-configured', missing },
@@ -227,24 +262,25 @@ export async function handleUploadInit(request: Request, env: Env): Promise<Resp
     return jsonResponse({ error: 'file-too-large', maxBytes }, 413);
   }
 
-  // ── 人机验证（fail-closed）──
-  // 两条路径，二选一：
-  //   · ticket         —— 之前某次验证换来的批量通行证（整批复用，不再打扰用户）
-  //   · turnstileToken —— 一次性令牌，验完立刻换一张通行证返回给客户端
+  // ── 人机验证 ──
+  // 三条路径：
+  //   · ticket         —— 之前换来的批量通行证（整批复用，不再打扰用户）
+  //   · turnstileToken —— 一次性令牌，仅在 UPLOAD_REQUIRE_TURNSTILE=1 时要求
+  //   · 都没有            —— 默认模式：直接放行（见 requireTurnstile 的说明）
   const ip = clientIp(request);
-  let human = false;
   if (typeof ticket === 'string' && ticket) {
-    human = await verifyTicket(env, ticket, ip);
-    if (!human) {
-      // 通行证过期/伪造：让客户端重新验证，而不是笼统报错
+    const ok = await verifyTicket(env, ticket, ip);
+    if (!ok) {
+      // 通行证过期/伪造：让客户端重新申请，而不是笼统报错
       return jsonResponse({ error: 'ticket-invalid' }, 403);
     }
-  } else if (typeof turnstileToken === 'string' && turnstileToken) {
-    human = await verifyTurnstile(env, turnstileToken, ip);
-    if (!human) return jsonResponse({ error: 'turnstile-failed' }, 403);
-  }
-  if (!human) {
-    return jsonResponse({ error: 'turnstile-token-required' }, 400);
+  } else if (needTurnstile) {
+    // fail-closed：开着验证码时没给令牌就拒绝，绝不放行
+    if (typeof turnstileToken !== 'string' || !turnstileToken) {
+      return jsonResponse({ error: 'turnstile-token-required' }, 400);
+    }
+    const ok = await verifyTurnstile(env, turnstileToken, ip);
+    if (!ok) return jsonResponse({ error: 'turnstile-failed' }, 403);
   }
 
   // ── 写节流：此前这条链路一次都没走过 allowWrite ────────────────

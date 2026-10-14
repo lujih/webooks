@@ -144,7 +144,7 @@ describe('网页上传接口的格式白名单', () => {
     }
   });
 
-  it('允许的格式会通过格式检查（之后才轮到验证码）', async () => {
+  it('允许的格式会通过格式检查并走到签发环节', async () => {
     // 把 siteverify 的 fetch 换成桩：测试只关心「格式检查是否放行」，
     // 不该真的去请求 Cloudflare（沙箱里会超时 5 秒，且结果不确定）。
     const original = globalThis.fetch;
@@ -157,9 +157,12 @@ describe('网页上传接口的格式白名单', () => {
     );
     try {
       const res = await init('book.epub');
-      const j = (await res.json()) as { error?: string };
-      // 走到「验证码不通过」说明格式检查已经放行了
-      expect(j.error).toBe('turnstile-failed');
+      const j = (await res.json()) as { error?: string; ticket?: string; uploadUrl?: string };
+      // 没有报 unsupported-format，且已经签出预签名 URL / 通行证 ——
+      // 说明格式检查放行了。（以前这里断言 turnstile-failed，
+      // 那是把「必须有人机验证」写成了断言，与现在的默认行为不符。）
+      expect(j.error).not.toBe('unsupported-format');
+      expect(j.uploadUrl ?? j.ticket).toBeTruthy();
     } finally {
       vi.stubGlobal('fetch', original);
     }

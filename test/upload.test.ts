@@ -52,7 +52,76 @@ describe('/api/upload/init', () => {
     const json = (await res.json()) as { error: string; missing: string[] };
     expect(json.error).toBe('upload-not-configured');
     expect(json.missing).toContain('R2_ACCESS_KEY_ID');
+    // ⚠️ TURNSTILE_SECRET **不再**是无条件必填 —— 人机验证默认关闭，
+    //   要求它等于「强制所有人配一个用不上的验证码」，而这正是之前
+    //   「上传一直失败」的根因之一。改成开了验证时才要求（见下一条）。
+    expect(json.missing).not.toContain('TURNSTILE_SECRET');
+    // 通行证签名密钥是必填的 —— 但测试环境已经配了 WRITE_TOKEN，
+    // 所以回落链生效，不必单独配 UPLOAD_TICKET_SECRET（这正是设计意图：
+    // 不引入新的必填配置）。用「一个都不剩」的 env 单独验证这一点。
+    expect(json.missing).not.toContain('UPLOAD_TICKET_SECRET');
+
+    const noKeys = { ...bare, UPLOAD_TICKET_SECRET: undefined } as Record<string, unknown>;
+    delete noKeys.WRITE_TOKEN;
+    delete noKeys.ADMIN_TOKEN;
+    const res2 = await handleUploadInit(
+      new Request(`${ORIGIN}/api/upload/init`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ filename: 'Book.epub', size: 1000 }),
+      }),
+      noKeys as unknown as Parameters<typeof handleUploadInit>[1],
+    );
+    const json2 = (await res2.json()) as { missing: string[] };
+    expect(json2.missing).toContain('UPLOAD_TICKET_SECRET');
+  });
+
+  it('开启人机验证时，TURNSTILE_SECRET 恢复为必填', async () => {
+    const bare = { ...testEnv, UPLOAD_REQUIRE_TURNSTILE: '1' } as Record<string, unknown>;
+    for (const k of [
+      'R2_ACCESS_KEY_ID', 'R2_SECRET_ACCESS_KEY', 'R2_ACCOUNT_ID',
+      'R2_BUCKET_NAME', 'TURNSTILE_SECRET',
+    ]) {
+      delete bare[k];
+    }
+    const req = new Request(`${ORIGIN}/api/upload/init`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ filename: 'Book.epub', size: 1000, turnstileToken: 'fake' }),
+    });
+    const res = await handleUploadInit(req, bare as unknown as Parameters<typeof handleUploadInit>[1]);
+    expect(res.status).toBe(503);
+    const json = (await res.json()) as { missing: string[] };
     expect(json.missing).toContain('TURNSTILE_SECRET');
+  });
+
+  it('默认（关闭验证）时，不带任何 token 也能通过 init', async () => {
+    // 这是本次改动的核心行为：网页上传不再需要人机验证。
+    // 防护没有降低 —— 真正的匿名写入口（WebDAV PUT）从来就没有验证，
+    // 两者共用同一套 guardWrite 节流与每日配额。
+    const res = await SELF.fetch(`${ORIGIN}/api/upload/init`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ filename: 'Book.epub', size: 1000 }),
+    });
+    expect(res.status).not.toBe(400);
+    const json = (await res.json()) as Record<string, unknown>;
+    expect(json.error).not.toBe('turnstile-token-required');
+  });
+
+  it('开启验证后，没给令牌会被拒（fail-closed 不被绕过）', async () => {
+    const req = new Request(`${ORIGIN}/api/upload/init`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ filename: 'Book.epub', size: 1000 }),
+    });
+    const withFlag = {
+      ...testEnv,
+      UPLOAD_REQUIRE_TURNSTILE: '1',
+    } as unknown as Parameters<typeof handleUploadInit>[1];
+    const res = await handleUploadInit(req, withFlag);
+    expect(res.status).toBe(400);
+    expect(((await res.json()) as { error: string }).error).toBe('turnstile-token-required');
   });
 
   it('拒绝不支持的格式（415，且在配置检查之前判定）', async () => {

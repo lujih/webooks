@@ -16,7 +16,7 @@
 import { ALLOWED_UPLOAD_FORMATS, EBOOK_FORMATS, COMIC_FORMATS } from './lib/collections';
 import { themeCss } from './lib/theme';
 
-export function uploadHtml(turnstileSiteKey: string): string {
+export function uploadHtml(turnstileSiteKey: string | null): string {
   // accept 用归一化后的格式列表；浏览器据此过滤文件选择框
   const accept = ALLOWED_UPLOAD_FORMATS.map((f) => `.${f}`).join(',');
   const formatList = [...EBOOK_FORMATS, ...COMIC_FORMATS].join(' / ');
@@ -176,7 +176,8 @@ ${themeCss()}
     <div class="msg" id="msg" role="status" aria-live="polite"></div>
   </div>
 
-  <div id="ts"></div>
+  <!-- 人机验证容器。没配 siteKey 时整个隐藏，避免留一块空白 -->
+  <div id="ts"${turnstileSiteKey ? '' : ' hidden'}></div>
 
   <p class="fineprint">
     这个书库是<b>匿名开放</b>的：任何人都能上传与下载，上传后自动上架、不经人工审核。<br>
@@ -190,6 +191,9 @@ const $ = (id) => document.getElementById(id);
 const creditEl = $('credit');
 const ACCEPT = ${JSON.stringify(ALLOWED_UPLOAD_FORMATS)};
 let siteKey = ${JSON.stringify(turnstileSiteKey)};
+// 是否需要人机验证。与服务端同一个判断依据：**有没有配 siteKey**。
+// 两边不一致会导致「前端弹框、后端不要」的错位，所以刻意用同一个信号。
+const NEED_TURNSTILE = !!siteKey;
 
 // 队列项：{ file, status: waiting|uploading|done|error|skip, pct, error, result }
 let queue = [];
@@ -341,6 +345,14 @@ function loadTurnstile(){
   });
 }
 async function renderWidget(){
+  // 人机验证默认关闭（服务端 UPLOAD_REQUIRE_TURNSTILE 控制）。
+  // 关闭时连脚本都不加载 —— 省一次外部请求，也让上传页在
+  // 「域名没在 Turnstile 控制台登记」时依然完全可用。
+  if(!NEED_TURNSTILE){
+    $('go').disabled = false;
+    msg('直接点「开始上传」即可', 'info');
+    return;
+  }
   await loadTurnstile();
   window.turnstile.render('#ts', {
     sitekey: siteKey,
@@ -415,7 +427,8 @@ async function uploadOne(item){
     contentType: item.file.type || '',
   };
   if(ticket) body.ticket = ticket;
-  else body.turnstileToken = await takeToken();
+  else if(NEED_TURNSTILE) body.turnstileToken = await takeToken();
+  // 都不需要 → 服务端直接放行（默认模式）
 
   let initRes = await fetch('/api/upload/init', {
     method:'POST', headers:{'content-type':'application/json'},
@@ -428,7 +441,7 @@ async function uploadOne(item){
   if(!initRes.ok && (initJson.error === 'ticket-invalid' || initJson.error === 'turnstile-failed')){
     ticket = null;
     bufferedToken = null;
-    body.turnstileToken = await takeToken();
+    if(NEED_TURNSTILE) body.turnstileToken = await takeToken();
     delete body.ticket;
     initRes = await fetch('/api/upload/init', {
       method:'POST', headers:{'content-type':'application/json'},

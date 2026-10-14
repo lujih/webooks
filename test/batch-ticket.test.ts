@@ -12,7 +12,7 @@
 
 import { SELF } from 'cloudflare:test';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import { mintTicket, verifyTicket } from '../src/api/upload';
+import { handleUploadInit, mintTicket, verifyTicket } from '../src/api/upload';
 import { resetLibrary, testEnv } from './setup';
 
 const ORIGIN = 'https://webooks.test';
@@ -35,6 +35,24 @@ function init(body: Record<string, unknown>, ip = IP): Promise<Response> {
     headers: { 'content-type': 'application/json', 'CF-Connecting-IP': ip },
     body: JSON.stringify({ filename: 'a.epub', size: 100, ...body }),
   });
+}
+
+/**
+ * 显式**开启**人机验证的 init。
+ *
+ * 人机验证现在默认关闭（UPLOAD_REQUIRE_TURNSTILE 未设），所以凡是测
+ * 「验证码通过/失败」语义的用例都必须走这个入口，否则断言的是
+ * 一个已经不存在的分支。
+ */
+function initWithTurnstile(body: Record<string, unknown>, ip = IP): Promise<Response> {
+  return handleUploadInit(
+    new Request(`${ORIGIN}/api/upload/init`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'CF-Connecting-IP': ip },
+      body: JSON.stringify({ filename: 'a.epub', size: 100, ...body }),
+    }),
+    { ...testEnv, UPLOAD_REQUIRE_TURNSTILE: '1' } as never,
+  );
 }
 
 beforeEach(async () => {
@@ -111,11 +129,31 @@ describe('一批只验证一次', () => {
     }
   });
 
-  it('没有令牌也没有通行证 → 拒绝', async () => {
+  it('没有令牌也没有通行证 → 默认模式放行并签发通行证', async () => {
+    // ⚠️ 人机验证默认**关闭**了（UPLOAD_REQUIRE_TURNSTILE 未设）。
+    //   理由：真正的匿名写入口是 WebDAV PUT，它从来就不需要验证码，
+    //   两者共用同一套节流与配额 —— 挡住网页上传挡不住 WebDAV，
+    //   却会因为「Turnstile 域名没登记」而让真实上传者完全无法上传。
+    //   想恢复旧行为：设 UPLOAD_REQUIRE_TURNSTILE=1。
     const res = await init({});
+    expect(res.status).not.toBe(400);
+    const j = (await res.json()) as { error?: string; ticket?: string };
+    expect(j.error).not.toBe('turnstile-token-required');
+    expect(j.ticket, '应签发通行证供后续批次复用').toBeTruthy();
+  });
+
+  it('开启人机验证后，没有令牌 → 拒绝（fail-closed）', async () => {
+    const { handleUploadInit } = await import('../src/api/upload');
+    const res = await handleUploadInit(
+      new Request('https://webooks.test/api/upload/init', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ filename: 'Book.epub', size: 1000 }),
+      }),
+      { ...testEnv, UPLOAD_REQUIRE_TURNSTILE: '1' } as never,
+    );
     expect(res.status).toBe(400);
-    const j = (await res.json()) as { error: string };
-    expect(j.error).toBe('turnstile-token-required');
+    expect(((await res.json()) as { error: string }).error).toBe('turnstile-token-required');
   });
 
   it('通行证无效 → 403 ticket-invalid（客户端据此重新验证）', async () => {
@@ -135,7 +173,9 @@ describe('一批只验证一次', () => {
   it('令牌验证失败时不发通行证', async () => {
     stubTurnstile(false);
     try {
-      const res = await init({ turnstileToken: 'bad' });
+      // ⚠️ 必须走 initWithTurnstile：默认模式下不验证令牌，
+      //   用 init 会拿到 200，断言的是一个已不存在的分支。
+      const res = await initWithTurnstile({ turnstileToken: 'bad' });
       expect(res.status).toBe(403);
       const j = (await res.json()) as { error: string; ticket?: string };
       expect(j.error).toBe('turnstile-failed');

@@ -121,8 +121,12 @@ describe('页面内联脚本语法自检', () => {
     expect(code).toContain('ticket');
     expect(code).toMatch(/if\(ticket\)\s*body\.ticket\s*=\s*ticket/);
     expect(code).toMatch(/if\(initJson\.ticket\)\s*ticket\s*=\s*initJson\.ticket/);
-    // 只在没有通行证（或通行证失效重试）时才去取一次性令牌 —— 不能每本都取
-    expect(code).toMatch(/else\s+body\.turnstileToken\s*=\s*await\s+takeToken\(\)/);
+    // 只在没有通行证（或通行证失效重试）时才去取一次性令牌 —— 不能每本都取。
+    // 中间允许夹一层开关判断（`else if (NEED_TURNSTILE)`）：人机验证关闭时
+    // 连令牌都不用取，这是默认行为。
+    expect(code).toMatch(
+      /else(?:\s+if\s*\([^)]*\))?\s+body\.turnstileToken\s*=\s*await\s+takeToken\(\)/,
+    );
     const perFileToken = code.match(/body\.turnstileToken\s*=\s*await\s+takeToken\(\)/g) ?? [];
     // 两处：首次（无通行证）+ 通行证失效后的重试。不应更多。
     expect(perFileToken.length).toBeLessThanOrEqual(2);
@@ -130,13 +134,32 @@ describe('页面内联脚本语法自检', () => {
     expect(code).toContain('ticket-invalid');
   });
 
-  it('人机验证设成 interaction-only（正常用户看不到验证框）', async () => {
+  it('人机验证相关：interaction-only + 无全局 token 变量 + 开关判定', async () => {
     const res = await SELF.fetch(`${ORIGIN}/upload`, { headers: { accept: 'text/html' } });
     const html = await res.text();
     const code = inlineScripts(html).join('\n');
+
+    // ① 开着验证时用 interaction-only：正常用户看不到验证框
     expect(code).toContain("appearance: 'interaction-only'");
-    // 不能再有「一个全局 token 变量反复复用」的老写法。
-    // 只匹配裸变量赋值（`turnstileToken = x`），排除对象属性（`body.turnstileToken = x`）。
+
+    // ② 不能再有「一个全局 token 变量反复复用」的老写法。
+    //    只匹配**裸变量**赋值（turnstileToken = x），排除对象属性
+    //    （body.turnstileToken = x —— 那恰恰是现在正确的写法）。
     expect(code).not.toMatch(/(^|[^.\w])turnstileToken\s*=[^=]/);
+
+    // ③ 前后端用同一个信号判断要不要验证：有没有配 siteKey。
+    //    两边判定不一致会导致「前端弹框、后端不要」的错位。
+    expect(code).toContain('const NEED_TURNSTILE = !!siteKey');
+    // 没配 siteKey 时整段跳过，连 Turnstile 脚本都不加载
+    expect(code).toMatch(/if\s*\(\s*!\s*NEED_TURNSTILE\s*\)/);
+  });
+
+  it('没配 TURNSTILE_SITE_KEY 时不渲染验证容器', async () => {
+    const { uploadHtml } = await import('../src/upload-page');
+    const noKey = uploadHtml(null);
+    expect(noKey).toMatch(/<div id="ts" hidden>/);
+    const withKey = uploadHtml('0x4AAAAAAA');
+    expect(withKey).toMatch(/<div id="ts">/);
+    expect(withKey).not.toMatch(/<div id="ts" hidden>/);
   });
 });
