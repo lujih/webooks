@@ -15,6 +15,11 @@
  *     故根锁只做精确匹配（不覆盖子资源），除非显式 Depth:1。
  */
 
+// §14.12：lockroot 里的 href 要做百分号编码 —— §8.3 要求同一份响应里所有
+// href 用同一种格式，而 <D:response><D:href> 是编码过的；中文文件名不编码
+// 会让严格解析器读到前后不一致的格式。
+import { encodeHref } from './xml';
+
 export interface LockRow {
   token: string;
   resource: string;
@@ -308,24 +313,50 @@ export async function liveLockForResource(
  *     正是 §14.14 要求的「单个锁令牌 URI」。
  *   所以**必须转义**：转义是 XML 文本层的表示问题，与「值是什么」无关。
  *   客户端解析后拿到的仍是裸 URI，与 Lock-Token 响应头里的一致。
+ *
+ * ⚠️ 第三处历史事故：元素名与子元素顺序都写错了。
+ *   原实现输出 `<D:lockdiscovery><D:lock>…`，而 RFC 4918 的 DTD 是：
+ *
+ *     <!ELEMENT lockdiscovery (activelock)* >                        (§15.7)
+ *     <!ELEMENT activelock (lockscope, locktype, depth, owner?,
+ *                            timeout?, locktoken?, lockroot)>       (§14.1)
+ *
+ *   两处错：① 元素名应是 `activelock`，不是 `lock`
+ *          ② 顺序必须是 owner → timeout → locktoken → lockroot，
+ *             原实现把 `timeout` 排在 `locktoken` 之后，违反 DTD 的序列约束
+ *
+ *   为什么 253 个测试全绿却没拦住：xml-wellformed.test.ts 只验**良构性**
+ *   （标签配对），而 `<D:lock>…</D:lock>` 恰恰是良构的；断言也只是
+ *   `toContain('<D:lock>')` 这种字符串匹配。严格客户端（.NET XmlDocument、
+ *   SabreDAV、davfs2）按 `activelock` 取锁，结果**一把都读不到** ——
+ *   锁功能形同虚设，而测试全绿。
+ *
+ *   现在由 test/lock-xml.test.ts 按上面两条 DTD 逐条校验。
  */
 export function lockDiscoveryXml(lock: LockRow, requestHref: string): string {
   const ownerXml = lock.owner ? `<D:owner>${escapeOwner(lock.owner)}</D:owner>` : '';
   const scope = lock.type === 'shared' ? 'shared' : 'exclusive';
-  const lockType = lock.type === 'shared' ? 'read' : 'write';
   const depth = lock.depth === '1' || lock.depth === '0' ? lock.depth : 'infinity';
+  // ⚠️ locktype 只能是 write —— RFC 4918 §14.15 的 DTD 是
+  //    `<!ELEMENT locktype (write) >`，**根本没有 read 锁**。
+  //    原实现给 shared 锁输出 `<D:locktype><D:read/>`，等于宣告了一个
+  //    本项目不实现的锁类型：客户端按它建立读锁，服务端却只认写锁语义。
+  //    shared / exclusive 的区别在 lockscope，不在 locktype。
   return (
-    `<D:lockdiscovery><D:lock>` +
+    `<D:lockdiscovery><D:activelock>` +
     `<D:lockscope><D:${scope}/></D:lockscope>` +
-    `<D:locktype><D:${lockType}/></D:locktype>` +
+    `<D:locktype><D:write/></D:locktype>` +
     `<D:depth>${depth}</D:depth>` +
+    ownerXml +
+    // ⚠️ timeout 必须在 locktoken 之前（DTD 的 sequence 约束）
+    `<D:timeout>Second-${lock.timeoutSec}</D:timeout>` +
     // token 含 <>，必须做 XML 转义，否则不是良构 XML
     `<D:locktoken><D:href>${escapeOwner(lock.token)}</D:href></D:locktoken>` +
     // §14.12：lockroot 给出被锁资源 URL（SHOULD）
-    `<D:lockroot><D:href>${escapeOwner(requestHref)}</D:href></D:lockroot>` +
-    `<D:timeout>Second-${lock.timeoutSec}</D:timeout>` +
-    ownerXml +
-    `</D:lock></D:lockdiscovery>`
+    // href 要做百分号编码：§8.3 要求响应里每个 href 用同一种格式，
+    // 而同一份响应的 <D:response><D:href> 是编码过的。
+    `<D:lockroot><D:href>${escapeOwner(encodeHref(requestHref))}</D:href></D:lockroot>` +
+    `</D:activelock></D:lockdiscovery>`
   );
 }
 

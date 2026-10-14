@@ -65,11 +65,23 @@ describe('MS-WebDAV 扩展属性', () => {
     expect(xml).toContain('<D:isdirectory>0</D:isdirectory>');
   });
 
-  it('supportedlock 宣告 exclusive/write + shared/read', async () => {
+  it('supportedlock 宣告 exclusive/write + shared/write（RFC 没有 read 锁）', async () => {
     const res = await dav('/title/', { method: 'PROPFIND', headers: { depth: '0' } });
     const xml = await res.text();
+
+    // ⚠️ 这条断言此前写的是 `shared/read`，而 RFC 4918 §14.15 的 DTD 是
+    //   <!ELEMENT locktype (write) > —— 规范里**根本没有 read 锁**
+    //   （那是 WebDAV Class 3 的扩展）。宣告一个不实现的锁类型，
+    //   客户端会据此建立读锁，然后与服务端的写锁语义冲突。
+    //   shared / exclusive 的区别在 lockscope，两者都是 write 锁。
     expect(xml).toContain('<D:lockscope><D:exclusive/></D:lockscope><D:locktype><D:write/></D:locktype>');
-    expect(xml).toContain('<D:lockscope><D:shared/></D:lockscope><D:locktype><D:read/></D:locktype>');
+    expect(xml).toContain('<D:lockscope><D:shared/></D:lockscope><D:locktype><D:write/></D:locktype>');
+    expect(xml, 'RFC 4918 没有 read 锁，不能宣告').not.toContain('<D:read/>');
+
+    // §15.10 <!ELEMENT supportedlock (lockentry)* >
+    // 元素名是 lockentry，不是 supportedlockentry
+    expect(xml).toContain('<D:lockentry>');
+    expect(xml, '元素名应为 lockentry').not.toContain('supportedlockentry');
   });
 });
 
