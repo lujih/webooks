@@ -141,6 +141,13 @@ ${themeCss()}
       <span class="stat" id="stat"></span>
     </div>
 
+    <!-- 书列表容器。⚠️ 不要删：renderList() 往这里写 innerHTML。
+         容器缺失时登录会抛 "Cannot set properties of null (setting 'innerHTML')"，
+         而它在 try/catch 里 —— 用户只看到「登录失败」，真实原因被吞掉，
+         排查时完全看不出是 DOM 缺元素。（真实踩过：加看板时替换 HTML
+         把这一行连带下面的 toast 一起吃掉了。） -->
+    <div id="listWrap"><div class="empty">加载中…</div></div>
+
     <!-- 求书看板：谁在求什么，书到了就标记划掉 -->
     <h2 style="font-family:var(--serif);font-weight:400;font-size:1rem;letter-spacing:.08em;
                color:var(--paper-dim);margin:var(--s4) 0 var(--s3)">求书看板</h2>
@@ -167,7 +174,14 @@ ${themeCss()}
 </div>
 
 <script>
-const $ = (id) => document.getElementById(id);
+const $ = (id) => {
+  const el = document.getElementById(id);
+  // ⚠️ 宁可在这里炸，也不要让调用方拿到 null 然后报
+  //    "Cannot set properties of null" —— 后者完全指不出是哪个元素缺失，
+  //    而且往往被 try/catch 吞掉，最终表现成「登录失败」这种误导性的现象。
+  if (!el) throw new Error('页面缺少元素 #' + id);
+  return el;
+};
 const esc = (s) => String(s == null ? '' : s).replace(/[&<>"']/g, (c) =>
   ({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;' }[c]));
 const fmtSize = (b) => b < 1024 ? b + ' B'

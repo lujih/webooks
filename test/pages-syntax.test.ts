@@ -163,3 +163,62 @@ describe('页面内联脚本语法自检', () => {
     expect(withKey).not.toMatch(/<div id="ts" hidden>/);
   });
 });
+
+describe('页面脚本引用的元素必须真实存在', () => {
+  /**
+   * 为什么需要这条测试：
+   *
+   * 加求书看板时，我用脚本替换 admin 页的一整段 HTML，误把
+   * `<div id="listWrap">` 连带下面的 toast 容器一起吃掉了。
+   * 于是 renderList() 执行 `$('listWrap').innerHTML = …` 时拿到 null，
+   * 抛 "Cannot set properties of null" —— 而它在登录的 try/catch 里，
+   * 用户只看到「登录失败」，与真实原因毫无关联，极难排查。
+   *
+   * 这类错误有 3 个特点，使得它极难被常规测试发现：
+   *   · TypeScript 查不出（DOM 是运行时的）
+   *   · 「页面能否解析」查不出（语法完全正确）
+   *   · 端到端测试若不真的点登录，也不会触发
+   *
+   * 所以这里做一件笨事：把脚本里所有 $('x') 引用与 DOM 里的 id 求差集。
+   */
+  const PAGES: ReadonlyArray<readonly [string, string]> = [
+    ['/admin', 'admin'],
+    ['/upload', 'upload'],
+    ['/requests', 'requests'],
+    ['/', 'home'],
+  ];
+
+  for (const [path, label] of PAGES) {
+    it(`${label} 页：脚本引用的每个 id 都在 DOM 里`, async () => {
+      const html = await (
+        await SELF.fetch(`${ORIGIN}${path}`, { headers: { accept: 'text/html' } })
+      ).text();
+
+      const script = inlineScripts(html).join('\n');
+      // 收集所有 $('x') / getElementById('x') 的引用
+      const refs = new Set<string>();
+      for (const m of script.matchAll(/\$\('([A-Za-z0-9_-]+)'\)/g)) refs.add(m[1]!);
+      for (const m of script.matchAll(/getElementById\('([A-Za-z0-9_-]+)'\)/g)) refs.add(m[1]!);
+
+      const domIds = new Set<string>();
+      for (const m of html.matchAll(/\bid="([A-Za-z0-9_-]+)"/g)) domIds.add(m[1]!);
+
+      // $helper 自己内部也会引用，但它是 DOM 查询不是字面量 id
+      const missing = [...refs].filter((id) => !domIds.has(id));
+      expect(
+        missing,
+        `${path} 的脚本引用了不存在的元素：${missing.join(', ')}\n`
+          + `症状会是 "Cannot set properties of null"，且常被 try/catch 吞成「登录失败」。`,
+      ).toEqual([]);
+    });
+  }
+
+  it('$ 在元素缺失时抛出可读的错误，而不是让调用方拿到 null', async () => {
+    const html = await (
+      await SELF.fetch(`${ORIGIN}/admin`, { headers: { accept: 'text/html' } })
+    ).text();
+    const script = inlineScripts(html).join('\n');
+    // 守卫存在，且错误信息里带上缺失的 id
+    expect(script).toMatch(/页面缺少元素/);
+  });
+});
