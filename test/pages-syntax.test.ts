@@ -541,3 +541,54 @@ describe('首页不再查 D1（请求预算）', () => {
     expect(body.latest).toBeNull();
   });
 });
+
+describe('每个页面都要声明站点图标（请求预算）', () => {
+  /**
+   * 这一组挡的是「每打开一个页面就白花一次 Worker 请求」。
+   *
+   * 浏览器在页面里没找到 <link rel="icon"> 时，会自己去猜 `/favicon.ico`。
+   * 加静态资源之前，那个路径不存在 —— 于是**每次页面浏览**都多一次请求
+   * 换回一个 404。而 favicon 现在是 public/favicon.ico，由静态资源层
+   * 直接应答（官方：静态资源请求 free and unlimited），不计入配额。
+   *
+   * 但这条链路有个前提：**页面必须显式声明它**。只放一个文件在 public/
+   * 也能被浏览器猜中，但一旦将来改了文件名（比如换成 /icon.svg），
+   * 所有页面的隐式猜测就会一起失效 —— 显式声明让这件事在测试里可见。
+   *
+   * 另外：静态资源不经过 Worker，所以 withSecurityHeaders() 管不到它，
+   * 它的 Cache-Control 写在 public/_headers（见 static-assets.test.ts）。
+   */
+  const PAGES: ReadonlyArray<readonly [string, string]> = [
+    ['/', 'home'],
+    ['/requests', 'requests'],
+    ['/upload', 'upload'],
+    ['/admin', 'admin'],
+    [`/dav/${encodeURIComponent('最近收录')}`, 'browse'],
+  ];
+
+  for (const [path, label] of PAGES) {
+    it(`${label} 页声明了 /favicon.ico`, async () => {
+      const res = await SELF.fetch(`${ORIGIN}${path}`, { headers: { accept: 'text/html' } });
+      const html = await res.text();
+      expect(html, `${label} 页缺少图标声明，浏览器会去请求一个不存在的路径`).toMatch(
+        /<link\s+rel="icon"[^>]*href="\/favicon\.ico"/,
+      );
+    });
+  }
+
+  it('图标声明在 <head> 里（放 body 里浏览器可能忽略）', async () => {
+    const html = await (
+      await SELF.fetch(`${ORIGIN}/`, { headers: { accept: 'text/html' } })
+    ).text();
+    const head = html.slice(0, html.indexOf('</head>'));
+    expect(head).toContain('rel="icon"');
+  });
+
+  it('声明的大小与产物一致（sizes 写着 32x32，图标就得真是 32×32）', async () => {
+    const html = await (
+      await SELF.fetch(`${ORIGIN}/`, { headers: { accept: 'text/html' } })
+    ).text();
+    expect(html).toMatch(/rel="icon"[^>]*sizes="32x32"/);
+    // 产物尺寸由 static-assets.test.ts 读真实字节校验；这里只保证两处声明一致
+  });
+});

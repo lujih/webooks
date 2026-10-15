@@ -67,11 +67,17 @@ src/
     xml.ts / http.ts    XML 与 HTTP 工具
   api/admin.ts          reindex / stats / purge
 migrations/0001_init.sql
+public/                 ★ 静态资源：唯一「不计入请求配额」的一类请求
+  favicon.ico           浏览器每次浏览都会猜它；没有它就是每次白花一次请求
+  robots.txt            挡住爬虫枚举 /dav/ 那棵可无限展开的目录树
+  _headers              静态资源的响应头（对 Worker 响应无效，见下）
 scripts/
   budget.mjs            ★ 请求预算模拟器
+  gen-favicon.mjs       生成 public/favicon.ico（开发期跑，产物提交进仓库）
+  gen-pinyin-table.mjs  生成 src/lib/pinyin-table.ts（同上，运行时零依赖）
   dav-probe.mjs         ★ 线上 DAV 一致性 / 边缘动词放行 / 100-continue 探针
   size-probe.mjs        ★ 请求体 100 MB 边界探针
-test/                   253+ 个测试（单元 + 端到端 + 回归）
+test/                   461 个测试（单元 + 端到端 + 回归）
 ```
 
 ---
@@ -299,6 +305,37 @@ rclone mount webooks: /mnt/books \
   --dir-cache-time 24h --poll-interval 0 --vfs-cache-mode off
 ```
 
+### 6. 静态资源（`public/`）—— 唯一真正不计费的请求类型
+
+先说三个反直觉的事实，因为这里最容易走错路：
+
+| 机制 | 省请求数？ | 说明 |
+|---|---|---|
+| **Cache API**（`caches.default`，本项目在用） | ❌ **一次都不省** | 官方原文：「every request still executes your Worker on the way in」。它只省上游（D1/R2）。 |
+| **Workers Caching**（`cache.enabled`） | ❌ **而且更贵** | 命中仍按标准费率计费（「Cache hits count as requests but do not consume CPU time」），且开启后连本来免费的静态资源请求也变成计费。我们的瓶颈是**请求数**不是 CPU → **故不开**。 |
+| **静态资源** | ✅ **free and unlimited** | 官方原文：「Requests to static assets are free and unlimited.」且**完全不经过 Worker 代码**。 |
+
+所以 `public/` 里放的是「每次访问都会发生、但内容恒定」的东西：
+
+- **`favicon.ico`** —— 页面不声明 `<link rel="icon">` 时，浏览器会自己去请求 `/favicon.ico`。
+  在这个文件存在之前，那个路径是 404：**每打开一个页面就白花一次 Worker 请求**。
+  现在每个页面都显式声明它（`test/pages-syntax.test.ts` 有守卫）。
+- **`robots.txt`** —— 首页有个「进入书柜」链接指向 `/dav/`，而那是棵**可无限枚举**的目录树。
+  没有 robots.txt 时爬虫会顺着目录把整个书库翻一遍。注意 HTML 页上的
+  `<meta name="robots" content="noindex">` **只阻止收录、不阻止抓取** —— 抓取照样花请求。
+
+`wrangler.jsonc` 的 `assets` 配置里 **`not_found_handling` 必须是 `"none"`**，理由写在那个文件的注释里，
+简短版：配成 `"404-page"` 且没有 `run_worker_first` 时，**真人浏览器的每一次顶层导航都会被静态 404 页吃掉**
+（触发条件只有 `Sec-Fetch-Mode: navigate` 这一个头，curl 不带 → curl 冒烟测试全绿而线上整站 404）。
+`scripts/verify-deploy.mjs` 有一条专门带这个头去探测的哨兵。
+
+HTML 页面**故意不放进 `public/`**：它们是动态渲染的（首页插 `DAV_MOUNT`/`R2_PUBLIC_BASE`，
+上传页插 Turnstile 公钥），一旦落成静态文件，部署时的 `--var` 覆盖就再也反映不到页面上 —— 那是静默失效。
+
+⚠️ `public/_headers` 只对静态资源生效，**对 Worker 生成的响应完全无效**；反之 Worker 里的
+`withSecurityHeaders()` 也管不到静态资源。两边各管各的，**漏一边就是静默缺失**，
+所以每个 `public/` 文件都必须在 `_headers` 里有对应规则（`test/static-assets.test.ts` 守卫这条）。
+
 ---
 
 ## 用预算模拟器回答「10 万/天够不够」
@@ -318,10 +355,33 @@ npm run budget -- --books 20000 --browse 2000 --mounts 200 --syncs 20
 默认场景（5,000 本 / 12 GB / 300 次浏览 / 20 次挂载 / 2 次全库同步）的结果：
 
 ```
-硬停瓶颈        Worker 请求/天（16.3% 已用）
-峰值承受力      峰值系数 3× → 49.0%（✅ 峰值也在额度内）
+硬停瓶颈        Worker 请求/天（16.6% 已用）
+忙日承受力      忙日系数 3× → 49.7%（✅ 忙日也在额度内）
 💳 R2 超额账单 ≈ $0.03/月（存储超 2.21 GB）
 ```
+
+「忙日系数」而不是「峰值 QPS」：100,000/天 是**日总量**额度，不是速率上限
+（官方 limits 页：「There is no general limit on requests per second.」）。
+所以这里乘的是「某天流量是平时的几倍」，与日额度**同量纲**，可以直接比。
+相乘出来的百分比用的就是同一个判据 —— 上一行说「忙日会打满」、下一行说
+「站点不会停摆」这种自相矛盾曾经真的出现过（只判均值不判忙日），现已修掉。
+
+⚠️ **这个百分比只算「可预期的使用量」，不含爬虫 / 扫描器 / 客户端重试。**
+这不是谨慎，是踩过的坑：这个模型曾在显示 16% 的当天，站点真的打满了 10 万次并停摆到次日 08:00。
+
+差距来自模型本身的三个错误，都已修掉（并写进代码注释，防止有人「优化」回去）：
+
+1. **把 Cache API 的命中当成了省请求**。它一次都不省（见上一节表格）。
+   模型里那个 `cdPageViewHitRate: 0.8` 参数已**删除** —— 留着就会有人继续传一个
+   「假装能省请求」的数字，现在传它会直接报 `未知参数` 然后退出。
+2. **没算每次浏览附带的隐式请求**。`/favicon.ico` 那条 404 是其中最普遍的一个
+   （现已由静态资源层消掉，所以 `implicitPerPageView` 现在是 0，
+   但参数保留着 —— 加任何「浏览器自动请求且必须过 Worker」的东西时都要加回它）。
+3. **压根没建模爬虫流量**。这个无法猜（本机没有 CF 凭据，拿不到线上计数），
+   所以默认 0，并且**在结论里显式标注**「不含未建模流量」——
+   宁可让人一眼看见这个空白，也不要再给一个虚假的安全感。
+
+想估算真实占用，用 Cloudflare 控制台的请求量反推：`--bots <次数/天>`。
 
 ---
 
@@ -452,7 +512,7 @@ npx wrangler secret put UPLOAD_REQUIRE_TURNSTILE   # 值填 1
 ## 测试
 
 ```bash
-npm test          # 297 个测试
+npm test          # 461 个测试
 npm run typecheck
 npm run check:dav  -- --url https://你的域名/dav/   # 线上一致性探针
 npm run check:size -- --url https://你的域名/dav/   # 请求体体积边界
@@ -462,7 +522,14 @@ npm run check:size -- --url https://你的域名/dav/   # 请求体体积边界
 格式白名单（网页上传与 WebDAV 两条入口）、元数据推导、content-type 取舍、
 XML 转义与编码、PROPFIND 请求体解析、Depth 语义、207 响应结构、
 200 条硬上限与分页、缓存命中与**写入即失效**、PUT/GET/HEAD/DELETE 全流程、
-未实现方法的明确拒绝、admin 鉴权、以及**页面内联脚本的语法自检**。
+未实现方法的明确拒绝、admin 鉴权、**页面内联脚本的语法自检**，
+以及**缓存安全**（每个响应都必须显式声明 `cache-control`，敏感接口不许可缓存）
+与**静态资源层**（`public/` 的产物字节、`_headers` 规则、`not_found_handling` 必须是 `none`）。
+
+后两组值得一提：静态资源层跑在 Worker **之外**，`SELF.fetch()` 完全看不到它 ——
+所以它们不测运行时行为，而是**在 Node 侧把 `public/` 的真实文件内容读进来当夹具**
+（workerd 的 `node:fs` 是个空壳，读不到仓库文件），把配置与产物本身钉死。
+理由很实际：这一层配错的后果是「线上整站 404，而 400+ 个测试全绿」。
 
 线上另有几套探针（见 `scripts/`）：
 

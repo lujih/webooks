@@ -17,6 +17,7 @@ export function adminHtml(): string {
 <html lang="zh-CN"><head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
+<link rel="icon" href="/favicon.ico" sizes="32x32">
 <title>管理后台 · webooks</title>
 <meta name="robots" content="noindex,nofollow">
 <style>

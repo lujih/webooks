@@ -198,6 +198,96 @@ async function probeOverwrite() {
   }
 }
 
+/**
+ * 探针 4：静态资源层是否真的上线了。
+ *
+ * 期望：/favicon.ico → 200 且 content-type 是图标
+ * 修复前：404 text/plain（而且**每次页面浏览**都白花一次 Worker 请求）
+ *
+ * 判据特意不只看状态码，还看 content-type —— Worker 的兜底 404 也是
+ * 200/404 之类的整数，光看码分不清「静态层在服务」还是「Worker 说没有」。
+ */
+async function probeStaticFavicon() {
+  try {
+    const res = await fetch(`${SITE}/favicon.ico`);
+    const ct = res.headers.get('content-type') || '';
+    const cc = res.headers.get('cache-control') || '';
+    const body = new Uint8Array(await res.arrayBuffer());
+    // PNG 魔数（本项目用 PNG 内嵌 ICO）或 ICO 头（00 00 01 00）
+    const isIco = body.length > 4
+      && ((body[0] === 0x89 && body[1] === 0x50) || (body[0] === 0 && body[1] === 0 && body[2] === 1));
+
+    results.push({
+      name: '/favicon.ico 由静态层服务',
+      status: res.status === 200 && isIco ? 'pass' : 'fail',
+      detail: res.status === 404
+        ? '404 —— public/ 没上传（静态资源优化未生效，每次浏览白花一次请求）'
+        : `期望 200 + 图标字节，实际 ${res.status} ${ct} ${body.length}B`,
+    });
+
+    // _headers 里的 Cache-Control 是否真的被应用了。
+    // 默认头是 `public, max-age=0, must-revalidate`，我们在 _headers 里
+    // 改成了 max-age=604800 —— 值不一样才说明 _headers 被解析了。
+    if (res.status === 200) {
+      results.push({
+        name: '_headers 规则生效（favicon）',
+        status: cc.includes('604800') ? 'pass' : 'fail',
+        detail: cc.includes('604800')
+          ? cc
+          : `期望 max-age=604800（_headers 生效），实际 "${cc}"（可能是默认头）`,
+      });
+    }
+  } catch (err) {
+    results.push({ name: '静态资源层', status: 'skip', detail: String(err.message || err) });
+  }
+}
+
+/**
+ * 探针 5：★ 最关键的一条 ★ —— 真人浏览器能不能打开 Worker 路由。
+ *
+ * 这条是给一个**真实踩过的坑**立的哨兵：
+ *
+ *   `assets.not_found_handling: "404-page"` 时，只要请求带
+ *   `Sec-Fetch-Mode: navigate`（真实浏览器每次顶层导航都会带，curl 不带），
+ *   `/`、`/upload`、`/requests`、`/admin`、`/dav/` **全部**被静态 404 页吃掉。
+ *
+ *   于是 curl 冒烟测试全绿，真人打开全是 404 —— 最恶劣的那种「测试通过但
+ *   线上是坏的」。这就是为什么这里必须**带着 navigate 头**发请求。
+ *
+ * 判据：带 navigate 头时，这几条路径必须仍返回 Worker 的 HTML。
+ * Worker 的 HTML 一定带 `content-security-policy`（withSecurityHeaders 加的），
+ * 而静态 404 页不会带 —— 用头区分，而不是用状态码（两边都是 200/404）。
+ */
+async function probeWorkerRoutesWithNavigateHeader() {
+  const NAV = {
+    'sec-fetch-mode': 'navigate',
+    'sec-fetch-dest': 'document',
+    accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+  };
+  const routes = ['/', '/upload', '/requests'];
+  try {
+    const bad = [];
+    for (const path of routes) {
+      const res = await fetch(`${SITE}${path}`, { headers: NAV });
+      const csp = res.headers.get('content-security-policy');
+      const body = await res.text();
+      // 成功判据：有 CSP（=Worker 生成的 HTML）且正文里有本站的 <title>
+      const ok = res.status === 200 && !!csp && /<title>/.test(body);
+      if (!ok) bad.push(`${path}→${res.status}${csp ? '' : '(无CSP=静态层抢答)'}`);
+      else await res.arrayBuffer().catch(() => {});
+    }
+    results.push({
+      name: '浏览器导航头下 Worker 路由仍可达',
+      status: bad.length === 0 ? 'pass' : 'fail',
+      detail: bad.length === 0
+        ? `${routes.length} 条路由带 sec-fetch-mode:navigate 均正常`
+        : `❌ 被静态层抢答：${bad.join(' ')} —— 检查 not_found_handling 是不是被改成了 "404-page"`,
+    });
+  } catch (err) {
+    results.push({ name: '浏览器导航头探测', status: 'skip', detail: String(err.message || err) });
+  }
+}
+
 const ICON = { pass: '✅', fail: '❌', skip: '➖' };
 
 console.log(`线上版本验证：${SITE}`);
@@ -210,6 +300,10 @@ console.log('');
 await probeCopyWhitelist();
 await probeUnlockNoToken();
 await probeOverwrite();
+// 静态资源层与「浏览器导航头下 Worker 路由是否仍可达」不需要写口令，
+// 所以放在最后：前三条要口令的探针若被跳过，这两条仍然会给出结论。
+await probeStaticFavicon();
+await probeWorkerRoutesWithNavigateHeader();
 
 let fail = 0;
 let pass = 0;

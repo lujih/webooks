@@ -1,11 +1,17 @@
 import { applyD1Migrations, env } from 'cloudflare:test';
 import { beforeAll } from 'vitest';
 import type { Env } from '../src/config';
+import type { StaticAssetsSnapshot } from './env';
 import { entriesCacheKey, purgeByPrefixes } from '../src/lib/cache';
 
 export interface TestEnv extends Env {
   TEST_MIGRATIONS: Parameters<typeof applyD1Migrations>[1];
   ADMIN_TOKEN: string;
+  /**
+   * public/ 的产物快照，由 vitest.config.ts 在 Node 侧读好传进来。
+   * 必须走这条路：workerd 的 `node:fs` 是空壳，读不到仓库文件。
+   */
+  TEST_STATIC_ASSETS: StaticAssetsSnapshot;
 }
 
 export const testEnv = env as unknown as TestEnv;

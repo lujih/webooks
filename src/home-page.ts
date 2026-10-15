@@ -53,6 +53,10 @@ export function indexHtml(mountPath: string, r2PublicBase: string | null): strin
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
+<!-- 显式声明图标：不声明时浏览器会自己去请求 /favicon.ico，
+     而那个路径在加静态资源之前是个 404 —— 每次页面浏览都白花一次 Worker 请求。
+     现在它是 public/favicon.ico，由静态资源层直接应答，不计入请求配额。 -->
+<link rel="icon" href="/favicon.ico" sizes="32x32">
 <title>webooks · 公共电子书库</title>
 <meta name="description" content="webooks —— 架在 Cloudflare Workers Free + R2 上的开放 WebDAV 电子书库。任何人都可以上传、浏览、下载。">
 <style>

@@ -55,7 +55,63 @@
       "database_id": "b0edfbd4-f6f1-468f-abb8-481dda7b1721",
       "migrations_dir": "migrations"
     }
-  ]
+  ],
+
+  // ═══════════════════════════════════════════════════════════════════════
+  // 静态资源 —— **唯一能真正省下 100,000 次/天请求配额的手段**
+  //
+  // 先把结论说清楚，因为这里有一个反直觉的定价事实：
+  //
+  //   · Cache API（caches.default，本项目一直在用）
+  //     官方原文：「every request still executes your Worker on the way in」
+  //     —— 它只省**上游**（D1/R2），一次请求都不省。
+  //
+  //   · Workers Caching（cache.enabled）
+  //     看着像是正解，实则**正好相反**。官方定价页脚注：命中缓存仍按标准
+  //     费率计费（「Cache hits count as requests but do not consume CPU time」），
+  //     并且开启后连平时免费的静态资源请求也一并变成计费。
+  //     我们的瓶颈是**请求数**不是 CPU，所以开启它是净亏损。**故不开。**
+  //
+  //   · 静态资源请求
+  //     官方原文：「Requests to static assets are free and unlimited.」
+  //     —— 只有这一类请求不计入配额，而且**完全不经过 Worker 代码**。
+  //
+  // 所以省请求数只有三条路：① 把响应变成静态资源；② 让客户端少发请求；
+  // ③ 让请求不经过本站（302 跳 R2）。这里走第 ① 条。
+  //
+  // ── 为什么 public/ 里只放 favicon 与 robots.txt ──
+  // 这两个文件各自堵掉一类**每次访问都发生**的浪费，见文件自身的注释。
+  // HTML 页面**故意不放进来**：它们是动态渲染的（首页要插 DAV_MOUNT 与
+  // R2_PUBLIC_BASE，上传页要插 Turnstile 公钥），一旦落成静态文件，
+  // 部署时的 --var 覆盖就再也反映不到页面上 —— 那是一种静默失效。
+  //
+  // ── ⚠️ not_found_handling 必须保持 "none" ──
+  // 实测（wrangler dev，逐条 curl 对比）：
+  //
+  //   "404-page" + 没有 run_worker_first 时，**浏览器访问的每一个 Worker
+  //   路由都会被静态 404 页吃掉**。触发条件只有一个请求头
+  //   `Sec-Fetch-Mode: navigate`（真实浏览器每次顶层导航都会带），
+  //   而 curl 不带 —— 于是 curl 冒烟测试全绿，真人打开 /upload、/requests、
+  //   /admin、/dav/ 全是 404。workerd 日志原话：
+  //     `Sec-Fetch-Mode: navigate` header present - using `not_found_handling` behavior
+  //
+  //   改配 run_worker_first 数组能救回来，但它要求**逐个列出**所有属于
+  //   Worker 的路径，且 `/x/*` 不匹配 `/x` 本身、大小写敏感。本项目的
+  //   DAV_MOUNT 是部署期可覆盖的（甚至可为空 = 挂在根上），
+  //   静态列表无法与它保持同步 —— 漏一条就是静默 404，而且测试套件
+  //   抓不到（SELF.fetch 根本不经过资源路由层）。
+  //
+  //   "none" 没有任何这类陷阱：命中静态资源就静态返回，否则照旧交给
+  //   Worker。代价只是「不存在的路径」仍要花 1 次请求换回文本 404 ——
+  //   与加静态资源**之前的行为完全一致**，不是回退。
+  // ═══════════════════════════════════════════════════════════════════════
+  "assets": {
+    "directory": "./public",
+    // binding 没有用到（Worker 里不会 env.ASSETS.fetch），
+    // 但显式写出来让 wrangler 的 dry-run 输出能看清它被绑上了。
+    "binding": "ASSETS",
+    "not_found_handling": "none"
+  }
 
   // 令牌类全部用 secret，绝不进仓库：
   //   ADMIN_TOKEN           保护 /api/admin/*     必填（未配置则全部 404）
