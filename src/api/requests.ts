@@ -20,6 +20,8 @@ import type { Env } from '../config';
 import { jsonResponse } from '../lib/http';
 import { creditsCacheKey, davCache, requestsCacheKey } from '../lib/cache';
 import { guardWrite } from '../lib/throttle';
+import { latestBook } from '../lib/db';
+import { collectionSegment } from '../lib/collections';
 import {
   DEFAULT_CREDIT_NAME,
   listForAdmin,
@@ -341,12 +343,36 @@ export async function handleCreditPublic(request: Request, env: Env): Promise<Re
     .bind(DEFAULT_CREDIT_NAME, DEFAULT_CREDIT_NAME)
     .first<{ total: number; named: number; collective: number }>();
 
+  // 「最近上架」—— 首页首屏那张活书脊。
+  //
+  // ⚠️ 为什么并到这里而不是首页单独查：
+  //   首页原来每次未命中都跑一次 latestBook()（1 行 D1 读）。
+  //   但首页是流量最大的入口，而这行数据**变化频率极低**（一天几十本），
+  //   榜单那边已经缓存了 1 小时 —— 顺手把它一起返回，
+  //   首页就变成了零 D1 读（命中时）。
+  // ⚠️ 挂载前缀的默认值必须与 config.ts 的 settings() 一致（'/dav'）——
+  //   那里是 `(env.DAV_MOUNT ?? '/dav')`。这里如果写成 `|| ''`，
+  //   测试环境（没配 DAV_MOUNT）就会拼出 `/最近收录/...` 这种
+  //   少了前缀的路径，而生产环境是 `/dav/最近收录/...` —— 两端不一致。
+  const mount = (env.DAV_MOUNT ?? '/dav').trim().replace(/^\/+|\/+$/g, '');
+  const latest = await latestBook(env.DB, mount, collectionSegment('recent'));
+
   const payload = {
     totalBooks: totals?.total ?? 0,
     namedBooks: totals?.named ?? 0,
     // 雷锋那一栏的书的数量。前端用它写「人人可署名」。
     collectiveBooks: totals?.collective ?? 0,
     contributors: results ?? [],
+    // 首屏活书脊。null = 书库为空（前端不渲染那张卡）
+    latest: latest
+      ? {
+          title: latest.title,
+          author: latest.author,
+          credit: latest.credit,
+          publishedAt: latest.published_at,
+          href: latest.href,
+        }
+      : null,
   };
 
   const body = JSON.stringify(payload);

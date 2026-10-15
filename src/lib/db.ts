@@ -610,9 +610,21 @@ export interface LatestBook {
   author: string | null;
   credit: string | null;
   published_at: string;
+  /** 浏览器可点的完整路径（含挂载前缀与集合段），由调用方的前缀拼成 */
+  href: string;
 }
 
-export async function latestBook(db: D1Database): Promise<LatestBook | null> {
+/**
+ * 取最近上架的一本书。
+ *
+ * `mountPath` 与 `recentSegment` 由调用方传入（而不是在这里读 env）——
+ * 保持这个函数是纯查询，路由层负责拼路径。
+ */
+export async function latestBook(
+  db: D1Database,
+  mountPath: string,
+  recentSegment: string,
+): Promise<LatestBook | null> {
   const row = await db
     .prepare(
       `SELECT leaf_name, title, author, credit, published_at
@@ -622,5 +634,15 @@ export async function latestBook(db: D1Database): Promise<LatestBook | null> {
         LIMIT 1`,
     )
     .first<LatestBook>();
-  return row ?? null;
+  if (!row) return null;
+  // 拼「/dav/最近收录/<文件名>」，文件名做百分号编码
+  // （可能含 # 等会截断 URL 的字符）
+  //
+  // ⚠️ mountPath 可能带或不带前导斜杠（调用方归一化程度不同）——
+  //   这里统一补上，否则会拼出 `dav/最近收录/…` 这种**相对路径**链接，
+  //   点下去会跳到当前目录的 dav/ 子目录而不是站点根。
+  const encoded = encodeURIComponent(row.leaf_name);
+  const prefix = mountPath.startsWith('/') ? mountPath : `/${mountPath}`;
+  const seg = recentSegment.startsWith('/') ? recentSegment.slice(1) : recentSegment;
+  return { ...row, href: `${prefix}/${seg}/${encoded}` };
 }

@@ -15,8 +15,6 @@
 
 import { themeCss } from './lib/theme';
 import { collectionSegment, type CollectionId } from './lib/collections';
-import type { LatestBook } from './lib/db';
-import { encodeHref } from './lib/xml';
 
 function esc(s: string): string {
   return s.replace(/[&<>"']/g, (c) =>
@@ -24,48 +22,7 @@ function esc(s: string): string {
   );
 }
 
-/**
- * 首屏那张「活书脊」。
- *
- * 为什么用它当首屏而不是一句宣传语：
- * 这个站点最不寻常的事实是**它自己在长大** —— 任何人随时能放一本书
- * 进来，没有审核、没有门槛。以前的首屏写「一间不熄灯的公共书库」，
- * 那是在**描述**书库；这张卡片是在**展示**它，而且明天就会不一样。
- *
- * 它也是全页唯一一个会变的元素 —— 其余部分（书架、榜单、使用方式）
- * 都是安静的辅助信息。注意力预算都花在这里。
- */
-function freshShelf(book: LatestBook, mountPath: string): string {
-  // ⚠️ encodeHref 返回的是**带前导斜杠**的完整路径，不能再拼一个 '/' ——
-  //   否则会产出 `/最近收录//搜神记.epub` 这种双斜杠链接（能跳转，但是坏链）。
-  const href = esc(
-    `${mountPath}/${collectionSegment('recent')}${encodeHref(`/${book.leaf_name}`)}`,
-  );
-  const credit = book.credit || '雷锋';
-  const when = book.published_at.slice(0, 10);
-  return `
-  <a class="fresh" href="${href}" style="animation-delay:.15s">
-    <span class="freshspine" aria-hidden="true"></span>
-    <span class="freshbody">
-      <span class="freshlabel">最近上架</span>
-      <span class="freshtitle">${esc(book.title)}</span>
-      <span class="freshmeta">${book.author ? esc(book.author) : '未署名作者'} · ${esc(credit)} 传来 · ${esc(when)}</span>
-    </span>
-  </a>`;
-}
-
-/**
- * 首页 HTML。
- *
- * `latest` 是最近上架的那本书（首屏那张「活书脊」）。
- * 由调用方传入而不是在这里查 —— 页面模块保持纯函数，
- * 渲染与取数分开，测试时也不需要 D1。
- */
-export function indexHtml(
-  mountPath: string,
-  r2PublicBase: string | null,
-  latest: LatestBook | null,
-): string {
+export function indexHtml(mountPath: string, r2PublicBase: string | null): string {
   const mount = `${mountPath}/`;
   // 集合路径段用中文：WebDAV 客户端与浏览器都以「路径末段」作为文件夹显示名，
   // 所以想让它们显示中文，路径本身就必须是中文（displayname 属性很多客户端不读）。
@@ -77,10 +34,6 @@ export function indexHtml(
     { path: `${mount}${seg('author')}/`, title: '按作者', sub: '寻找同一位作者', icon: '著' },
     { path: `${mount}${seg('format')}/`, title: '按格式', sub: 'EPUB / PDF / CBZ…', icon: '式' },
   ];
-  // 首屏那张「活书脊」：最近上架的那一本。
-  // 取不到（书库为空）时整块不渲染 —— 一个没有书的书库不该假装有。
-  const freshHtml = latest ? freshShelf(latest, mountPath) : '';
-
   const shelfHtml = shelves
     .map((s, i) => {
       return `
@@ -363,7 +316,10 @@ ${themeCss()}
     <p>任何人随时能放一本书进来，<b>不需要注册，也不用等审核</b>。
        浏览器直接看，或用 WebDAV 客户端连上。</p>
   </section>
-${freshHtml}
+  <!-- 首屏「活书脊」：最近上架的那本书。数据由 /api/credits 提供
+       （该接口缓存 1 小时），所以首页本身零 D1 读、可被 CDN 无限缓存。
+       书库为空时 JS 会把这块整个移除。 -->
+  <div class="fresh" id="fresh" hidden></div>
 
   <div class="cta reveal" style="animation-delay:.3s">
     <a class="seal" href="/upload"><span class="dot"></span>上架一本书</a>
@@ -471,10 +427,61 @@ ${shelfHtml}
     return el;
   }
 
+  /**
+   * 首屏那张「活书脊」。
+   *
+   * 与榜单共用同一次 fetch（零额外请求）。书库为空（latest 为 null）时
+   * 整个容器移除 —— 一个没有书的书库不该在首屏摆一张空卡片。
+   *
+   * 转义一律用 textContent，不用 innerHTML 拼字符串。
+   */
+  function renderFresh(latest) {
+    var box = document.getElementById('fresh');
+    if (!box) return;
+    if (!latest || !latest.title) { box.remove(); return; }
+
+    box.hidden = false;
+    box.innerHTML = '';
+
+    var spine = document.createElement('span');
+    spine.className = 'freshspine';
+
+    var body = document.createElement('span');
+    body.className = 'freshbody';
+
+    var label = document.createElement('span');
+    label.className = 'freshlabel';
+    label.textContent = '最近上架';
+
+    var title = document.createElement('a');
+    title.className = 'freshtitle';
+    title.href = latest.href;
+    title.textContent = latest.title;
+
+    var meta = document.createElement('span');
+    meta.className = 'freshmeta';
+    // 署名缺失回落「雷锋」：那是集体署名，不是空值
+    var credit = latest.credit || COLLECTIVE;
+    var who = latest.author || '未署名作者';
+    meta.textContent = who + ' · ' + credit + ' 传来 · ' + (latest.publishedAt || '').slice(0, 10);
+
+    body.appendChild(label);
+    body.appendChild(title);
+    body.appendChild(meta);
+    box.appendChild(spine);
+    box.appendChild(body);
+  }
+
   fetch('/api/credits', { headers: { accept: 'application/json' } })
     .then(function (r) { return r.ok ? r.json() : null; })
     .then(function (d) {
       if (!d) return;
+
+      // ── 首屏活书脊 ──
+      // 与榜单共用同一次 fetch —— 不额外发请求。
+      // 服务端已把 href 拼好（含百分号编码），前端只负责填内容。
+      renderFresh(d.latest);
+
       var cs = d.contributors || [];
       if (cs.length) {
         var frag = document.createDocumentFragment();
@@ -506,9 +513,11 @@ ${shelfHtml}
       }
     })
     .catch(function () {
-      // 静默：榜单是配角，取不到就不显示
+      // 静默：榜单与活书脊都是配角，取不到就不显示，不影响首页可用性
       list.hidden = true;
       empty.hidden = true;
+      var box = document.getElementById('fresh');
+      if (box) box.remove();
     });
 })();
 </script>

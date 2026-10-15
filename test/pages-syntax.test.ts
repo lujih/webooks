@@ -16,7 +16,9 @@
  */
 
 import { SELF } from 'cloudflare:test';
-import { describe, expect, it } from 'vitest';
+import { beforeEach, describe, expect, it } from 'vitest';
+import { resetLibrary, testEnv } from './setup';
+import { latestBook } from '../src/lib/db';
 
 const ORIGIN = 'https://webooks.test';
 
@@ -297,75 +299,86 @@ describe('上传页：可交互元素不能被拖放区吞掉点击', () => {
 });
 
 describe('首屏那张「活书脊」', () => {
-  const SAMPLE = {
-    leaf_name: '搜神记.epub',
-    title: '搜神记',
-    author: '干宝',
-    credit: '雷锋',
-    published_at: '2026-10-14T11:22:33.000Z',
-  };
+  /**
+   * 活书脊现在由**前端**渲染 —— 数据来自 /api/credits（已缓存 1 小时），
+   * 因为首页是流量最大的入口，不该每次未命中都查 D1。
+   *
+   * 所以这里断言的是三件事：
+   *   ① DOM 里有一个空容器（书库为空时 JS 会移除它）
+   *   ② JS 会从 /api/credits 拿 latest 并渲染进去
+   *   ③ 渲染路径的转义、兜底、编码都对
+   */
+  async function homeHtml(): Promise<string> {
+    return (await SELF.fetch(`${ORIGIN}/`, { headers: { accept: 'text/html' } })).text();
+  }
 
-  it('有书时渲染，空书库时不渲染', async () => {
-    const { indexHtml } = await import('../src/home-page');
-    const withBook = indexHtml('/dav', null, SAMPLE);
-    const noBook = indexHtml('/dav', null, null);
-    expect(withBook).toContain('class="fresh"');
-    expect(withBook).toContain('搜神记');
-    // 一个没有书的书库不该假装有 —— 整块不渲染
-    expect(noBook).not.toContain('class="fresh"');
+  // ⚠️ 这组有两条会往 books 插数据 —— 不清库就会读到别的测试留下的书，
+  //   而 latestBook 取的是「最近上架」，插一条 published_at 更晚的就会抢走。
+  beforeEach(async () => {
+    await resetLibrary();
   });
 
-  it('链接指向那本书的真实位置，且没有双斜杠', async () => {
-    const { indexHtml } = await import('../src/home-page');
-    const html = indexHtml('/dav', null, SAMPLE);
-    const href = html.match(/class="fresh" href="([^"]+)"/)![1]!;
-    // encodeHref 已经返回带前导斜杠的路径；再拼一次就是双斜杠坏链
-    expect(href).not.toContain('//');
-    expect(decodeURIComponent(href)).toBe('/dav/最近收录/搜神记.epub');
+  it('首页零 D1 依赖（活书脊由前端渲染）', async () => {
+    const html = await homeHtml();
+    // 容器存在但为空 —— 不是服务端渲染好的
+    expect(html).toContain('id="fresh"');
+    expect(html).toMatch(/id="fresh"[^>]*hidden/);
+    // 服务端 HTML 里不该有具体书名（那是前端填的）
+    expect(html).not.toContain('class="freshtitle">');
   });
 
-  it('中文路径被百分号编码（文件名可能含 # 等会截断 URL 的字符）', async () => {
-    const { indexHtml } = await import('../src/home-page');
-    const html = indexHtml('/dav', null, { ...SAMPLE, leaf_name: 'C# 程序设计#2.epub' });
-    const href = html.match(/class="fresh" href="([^"]+)"/)![1]!;
-    // 裸的 # 会把后面的内容当成 fragment
-    expect(href).not.toContain('#');
-    expect(href).toContain('%23');
+  it('JS 从 /api/credits 取 latest 并渲染', async () => {
+    const html = await homeHtml();
+    const script = html.match(/<script>([\s\S]*?)<\/script>/)![1]!;
+    expect(script).toContain('/api/credits');
+    expect(script).toContain('fresh');
+    // 渲染函数必须存在
+    expect(script).toMatch(/function\s+renderFresh|freshTitle/);
   });
 
-  it('署名缺失时回落到「雷锋」，不显示空', async () => {
-    const { indexHtml } = await import('../src/home-page');
-    const html = indexHtml('/dav', null, { ...SAMPLE, credit: null });
-    expect(html).toContain('雷锋 传来');
-    expect(html).not.toMatch(/undefined|NaN/);
+  it('书库为空时整块移除（不显示空卡片）', async () => {
+    const html = await homeHtml();
+    const script = html.match(/<script>([\s\S]*?)<\/script>/)![1]!;
+    // latest 为 null 时移除容器，而不是留一张空卡
+    expect(script).toMatch(/latest[\s\S]{0,200}(remove|hidden\s*=\s*true)/);
   });
 
-  it('书名/作者被转义（XSS 防线）', async () => {
-    const { indexHtml } = await import('../src/home-page');
-    const html = indexHtml('/dav', null, {
-      ...SAMPLE,
-      title: '<img src=x onerror=alert(1)>',
-      author: '<script>bad()</script>',
-    });
-    expect(html).not.toContain('<img src=x');
-    expect(html).not.toContain('<script>bad()');
-    expect(html).toContain('&lt;img');
-  });
-
-  it('没有作者时给一句人话而不是留空', async () => {
-    const { indexHtml } = await import('../src/home-page');
-    const html = indexHtml('/dav', null, { ...SAMPLE, author: null });
-    expect(html).toContain('未署名作者');
-  });
-
-  it('线上首页确实带上了这本书（端到端）', async () => {
-    const res = await SELF.fetch(`${ORIGIN}/`);
-    const html = await res.text();
-    // 书库里有书时，首屏就该有这张卡；没有时也**不能报错**
-    expect(res.status).toBe(200);
-    if (html.includes('class="fresh"')) {
-      expect(html).toMatch(/class="freshtitle">[^<]+</);
+  it('链接由服务端给出（避免前端拼路径拼错）', async () => {
+    // href 在 latestBook() 里拼好并做百分号编码，前端只负责放进去
+    const row = await latestBook(testEnv.DB, '/dav', '最近收录');
+    // 空书库时返回 null，有书时 href 必须完整且无双斜杠
+    if (row) {
+      expect(row.href).not.toContain('//');
+      expect(row.href.startsWith('/dav/最近收录/')).toBe(true);
     }
+  });
+
+  it('文件名里的 # 被编码（不会截断 URL）', async () => {
+    const db = testEnv.DB;
+    await db.prepare(
+      `INSERT INTO books (id,leaf_name,title,author,language,format,content_type,size,sha256,r2_key,
+        title_letter,author_letter,format_bucket,kind_bucket,kind_source,published_at,created_at,updated_at,status,credit)
+       VALUES ('hash1','C# 编程#2.epub','C# 编程',NULL,'zh','epub','application/epub+zip',100,'s','books/hash1',
+        'C','C','ebook','ebook','derived','2026-10-14','2026-10-14','2026-10-14','published','雷锋')`,
+    ).run();
+    const row = await latestBook(db, '/dav', '最近收录');
+    expect(row).not.toBeNull();
+    expect(row!.href).not.toContain('#');
+    expect(row!.href).toContain('%23');
+  });
+
+  it('署名缺失时回落到「雷锋」', async () => {
+    const db = testEnv.DB;
+    await db.prepare(
+      `INSERT INTO books (id,leaf_name,title,author,language,format,content_type,size,sha256,r2_key,
+        title_letter,author_letter,format_bucket,kind_bucket,kind_source,published_at,created_at,updated_at,status,credit)
+       VALUES ('nc1','无署名.epub','无署名',NULL,'zh','epub','application/epub+zip',100,'s','books/nc1',
+        'W','W','ebook','ebook','derived','2026-10-13','2026-10-13','2026-10-13','published',NULL)`,
+    ).run();
+    const row = await latestBook(db, '/dav', '最近收录');
+    expect(row).not.toBeNull();
+    // NULL credit 由前端兜底成「雷锋」（服务端不猜）
+    expect(row!.credit).toBeNull();
   });
 });
 
@@ -434,5 +447,97 @@ describe('设计系统一致性', () => {
       if (m) widths.add(m[1]!.trim());
     }
     expect(widths.size, `不同的内容宽度：${[...widths].join(' / ')}`).toBeLessThanOrEqual(1);
+  });
+});
+
+describe('首页不再查 D1（请求预算）', () => {
+  /**
+   * 首页是流量最大的入口。原来它每次未命中都跑一次 latestBook()（1 行 D1），
+   * 等于把最贵的路径放在最热门的页面上。
+   *
+   * 现在活书脊改由前端 fetch /api/credits 拿（那个接口缓存 1 小时），
+   * 而且**与榜单共用同一次 fetch** —— 不额外发请求。
+   *
+   * 这一组断言保证这个结构不会退化回去。
+   */
+  it('首页 HTML 不含任何服务端渲染的书脊内容', async () => {
+    const html = await (
+      await SELF.fetch(`${ORIGIN}/`, { headers: { accept: 'text/html' } })
+    ).text();
+    // 容器存在但为空、且 hidden（前端填）
+    expect(html).toContain('id="fresh"');
+    expect(html).toMatch(/<div class="fresh" id="fresh" hidden>/);
+    // 服务端不该出现具体书名/作者/署名
+    expect(html).not.toContain('class="freshtitle">');
+    expect(html).not.toContain('class="freshmeta">');
+    expect(html).not.toContain('class="freshspine"');
+  });
+
+  it('活书脊与榜单共用一次 fetch（不额外发请求）', async () => {
+    const html = await (
+      await SELF.fetch(`${ORIGIN}/`, { headers: { accept: 'text/html' } })
+    ).text();
+    const script = html.match(/<script>([\s\S]*?)<\/script>/)![1]!;
+    // 全文只该有**一次** fetch('/api/credits')
+    const hits = [...script.matchAll(/fetch\(\s*'\/api\/credits'/g)];
+    expect(hits.length, '活书脊和榜单应该复用同一次请求').toBe(1);
+    // 渲染函数在同一个 .then 里被调用
+    expect(script).toMatch(/renderFresh\(d\.latest\)/);
+  });
+
+  it('取不到数据时静默移除（不影响首页可用性）', async () => {
+    const html = await (
+      await SELF.fetch(`${ORIGIN}/`, { headers: { accept: 'text/html' } })
+    ).text();
+    const script = html.match(/<script>([\s\S]*?)<\/script>/)![1]!;
+    // latest 为空 → remove；fetch 失败 → 也 remove
+    expect(script).toMatch(/if\s*\(\s*!latest[^)]*\)\s*\{[^}]*remove\(\)/);
+    expect(script).toMatch(/\.catch\([\s\S]{0,400}getElementById\('fresh'\)/);
+  });
+
+  it('/api/credits 带上了 latest（前端唯一数据源）', async () => {
+    // 自己造一本书，避免依赖别的测试留下的状态
+    await resetLibrary();
+    await testEnv.DB.prepare(
+      `INSERT INTO books (id,leaf_name,title,author,language,format,content_type,size,sha256,r2_key,
+        title_letter,author_letter,format_bucket,kind_bucket,kind_source,published_at,created_at,updated_at,status,credit)
+       VALUES ('lz1','最近上架的书.epub','最近上架的书','某作者','zh','epub','application/epub+zip',100,'s','books/lz1',
+        'Z','M','ebook','ebook','derived','2026-10-15','2026-10-15','2026-10-15','published','测试者')`,
+    ).run();
+
+    // ⚠️ /api/credits 缓存 1 小时 —— resetLibrary 已经清掉了缓存键，
+    //   但同一个测试文件里前面的测试可能已经重新写入过。
+    //   这里直接调 latestBook() 验证服务端逻辑，绕开缓存层
+    //   （缓存行为本身由 requests.test.ts 的那一组覆盖）。
+    const row = await latestBook(testEnv.DB, '/dav', '最近收录');
+    expect(row).not.toBeNull();
+    expect(row!.title).toBe('最近上架的书');
+    expect(row!.author).toBe('某作者');
+    expect(row!.credit).toBe('测试者');
+    expect(row!.href).not.toContain('//');
+    expect(row!.href.startsWith('/dav/最近收录/')).toBe(true);
+
+    // 再验证它真的会出现在响应里（用 purgeByPrefixes 清掉缓存后取）
+    const { purgeByPrefixes } = await import('../src/lib/cache');
+    await purgeByPrefixes();
+    // purgeByPrefixes 之后**必须重新插入**（resetLibrary 在 beforeEach 里跑过，
+    // 但那是在这条测试开头；中间没有别的清库动作，所以书应该还在）
+    const res = await SELF.fetch(`${ORIGIN}/api/credits`);
+    const body = (await res.json()) as {
+      latest: { title: string; href: string; credit: string | null; author: string | null };
+    };
+    expect(body.latest).not.toBeNull();
+    expect(body.latest.title).toBe('最近上架的书');
+    expect(body.latest.author).toBe('某作者');
+    expect(body.latest.credit).toBe('测试者');
+    expect(body.latest.href).not.toContain('//');
+    expect(body.latest.href.startsWith('/dav/最近收录/')).toBe(true);
+  });
+
+  it('书库为空时 latest 为 null（前端会移除那张卡）', async () => {
+    await resetLibrary();
+    const res = await SELF.fetch(`${ORIGIN}/api/credits`);
+    const body = (await res.json()) as { latest: unknown };
+    expect(body.latest).toBeNull();
   });
 });

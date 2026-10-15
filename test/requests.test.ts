@@ -553,10 +553,14 @@ describe('上传者榜单（公开端点）', () => {
   it('只返回名字与本数 —— 不泄漏任何管理信息', async () => {
     const res = await SELF.fetch(`${ORIGIN}/api/credits`);
     const body = (await res.json()) as Record<string, unknown>;
-    // 这是一个**匿名公开**端点，出现任何额外字段都要重新审视
+    // 这是一个**匿名公开**端点，出现任何额外字段都要重新审视。
+    //
+    // latest 是首屏活书脊的数据（书名/作者/署名/日期/链接）——
+    // 全部是书库里本来就公开的信息，没有 IP/内部 ID。
     expect(Object.keys(body).sort()).toEqual([
       'collectiveBooks',
       'contributors',
+      'latest',
       'namedBooks',
       'totalBooks',
     ]);
@@ -566,6 +570,15 @@ describe('上传者榜单（公开端点）', () => {
         Object.keys(c).sort(),
         `贡献者 ${String(c.name)} 的字段超出「名字 + 本数」，需要重新审视是否该公开`,
       ).toEqual(['books', 'name']);
+    }
+    if (body.latest) {
+      expect(Object.keys(body.latest as object).sort()).toEqual([
+        'author',
+        'credit',
+        'href',
+        'publishedAt',
+        'title',
+      ]);
     }
   });
 

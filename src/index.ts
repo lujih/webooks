@@ -18,7 +18,6 @@ import { requestsHtml } from './requests-page';
 import { settings, type Env, type Settings } from './config';
 import { textResponse, withSecurityHeaders } from './lib/http';
 import { indexHtml } from './home-page';
-import { latestBook } from './lib/db';
 import { adminHtml } from './admin-page';
 import { uploadHtml } from './upload-page';
 import { handleDav } from './webdav';
@@ -108,9 +107,14 @@ async function route(request: Request, env: Env): Promise<Response> {
     }
 
     if (path === '/' || path === '') {
-      // 首屏那张「活书脊」要读 1 行 —— 只在首页这一次请求里，不缓存。
-      const latest = await latestBook(env.DB);
-      return new Response(indexHtml(cfg.mountPath, cfg.r2PublicBase, latest), {
+      // ⚠️ 首页**不再查 D1**。首屏那张「活书脊」（最近上架的书）
+      //   改由前端 fetch /api/credits 拿 —— 那个接口已经缓存 1 小时，
+      //   而首页是流量最大的入口。原来这里每次未命中都跑一次
+      //   latestBook()，等于把最贵的路径放在最热门的页面上。
+      //
+      //   代价：书脊比榜单晚一点点出现（多一次 fetch）。
+      //   换来的是首页本身可以被 CDN 无限缓存。
+      return new Response(indexHtml(cfg.mountPath, cfg.r2PublicBase), {
         status: 200,
         headers: {
           'content-type': 'text/html; charset=utf-8',
@@ -138,24 +142,18 @@ async function route(request: Request, env: Env): Promise<Response> {
 
     // 上传页
     if (path === '/upload' || path === '/upload/') {
-      // ⚠️ 原来是 no-store，理由是「页面里有 Turnstile 公钥」——
-      //   但那是**公钥**，本来就可以公开，而且它极少变动。
-      //   结果：每次有人点「上架一本」都消耗 1 次 Worker 请求。
+      // 原来是 no-store，理由是「页面里有 Turnstile 公钥」——
+      // 但**人机验证已经默认关闭**（见 api/upload.ts 的 requireTurnstile），
+      // 那个变量现在是空串，页面实质上是编译期常量。
       //
-      // 缓存 10 分钟。风险点与对策：
-      //   · Turnstile 公钥轮换后，最长 10 分钟内访客拿到旧 key
-      //     → 表现为「上传页验证码不显示」。10 分钟可接受，
-      //       且轮换密钥本来就要配套刷新页面。
-      //   · 页面内联 JS 依赖 env 里读到的 siteKey → 已确认只有这一个
-      //     变量，其余全是编译期常量（见 uploadHtml 的入参）。
-      //
-      // 想彻底消除这个风险：把 siteKey 改成前端 fetch /api/turnstile-config，
-      // 那样页面本身可以无限缓存。但那是另一次改动，先拿这 10 分钟。
+      // 缓存 1 小时。Turnstile 只有被显式打开（UPLOAD_REQUIRE_TURNSTILE=1）
+      // 时 siteKey 才非空，届时密钥轮换最多让访客 1 小时内拿到旧 key
+      // —— 而打开验证码本来就要配套刷新页面，这个代价可接受。
       return new Response(uploadHtml(env.TURNSTILE_SITE_KEY ?? ''), {
         status: 200,
         headers: {
           'content-type': 'text/html; charset=utf-8',
-          'cache-control': 'public, max-age=600',
+          'cache-control': 'public, max-age=3600',
         },
       });
     }
