@@ -79,15 +79,29 @@
   // 所以省请求数只有三条路：① 把响应变成静态资源；② 让客户端少发请求；
   // ③ 让请求不经过本站（302 跳 R2）。这里走第 ① 条。
   //
-  // ── 为什么 public/ 里只放 favicon 与 robots.txt ──
-  // 这两个文件各自堵掉一类**每次访问都发生**的浪费，见文件自身的注释。
+  // ── public/ 里放了什么，为什么 ──
+  //   · favicon.ico、robots.txt —— 各自堵掉一类**每次访问都发生**的浪费
+  //   · 404.html —— 让「不存在的路径」不再花 Worker 请求（见下）
   // HTML 页面**故意不放进来**：它们是动态渲染的（首页要插 DAV_MOUNT 与
   // R2_PUBLIC_BASE，上传页要插 Turnstile 公钥），一旦落成静态文件，
   // 部署时的 --var 覆盖就再也反映不到页面上 —— 那是一种静默失效。
   //
-  // ── ⚠️ not_found_handling 必须保持 "none" ──
-  // 实测（wrangler dev，逐条 curl 对比）：
+  // ═══ not_found_handling: "404-page" + run_worker_first：一次被推翻的决定 ═══
   //
+  // 这里最初配的是 `"none"`，并把「绝不改成 404-page」写进了注释。**这个
+  // 决定后来被推翻了**，因为它把最贵的一类请求留在了计费侧：
+  //
+  //   "none" 下，每一个**不存在的路径**（/wp-login.php、/.env、
+  //   /administrator、/sitemap.xml… 扫描器与爬虫的长尾）都要花
+  //   1 次 Worker 请求换回文本 404。而这类请求的**数量不受本站控制** ——
+  //   这正是 10 万/天被打满时的形态：请求量可以毫无预兆地翻几倍。
+  //
+  //   "404-page" 把这类请求变成静态资源应答（free and unlimited，
+  //   完全不跑 Worker）。代价是必须用 run_worker_first 把**属于 Worker
+  //   的路径逐个列出来** —— 不在列表里又没有对应资源的路径，一律吃静态
+  //   404 页。
+  //
+  // ── 为什么单独用 404-page 会毁掉整站（实测，不是推理）──
   //   "404-page" + 没有 run_worker_first 时，**浏览器访问的每一个 Worker
   //   路由都会被静态 404 页吃掉**。触发条件只有一个请求头
   //   `Sec-Fetch-Mode: navigate`（真实浏览器每次顶层导航都会带），
@@ -95,22 +109,46 @@
   //   /admin、/dav/ 全是 404。workerd 日志原话：
   //     `Sec-Fetch-Mode: navigate` header present - using `not_found_handling` behavior
   //
-  //   改配 run_worker_first 数组能救回来，但它要求**逐个列出**所有属于
-  //   Worker 的路径，且 `/x/*` 不匹配 `/x` 本身、大小写敏感。本项目的
-  //   DAV_MOUNT 是部署期可覆盖的（甚至可为空 = 挂在根上），
-  //   静态列表无法与它保持同步 —— 漏一条就是静默 404，而且测试套件
-  //   抓不到（SELF.fetch 根本不经过资源路由层）。
+  // ── 所以这个列表就是「哪些路径归 Worker」的唯一清单 ──
+  // 规则语义（实测）：匹配请求路径；`/x/*` 匹配 `/x/` 与 `/x/任意`，
+  // **不匹配 `/x` 本身**；大小写敏感且字面匹配（`/HEALTH`、`/health/` 会漏）；
+  // 它**优先于**命中的静态资源。上限 100 条。
   //
-  //   "none" 没有任何这类陷阱：命中静态资源就静态返回，否则照旧交给
-  //   Worker。代价只是「不存在的路径」仍要花 1 次请求换回文本 404 ——
-  //   与加静态资源**之前的行为完全一致**，不是回退。
+  // ⚠️ 漏一条 = 那个路由对真人静默 404，而且**测试套件抓不到**
+  //    （SELF.fetch 完全不经过资源路由层）。因此有三道防线：
+  //      ① 这个列表由 test/static-assets.test.ts 对着 src/index.ts 的
+  //         路由字面量**逐条比对** —— 加了新路由忘了同步，测试立刻红；
+  //      ② scripts/verify-deploy.mjs 带 `Sec-Fetch-Mode: navigate` 探线上，
+  //         真人导航吃静态 404 时部署验证会失败；
+  //      ③ 未知路径由 `__routecheck_*` 探针确认仍是静态 404（省下请求）。
+  //
+  // ⚠️ DAV_MOUNT 是**部署期可覆盖**的（`--var DAV_MOUNT=...`，空串 = 挂在
+  //    站点根）。列表里写死了 `/dav`，所以改了它就必须同步改列表，
+  //    否则整棵书柜树会被静态 404 吃掉。测试里有一条断言钉着
+  //    「wrangler.jsonc 不许出现 vars.DAV_MOUNT」，正是为了让这层耦合显式。
   // ═══════════════════════════════════════════════════════════════════════
   "assets": {
     "directory": "./public",
     // binding 没有用到（Worker 里不会 env.ASSETS.fetch），
     // 但显式写出来让 wrangler 的 dry-run 输出能看清它被绑上了。
     "binding": "ASSETS",
-    "not_found_handling": "none"
+    "not_found_handling": "404-page",
+    // 归 Worker 的路径。**改路由时必须同步这里**（见上面的三道防线）。
+    // 每条都写「带斜杠」与「不带斜杠」两种形态：`/x/*` 不匹配 `/x`，
+    // 而 `/requests/` 既不对应任何静态资源，也不会被自动重定向。
+    "run_worker_first": [
+      "/",
+      "/health",
+      "/api/*",
+      "/dav",
+      "/dav/*",
+      "/requests",
+      "/requests/",
+      "/upload",
+      "/upload/",
+      "/admin",
+      "/admin/"
+    ]
   }
 
   // 令牌类全部用 secret，绝不进仓库：

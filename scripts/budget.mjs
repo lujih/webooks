@@ -153,7 +153,11 @@ function main() {
   //   · 搜索引擎 / 归档站 / AI 抓取器的爬取（robots.txt 只能约束守规矩的）
   //   · 漏洞扫描器探测 /wp-login.php、/.env、/administrator 之类
   //   · 用户反复刷新、断点续传、客户端重试
-  //   · 上面这些的放大：每一个 404 也是一次实打实的 Worker 请求
+  //
+  // 2026-10 起，**不存在的路径已不再计入**：`not_found_handling: "404-page"`
+  // 让它们由 public/404.html 应答，不调用 Worker（扫描器那类流量因此归零）。
+  // 官方定价页：「Requests to static assets are free and unlimited.」
+  // 剩下仍要计费的是**打到了真路由**的爬取与重试 —— 那些无法靠配置消除。
   //
   // 因为没有 API token（本机无 CF 凭据），拿不到线上的真实计数，所以**不猜**：
   // 默认 0，并在结论里明确标注「不含未建模流量」。

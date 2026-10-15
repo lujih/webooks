@@ -327,7 +327,9 @@ async function probeWorkerRoutesWithNavigateHeader() {
     'sec-fetch-dest': 'document',
     accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
   };
-  const routes = ['/', '/upload', '/requests'];
+  // 含带尾斜杠的形式：实测 `/x/*` **不匹配** `/x` 本身，漏在
+  // run_worker_first 里的话这些路径会吃静态 404。
+  const routes = ['/', '/upload', '/requests', '/upload/', '/requests/', '/admin/', '/dav/'];
   try {
     const bad = [];
     for (const path of routes) {
@@ -344,10 +346,55 @@ async function probeWorkerRoutesWithNavigateHeader() {
       status: bad.length === 0 ? 'pass' : 'fail',
       detail: bad.length === 0
         ? `${routes.length} 条路由带 sec-fetch-mode:navigate 均正常`
-        : `❌ 被静态层抢答：${bad.join(' ')} —— 检查 not_found_handling 是不是被改成了 "404-page"`,
+        : `❌ 被静态层抢答：${bad.join(' ')} —— 检查 wrangler.jsonc 的 run_worker_first 是否漏了这条路径`,
     });
   } catch (err) {
     results.push({ name: '浏览器导航头探测', status: 'skip', detail: String(err.message || err) });
+  }
+}
+
+/**
+ * 探针 6：**未知路径必须由静态 404 页应答**（免费），而不是 Worker 的文本 404
+ *
+ * 这才是省请求的那一半。扫描器打过来的不存在的路径数量不受本站控制
+ * （/wp-login.php、/.env、/administrator…），每一条在 Worker 应答时就是一
+ * 次配额。两个条件共同决定它免费：`not_found_handling: "404-page"` 叫它
+ * 不调 Worker，`run_worker_first` 只列真路由、没把 `*` 之类的也揽进来。
+ *
+ * ⚠️ 必须带**浏览器导航头**。`not_found_handling` 对
+ * `Sec-Fetch-Mode: navigate` 的行为**不一样**（miniflare 里那条 flag 叫
+ * SEC_FETCH_MODE_NAVIGATE_HEADER_PREFERS_ASSET_SERVING，本仓库的
+ * compatibility_date 之后默认开启）。纯 curl 测会假绿 —— 曾经配了
+ * "404-page" 却漏掉 run_worker_first，curl 看到的是正常 Worker 路由，
+ * 而真人浏览器看到的是整站 404。
+ *
+ * 判据不只看状态码（Worker 的兜底 404 也是 404），要区分正文：
+ *   · 静态 404 页 = public/404.html，有本站排版（含「没有这一页」）
+ *   · Worker 的 404 = 纯文本 `Not Found`
+ */
+async function probeUnknownPathIsStatic404() {
+  const NAV = {
+    'sec-fetch-mode': 'navigate',
+    'sec-fetch-dest': 'document',
+    accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+  };
+  const path = `/${TMP}_nope`;
+  try {
+    const res = await fetch(`${SITE}${path}`, { headers: NAV });
+    const body = await res.text();
+    const isStaticPage = res.status === 404 && /没有这一页/.test(body);
+    const isWorkerText = body.trim() === 'Not Found';
+    results.push({
+      name: '未知路径由静态 404 应答（不花请求）',
+      status: isStaticPage ? 'pass' : 'fail',
+      detail: isStaticPage
+        ? '404 + public/404.html（免费，未调用 Worker）'
+        : isWorkerText
+          ? '404 但正文是 Worker 的文本 "Not Found" —— 未知路径仍在花配额，检查 not_found_handling 是不是 "none"'
+          : `${res.status}，正文 ${body.length}B 既不像 public/404.html 也不像 Worker 文本`,
+    });
+  } catch (err) {
+    results.push({ name: '未知路径静态 404', status: 'skip', detail: String(err.message || err) });
   }
 }
 
@@ -369,6 +416,7 @@ await probeOverwrite();
 // 所以放在最后：前三条要口令的探针若被跳过，这两条仍然会给出结论。
 await probeStaticFavicon();
 await probeWorkerRoutesWithNavigateHeader();
+await probeUnknownPathIsStatic404();
 
 let fail = 0;
 let pass = 0;

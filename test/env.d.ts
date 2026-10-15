@@ -9,6 +9,7 @@ export interface StaticAssetsSnapshot {
   budgetSource: string;
   verifyDeploySource: string;
   deployWorkflow: string;
+  indexSource: string;
 }
 
 // 让 cloudflare:test 里 env 的类型与 src/config.ts 的 Env 对齐

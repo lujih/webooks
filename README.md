@@ -77,7 +77,7 @@ scripts/
   gen-pinyin-table.mjs  生成 src/lib/pinyin-table.ts（同上，运行时零依赖）
   dav-probe.mjs         ★ 线上 DAV 一致性 / 边缘动词放行 / 100-continue 探针
   size-probe.mjs        ★ 请求体 100 MB 边界探针
-test/                   461 个测试（单元 + 端到端 + 回归）
+test/                   480 个测试（单元 + 端到端 + 回归）
 ```
 
 ---
@@ -323,11 +323,36 @@ rclone mount webooks: /mnt/books \
 - **`robots.txt`** —— 首页有个「进入书柜」链接指向 `/dav/`，而那是棵**可无限枚举**的目录树。
   没有 robots.txt 时爬虫会顺着目录把整个书库翻一遍。注意 HTML 页上的
   `<meta name="robots" content="noindex">` **只阻止收录、不阻止抓取** —— 抓取照样花请求。
+- **`404.html`** —— 见下，它承担的是最大的一块：**所有不存在的路径**。
 
-`wrangler.jsonc` 的 `assets` 配置里 **`not_found_handling` 必须是 `"none"`**，理由写在那个文件的注释里，
-简短版：配成 `"404-page"` 且没有 `run_worker_first` 时，**真人浏览器的每一次顶层导航都会被静态 404 页吃掉**
-（触发条件只有 `Sec-Fetch-Mode: navigate` 这一个头，curl 不带 → curl 冒烟测试全绿而线上整站 404）。
-`scripts/verify-deploy.mjs` 有一条专门带这个头去探测的哨兵。
+#### 未知路径：`404-page` + `run_worker_first`
+
+扫描器打过来的不存在的路径（`/wp-login.php`、`/.env`、`/administrator`…）数量**不受本站控制**，
+而它们在 `not_found_handling: "none"` 下每一条都要花一次 Worker 配额去回一个十来个字节的文本 404。
+这正是上次一天打满 10 万的形态，所以现在配的是：
+
+```jsonc
+"assets": {
+  "directory": "./public",
+  "not_found_handling": "404-page",
+  "run_worker_first": [ /* 每一条 Worker 路由，缺一条那条路由就对真人 404 */ ]
+}
+```
+
+**这两个设置必须成对出现，且是一条线的两端**：
+
+- 只要 `404-page`，不加 `run_worker_first` → 真人浏览器的每一次顶层导航都被静态 404 页吃掉。
+  触发条件只有 `Sec-Fetch-Mode: navigate` 一个头（curl 不带），所以 curl 冒烟测试全绿而线上整站 404。
+- 只要 `run_worker_first` 的语义有一条漏掉 → 那条路径静默 404。实测三条容易漏的规则：
+  `/x/*` **不匹配 `/x` 本身**；字面量精确匹配、**大小写敏感**；`run_worker_first` **优先于**命中的静态资源。
+- `run_worker_first: true`（布尔）**不是**「全部走 Worker」的安全写法 —— 实测它让任何静态资源都不被服务，
+  优化归零。必须用数组。
+
+`test/static-assets.test.ts` 把这条线钉住了：它从 `src/index.ts` 里抠出全部路由字面量，
+断言每一条都被某个 `run_worker_first` 模式覆盖 —— 新加一条路由却忘了同步列表，测试会红。
+`scripts/verify-deploy.mjs` 另有两端哨兵：一条带 navigate 头确认 Worker 路由仍可达，
+一条确认未知路径返回的是 `public/404.html`（而不是 Worker 的文本 `Not Found`）。
+两处都读真实文件，改动会被逼着重新读一遍上面这段论证。
 
 HTML 页面**故意不放进 `public/`**：它们是动态渲染的（首页插 `DAV_MOUNT`/`R2_PUBLIC_BASE`，
 上传页插 Turnstile 公钥），一旦落成静态文件，部署时的 `--var` 覆盖就再也反映不到页面上 —— 那是静默失效。
@@ -512,7 +537,7 @@ npx wrangler secret put UPLOAD_REQUIRE_TURNSTILE   # 值填 1
 ## 测试
 
 ```bash
-npm test          # 461 个测试
+npm test          # 480 个测试
 npm run typecheck
 npm run check:dav  -- --url https://你的域名/dav/   # 线上一致性探针
 npm run check:size -- --url https://你的域名/dav/   # 请求体体积边界
@@ -524,7 +549,8 @@ XML 转义与编码、PROPFIND 请求体解析、Depth 语义、207 响应结构
 200 条硬上限与分页、缓存命中与**写入即失效**、PUT/GET/HEAD/DELETE 全流程、
 未实现方法的明确拒绝、admin 鉴权、**页面内联脚本的语法自检**，
 以及**缓存安全**（每个响应都必须显式声明 `cache-control`，敏感接口不许可缓存）
-与**静态资源层**（`public/` 的产物字节、`_headers` 规则、`not_found_handling` 必须是 `none`）。
+与**静态资源层**（`public/` 的产物字节、`_headers` 规则、`404-page` +
+`run_worker_first` 必须覆盖全部 Worker 路由）。
 
 后两组值得一提：静态资源层跑在 Worker **之外**，`SELF.fetch()` 完全看不到它 ——
 所以它们不测运行时行为，而是**在 Node 侧把 `public/` 的真实文件内容读进来当夹具**

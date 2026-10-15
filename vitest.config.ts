@@ -45,6 +45,11 @@ function readStaticAssetsSnapshot() {
     // 两者都只能在这层钉住 —— 脚本跑在 CI 里，测试够不着。
     verifyDeploySource: read('scripts/verify-deploy.mjs'),
     deployWorkflow: read('.github/workflows/deploy.yml'),
+    // 路由分发源码。wrangler.jsonc 的 run_worker_first 是「哪些路径归 Worker」
+    // 的唯一清单，而漏一条 = 那个路由对真人静默 404、测试套件还抓不到
+    // （SELF.fetch 不经过资源路由层）。所以在这里读源码，让测试把
+    // 路由字面量与那份清单**逐条比对** —— 这是唯一能自动发现漏项的防线。
+    indexSource: read('src/index.ts'),
   };
 }
 

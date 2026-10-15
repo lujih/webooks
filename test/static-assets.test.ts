@@ -8,10 +8,17 @@
  * 也**证明不了** public/ 配对了。
  *
  * 而这一层的配置一旦错，后果是「线上整站 404，而测试全绿」——
- * 这不是假设：实测 `not_found_handling: "404-page"` 时，只要请求带
- * `Sec-Fetch-Mode: navigate`（真实浏览器每次顶层导航都带，curl 不带），
- * `/`、`/upload`、`/requests`、`/admin`、`/dav/` **全部**被静态 404 页吃掉。
+ * 这不是假设：实测 `not_found_handling: "404-page"` **而漏配
+ * `run_worker_first`** 时，只要请求带 `Sec-Fetch-Mode: navigate`
+ * （真实浏览器每次顶层导航都带，curl 不带），`/`、`/upload`、
+ * `/requests`、`/admin`、`/dav/` **全部**被静态 404 页吃掉。
  * curl 冒烟测试因此全是假绿。
+ *
+ * 反过来，`"none"` 没有这个陷阱，但**每一个不存在的路径都要花一次
+ * Worker 请求**去回文本 404 —— 扫描器打过来的路径数量不受本站控制，
+ * 这是上次一天打满 10 万次额度的形态。所以现在的配置是
+ * `"404-page"` + 一份必须覆盖全部 Worker 路由的 `run_worker_first` 列表，
+ * 本文件的两组断言就是这两个条件各自的守卫。
  *
  * 既然测不了运行时行为，就退一步**把配置与产物本身钉死**：
  * 这些断言读的是真实的文件内容，任何一条被改动都会立刻红，
@@ -96,37 +103,134 @@ function parseHeadersFile(text: string): Map<string, string[]> {
 const headersFile = FILES['_headers'] ?? '';
 const headerRules = parseHeadersFile(headersFile);
 
-describe('静态资源配置：not_found_handling 必须是 none', () => {
+describe('静态资源配置：404-page + run_worker_first 必须成对出现', () => {
   const cfg = readWranglerConfig();
 
   it('assets 块存在且指向 ./public', () => {
     // 这条断言同时是「assets 块没被人删掉」的守卫 ——
-    // 删掉它不会让任何功能测试变红，只会让 favicon/robots 静默变回
+    // 删掉它不会让任何功能测试变红，只会让 favicon/robots/404 静默变回
     // 「每次访问花一次 Worker 请求」，属于最难察觉的那类回退。
     expect(cfg.assets, 'assets 块丢失，静态资源优化被移除').toBeTruthy();
     expect(cfg.assets.directory).toBe('./public');
   });
 
-  it('not_found_handling 是 none —— 改成 404-page 会让整站对真人 404', () => {
-    // 这是本文件最重要的一条断言。理由见文件头：
-    // "404-page" 在带 Sec-Fetch-Mode: navigate 的请求上会抢走所有 Worker 路由。
-    expect(cfg.assets.not_found_handling).toBe('none');
+  it('not_found_handling 是 404-page —— 未知路径必须免费，而不是花一次请求', () => {
+    // ⚠️ 这条断言的方向**被推翻过一次**，别再翻回去：
+    //
+    //   最初配的是 "none"，理由是「404-page 会让整站对真人 404」。
+    //   那个观察是对的（下面那条断言仍然在防它），但结论错了：
+    //   配上 run_worker_first 之后，"404-page" 是安全的，而且它是
+    //   **唯一能免费应答未知路径**的配置。
+    //
+    //   为什么这件事重要：扫描器/爬虫打过来的不存在的路径
+    //   （/wp-login.php、/.env、/administrator…）数量不受本站控制，
+    //   而 "none" 下每一条都要花 1 次 Worker 请求去回一个文本 404。
+    //   请求量毫无预兆翻几倍正是上次打满 10 万的形态。
+    expect(cfg.assets.not_found_handling).toBe('404-page');
   });
 
-  it('没有用 run_worker_first 反转顺序', () => {
-    // run_worker_first: true 等于「每个请求都先跑 Worker」——
-    // 静态资源再也省不下一次请求，本优化归零。
-    // （数组形式理论上可用，但它要逐个列出 Worker 路径，而 DAV_MOUNT
-    //   是部署期可覆盖的，静态列表无法保持同步 —— 所以整体禁用。）
-    expect(cfg.assets.run_worker_first).toBeUndefined();
+  it('404.html 存在（404-page 靠它应答，缺了就退回 Worker）', () => {
+    // 缺少 404.html 时 404-page 无页可服，实测会回落给 Worker ——
+    // 于是整条优化静默失效，而功能测试全绿。
+    expect(FILES['404.html'], 'public/404.html 丢失，未知路径又变成计费请求').toBeDefined();
+    expect(utf8(FILES['404.html']!)).toContain('没有这一页');
   });
 
-  it('DAV_MOUNT 没有被 wrangler.jsonc 覆盖（robots.txt 的写死路径依赖它）', () => {
-    // robots.txt 是静态文件，只能写死 `/dav/`。若有人在 vars 里把
-    // DAV_MOUNT 改成别的（比如 /library），这条 Disallow 就失效了，
-    // 而爬虫会重新开始枚举那棵可无限展开的目录树。
-    // 这条断言把这层「隐式耦合」变成显式的：改了就红，逼你去同步 robots.txt。
-    expect(cfg.vars?.DAV_MOUNT, 'DAV_MOUNT 被覆盖了，请同步 public/robots.txt 的 Disallow').toBeUndefined();
+  it('run_worker_first 是数组，不是 true（true 等于每个请求都先跑 Worker）', () => {
+    const rwf = cfg.assets.run_worker_first;
+    expect(Array.isArray(rwf), 'run_worker_first 必须是数组；true 会让静态资源优化归零').toBe(true);
+    expect(rwf.length, '空数组等于所有路径都吃静态 404，整站会瘫').toBeGreaterThan(0);
+  });
+
+  it('DAV_MOUNT 没有被 wrangler.jsonc 覆盖（列表里的 /dav 与 robots.txt 都写死了它）', () => {
+    // run_worker_first 里写死 `/dav`，robots.txt 里写死 `Disallow: /dav/`。
+    // 若有人在 vars 里把 DAV_MOUNT 改成别的（比如 /library），
+    // 两处会同时失效：整棵书柜树被静态 404 吃掉，而爬虫重新开始枚举它。
+    // 这条断言把这层「隐式耦合」变成显式的：改了就红，逼你去同步两处。
+    expect(cfg.vars?.DAV_MOUNT, 'DAV_MOUNT 被覆盖了，请同步 run_worker_first 与 public/robots.txt').toBeUndefined();
+  });
+});
+
+/**
+ * run_worker_first 的模式匹配。语义全部是**实测**得来的（wrangler dev 逐条 curl）：
+ *   · `/x/*` 匹配 `/x/` 与 `/x/任意`，但**不匹配 `/x` 本身**
+ *   · 字面量精确匹配，**大小写敏感**（`/HEALTH`、`/health/` 会漏）
+ *   · 它**优先于**命中的静态资源
+ */
+function routeMatches(pattern: string, path: string): boolean {
+  if (pattern.endsWith('*')) return path.startsWith(pattern.slice(0, -1));
+  return path === pattern;
+}
+
+/**
+ * 从 src/index.ts 里抠出所有属于 Worker 的路径字面量。
+ *
+ * 做法是找路由判定处的那几种写法（`path === '...'`、`path.startsWith('...')`），
+ * 而不是解析 AST —— 够用且不会因为重构而变脆。**找不到就断言失败**，
+ * 所以如果有人把 `path === '/health'` 改成别的形状，这里会先红，
+ * 而不是静默地漏掉一条路由。
+ */
+function workerRouteLiterals(src: string): string[] {
+  const out = new Set<string>();
+  // `path === ''` 是源码里与 `/` 合并写在同一分支的别名（URL 的 pathname
+  // 永远至少是 `/`，所以它实际不可达）。归一到 `/`，否则它会以空串的形式
+  // 混进结果，让「有没有漏项」的判据失效。
+  for (const m of src.matchAll(/\bpath\s*===\s*'([^']*)'/g)) out.add(m[1] === '' ? '/' : m[1]!);
+  for (const m of src.matchAll(/\bpath\.startsWith\('([^']*)'\)/g)) out.add(`${m[1]}*`);
+  return [...out];
+}
+
+describe('run_worker_first 必须覆盖每一个 Worker 路由（漏一条 = 该路由对真人 404）', () => {
+  const cfg = readWranglerConfig();
+  const patterns: string[] = cfg.assets.run_worker_first;
+  const src = SNAPSHOT.indexSource;
+
+  it('源码读到了（否则下面的断言会假绿）', () => {
+    expect(src.length).toBeGreaterThan(1000);
+  });
+
+  it('路由字面量确实抠出来了（抠不到就说明正则失效，必须先修这个）', () => {
+    const routes = workerRouteLiterals(src);
+    // 这几条是路由表的骨架，任何一条抠不到都说明上面的正则已经跟不上代码
+    for (const known of ['/health', '/api/requests', '/requests', '/upload', '/admin', '/api/credits', '/']) {
+      expect(routes, `src/index.ts 里没找到路由 ${known} —— 抠取正则失效了`).toContain(known);
+    }
+  });
+
+  it('src/index.ts 里的每条路由都被某条 run_worker_first 模式覆盖', () => {
+    const missing = workerRouteLiterals(src).filter(
+      (r) => !patterns.some((p) => {
+        // 抠出来的 `startsWith('/api/admin/')` 变成 `/api/admin/*`，
+        // 它要匹配的实际是 `/api/admin/anything`，用样例路径来判。
+        const sample = r.endsWith('*') ? `${r.slice(0, -1)}sample` : r;
+        return routeMatches(p, sample) || r === p;
+      }),
+    );
+    expect(
+      missing,
+      `这些路由没进 run_worker_first，加了静态层后会对真人静默 404：${missing.join(', ')}`,
+    ).toEqual([]);
+  });
+
+  it('每个带斜杠的页面路由都单列了一条（`/x/*` 不匹配 `/x/` 之外的东西，实测）', () => {
+    // `/requests/` 既不对应静态资源、也不会被自动重定向，必须显式列出。
+    for (const p of ['/requests/', '/upload/', '/admin/']) {
+      expect(patterns, `${p} 没被列出，访问它会吃静态 404`).toContain(p);
+    }
+    // `/dav` 与 `/dav/*` 缺一不可：前者是书柜根（PROPFIND 挂载点），
+    // 后者是它下面的一切。实测 `/dav/*` 不匹配 `/dav` 本身。
+    expect(patterns).toContain('/dav');
+    expect(patterns).toContain('/dav/*');
+  });
+
+  it('没有把静态资源路径也塞进 run_worker_first（那等于自己废掉优化）', () => {
+    // run_worker_first 优先于静态资源：一旦把 /favicon.ico 列进去，
+    // 它又变成「每次页面浏览花一次 Worker 请求」，而且测试全绿。
+    for (const f of Object.keys(FILES)) {
+      if (f === '_headers') continue;
+      const p = `/${f}`;
+      expect(patterns.some((pat) => routeMatches(pat, p)), `${p} 被 run_worker_first 抢走了`).toBe(false);
+    }
   });
 });
 
@@ -178,24 +282,61 @@ describe('public/ 产物完整性', () => {
 });
 
 describe('_headers 规则', () => {
-  it('每个 public/ 下的实体文件都有对应的头规则', () => {
-    // 静态资源不经过 Worker，拿不到 withSecurityHeaders() 的那套头。
-    // 漏一条规则 = 那个文件裸奔（没有 Cache-Control 也没有 nosniff）。
+  /**
+   * 静态资源不经过 Worker，拿不到 withSecurityHeaders() 的那套头。
+   * 漏一条 = 那个文件裸奔（没有 nosniff / 没有 CSP）。
+   *
+   * 规则是**两层**的，所以判据要看「这条路径会命中哪些规则」，
+   * 而不是「有没有一条同名规则」：
+   *   · `/*`  —— 所有静态资源的安全头（含未知路径，它们命中这条）
+   *   · 具体路径 —— 自己的 Cache-Control
+   * 两层都命中是**设计如此**，但它们携带的头**必须不相交** ——
+   * 同一个头命中两次会被发两遍，而浏览器对重复 CSP 取交集（越并越严）。
+   */
+  const catchAll = headerRules.get('/*') ?? [];
+  const specific = [...headerRules].filter(([p]) => p !== '/*');
+  /** 该路径实际会命中的头（`/*` 的 + 它自己那条规则的） */
+  const headersFor = (p: string): string[] => [...catchAll, ...(headerRules.get(p) ?? [])];
+
+  it('/* 规则存在，且带上了 Worker 那份的基础安全头', () => {
+    expect(headerRules.has('/*'), '/* 规则丢失，未知路径的静态 404 就没有安全头了').toBe(true);
+    for (const h of ['x-content-type-options', 'referrer-policy', 'content-security-policy']) {
+      expect(catchAll, `/* 缺 ${h}`).toContain(h);
+    }
+  });
+
+  it('每个 public/ 下的实体文件都拿到 nosniff 与 CSP', () => {
     const files = Object.keys(FILES).filter((f) => f !== '_headers');
     expect(files.length).toBeGreaterThan(0);
     for (const f of files) {
-      expect(headerRules.has(`/${f}`), `public/${f} 没有 _headers 规则`).toBe(true);
+      const names = headersFor(`/${f}`);
+      expect(names, `public/${f} 拿不到 x-content-type-options`).toContain('x-content-type-options');
+      expect(names, `public/${f} 拿不到 content-security-policy`).toContain('content-security-policy');
     }
   });
 
-  it('每个静态资源都带 cache-control 与 nosniff', () => {
-    for (const [path, names] of headerRules) {
+  it('每个静态资源都有自己的 Cache-Control（或明确接受默认值）', () => {
+    // 404.html 故意不给 Cache-Control：保留平台默认的
+    // `public, max-age=0, must-revalidate` + ETag —— 改版立刻生效，
+    // 而静态请求本来就免费，不必靠长缓存省什么。
+    for (const [path, names] of specific) {
       expect(names, `${path} 缺 cache-control`).toContain('cache-control');
-      expect(names, `${path} 缺 x-content-type-options`).toContain('x-content-type-options');
+    }
+    // 但需要长缓存的那两个必须有 —— 少了它们，浏览器每次浏览都回来问一次
+    for (const p of ['/favicon.ico', '/robots.txt']) {
+      expect(headerRules.has(p), `${p} 没有独立规则`).toBe(true);
+      expect(specific.find(([k]) => k === p)?.[1], `${p} 缺 cache-control`).toContain('cache-control');
     }
   });
 
-  it('没有重复规则（同一个头发两遍时，浏览器对 CSP 取交集，极难排查）', () => {
+  it('/* 与具体规则的头**不相交**（同一个头发两遍时浏览器取交集，极难排查）', () => {
+    for (const [path, names] of specific) {
+      const dup = names.filter((n) => catchAll.includes(n));
+      expect(dup, `${path} 与 /* 重复定义：${dup.join(', ')}`).toEqual([]);
+    }
+  });
+
+  it('没有重复的规则路径', () => {
     const paths: string[] = [];
     for (const rawLine of headersFile.split('\n')) {
       const line = rawLine.replace(/\s+$/, '');
@@ -205,8 +346,14 @@ describe('_headers 规则', () => {
     expect(paths.length).toBe(new Set(paths).size);
   });
 
-  it('没有用 /* 兜底（兜底规则会和具体规则叠加，导致重复发头）', () => {
-    expect(headerRules.has('/*')).toBe(false);
+  it('CSP 允许内联样式（404 页的样式是内联的），但不允许脚本', () => {
+    // 静态资源里没有任何 JS。一旦哪天有人给静态页加了 <script>，
+    // 这条 CSP 会让它静默不执行 —— 所以在断言里写明这个前提。
+    const csp = headersFile.match(/Content-Security-Policy:\s*(.+)/i)?.[1] ?? '';
+    expect(csp).toContain("style-src 'unsafe-inline'");
+    expect(csp).toContain("default-src 'none'");
+    expect(csp).not.toContain("script-src 'self'");
+    expect(csp).not.toContain('script-src *');
   });
 
   it('_headers 与 robots.txt 自身不会被当成资源下发', () => {
