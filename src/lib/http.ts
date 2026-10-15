@@ -105,17 +105,58 @@ const HTML_HEADERS: Record<string, string> = {
   ].join('; '),
 };
 
-/** 给响应补上安全头（不覆盖已有同名头） */
+/**
+ * 给响应补上安全头（不覆盖已有同名头）。
+ *
+ * ⚠️ 同时还负责**兜底设 `cache-control: no-store`** —— 这不是安全头，
+ *   但放在同一层有充分理由，见下面 `DEFAULT_CACHE_DIRECTIVE` 的长注释。
+ */
 export function withSecurityHeaders(res: Response, isHtml = false): Response {
   const extra = isHtml ? HTML_HEADERS : BASELINE_HEADERS;
   const headers = new Headers(res.headers);
   for (const [k, v] of Object.entries(extra)) {
     if (!headers.has(k)) headers.set(k, v);
   }
+  if (!headers.has('cache-control')) headers.set('cache-control', DEFAULT_CACHE_DIRECTIVE);
   return new Response(res.body, {
     status: res.status,
     statusText: res.statusText,
     headers,
   });
 }
+
+/**
+ * 没写 cache-control 时的兜底值。
+ *
+ * ## 为什么必须是 no-store，而不是「什么都不设」
+ *
+ * 启用 Workers Caching（`wrangler.jsonc` 的 `cache` 块）后，Cloudflare 会在
+ * **调用 Worker 之前**先查缓存 —— 命中时 Worker 一次都不跑，这是唯一能省下
+ * 每日 100,000 请求额度的机制（Cache API `caches.default` 做不到：官方明说
+ * 「every request still executes your Worker on the way in」）。
+ *
+ * 但开启它带来一个**默认危险**：官方文档明确写着
+ *
+ *   > Responses with no `Cache-Control` header are still cached.
+ *   > 200 → 7200 秒（2 小时）
+ *
+ * 于是任何一条忘了设头的路由，其响应会被**匿名缓存 2 小时**。对本站来说
+ * 这是数据泄漏而不仅是脏读 —— `/api/admin/**` 用 `Authorization` 鉴权，
+ * 而 `Authorization` **不在缓存键里**（键只有路径 + 查询串 + Worker 版本）。
+ * 管理接口一旦被缓存，任何匿名访客都能拿到管理数据。
+ *
+ * 审计时实测确认了这些路由**当时全都裸奔**（无 cache-control）：
+ *   `/api/admin/books`、`/api/admin/requests`、`/api/admin/stats`、
+ *   `/api/turnstile-config`
+ *
+ * ## 所以采用「失败即安全」的默认值
+ *
+ * 兜底设 no-store，需要缓存的路由**显式**写 `cache-control` 声明。
+ * 漏写只会让站点少省一点额度（性能问题），不会泄漏数据（安全问题）。
+ * 反过来做（默认可缓存）则要求每条新路由都记得加 no-store —— 迟早会漏。
+ *
+ * 这个默认值对 `getResponse` 的所有调用点生效，包括错误响应
+ * （401/403/404 等），它们本来也绝不该被缓存。
+ */
+const DEFAULT_CACHE_DIRECTIVE = 'no-store';
 

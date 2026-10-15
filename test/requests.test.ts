@@ -456,9 +456,7 @@ describe('求书墙链接可达', () => {
     expect(html).toContain('href="/requests"');
   });
 
-  it('页面对浏览器访问带安全响应头', async () => {
-    // 安全头只在「浏览器直接打开页面」时加（src/index.ts 的 wantsHtml），
-    // WebDAV 客户端的请求不该被塞 CSP。所以这里必须带 accept: text/html。
+  it('HTML 页面带安全响应头', async () => {
     const res = await SELF.fetch(`${ORIGIN}/requests`, { headers: { accept: 'text/html' } });
     expect(res.status).toBe(200);
     expect(res.headers.get('x-frame-options')).toBe('DENY');
@@ -466,10 +464,45 @@ describe('求书墙链接可达', () => {
     expect(res.headers.get('content-security-policy')).toBeTruthy();
   });
 
-  it('页面对脚本请求不加 CSP（避免干扰非浏览器客户端）', async () => {
+  it('不带 Accept 头访问 HTML 页面也带 CSP（安全头不能靠请求头决定）', async () => {
+    // ⚠️ 这条以前是反过来的（断言「无 CSP」），理由是
+    //   「避免干扰非浏览器客户端」。那个理由站不住，而且启用 Workers
+    //   Caching 之后变得危险：
+    //
+    //   ① CSP 只被**浏览器**强制执行，curl/rclone 根本不解析它 ——
+    //      「干扰非浏览器客户端」这个担心不成立。
+    //   ② 缓存键**不含 Accept**（官方文档明确列出 Accept/Authorization/
+    //      Cookie/User-Agent 都不在键里）。靠 Accept 决定响应头 =
+    //      谁先访问，缓存里就存谁那份头：
+    //        浏览器先来 → 带 CSP；脚本先来 → 不带 CSP，之后浏览器也拿到这份
+    //      → 安全头随机丢失。
+    //   ③ 真实安全缺口：浏览器若发 `Accept: */*`（有些客户端会），
+    //      以前会拿不到 CSP。这是可被利用的降级。
+    //
+    //   现在判**响应的 content-type** —— 确定性，且浏览器与脚本拿到
+    //   同一份缓存是正确行为。
     const res = await SELF.fetch(`${ORIGIN}/requests`);
     expect(res.status).toBe(200);
-    expect(res.headers.get('content-security-policy')).toBeNull();
+    expect(res.headers.get('content-type')).toMatch(/text\/html/);
+    expect(
+      res.headers.get('content-security-policy'),
+      'HTML 响应必须始终带 CSP，与请求头无关',
+    ).toBeTruthy();
+  });
+
+  it('WebDAV 的 207 不带 CSP（它靠 content-type 排除，比 Accept 更准）', async () => {
+    // 这才是「不能干扰客户端」的那一类：DAV 多状态响应是 application/xml，
+    // 客户端可能把意外的 CSP 当异常。它天然落在 text/html 判断之外。
+    const res = await SELF.fetch(`${ORIGIN}/dav/${encodeURIComponent('最近收录')}`, {
+      method: 'PROPFIND',
+      headers: { depth: '0' },
+    });
+    expect(res.status).toBe(207);
+    expect(res.headers.get('content-type')).toMatch(/application\/xml/);
+    expect(
+      res.headers.get('content-security-policy'),
+      '207 是 XML，不该被当成 HTML 塞 CSP',
+    ).toBeNull();
   });
 });
 

@@ -24,22 +24,35 @@ import { handleDav } from './webdav';
 
 export default {
   async fetch(request: Request, env: Env, _ctx: ExecutionContext): Promise<Response> {
-    // 所有出口统一补安全响应头，放在最外层是为了「不管走哪条分支都不会漏」。
-    return withSecurityHeaders(await route(request, env), wantsHtml(request));
+    const res = await route(request, env);
+    // 所有出口统一补安全响应头（含 cache-control 兜底），放在最外层是为了
+    // 「不管走哪条分支都不会漏」—— 漏一条就是数据泄漏，见 lib/http.ts 的长注释。
+    return withSecurityHeaders(res, isHtmlResponse(res));
   },
 } satisfies ExportedHandler<Env>;
 
 /**
- * 是否需要 HTML 专属响应头（含 CSP）。
- * 只有「浏览器直接打开页面」的场景加 —— WebDAV 客户端的 207 不加 CSP，
- * 避免被客户端误判为异常响应。
+ * 该响应是否算 HTML（决定加不加 CSP 那一组头）。
+ *
+ * ⚠️ 这里判的是**响应**的 content-type，而不是请求的 `Accept`。
+ *
+ * 原来判的是 `Accept: text/html`，启用 Workers Caching 后就不成立了：
+ * 缓存键只含「路径 + 查询串 + Worker 版本」，**不含 `Accept`**
+ * （官方文档明确列出 `Authorization`/`Cookie`/`Accept-Language`/`User-Agent`
+ *   都不在键里）。于是同一 URL 先被谁访问、缓存里就是谁的那份响应头：
+ *
+ *   · 浏览器先来（Accept: text/html）→ 缓存带 CSP
+ *   · curl 先来（Accept: * / *）→ 缓存**不带 CSP**，之后浏览器也拿到这份
+ *
+ * 结果是安全头随机丢失。而判响应类型是**确定性的**：同一个 URL 的响应
+ * content-type 固定，浏览器和 curl 拿到同一份缓存是正确行为。
+ *
+ * 顺带解决了「207 不能带 CSP」：WebDAV 多状态响应是 application/xml，
+ * 天然落在这条判断之外 —— 比原来靠 Accept 猜更准确。
  */
-function wantsHtml(request: Request): boolean {
-  const path = new URL(request.url).pathname;
-  if (path === '/' || path === '' || path === '/upload' || path === '/upload/') return true;
-  if (path === '/admin' || path === '/admin/') return true;
-  const accept = request.headers.get('accept') ?? '';
-  return request.method === 'GET' && accept.includes('text/html');
+function isHtmlResponse(res: Response): boolean {
+  const ct = res.headers.get('content-type') ?? '';
+  return ct.startsWith('text/html');
 }
 
 async function route(request: Request, env: Env): Promise<Response> {
