@@ -22,6 +22,14 @@ import { latestBook } from '../src/lib/db';
 
 const ORIGIN = 'https://webooks.test';
 
+/**
+ * R2 公开域基址（来自 vitest.config.ts 的 bindings）。
+ *
+ * 不写死字符串：测的就是「同一个 env 值被正确地拼进直链」，
+ * 写死会让「配置改了但代码没跟上」这类问题在测试里看不出来。
+ */
+const R2_BASE = testEnv.R2_PUBLIC_BASE.replace(/\/+$/, '');
+
 /** 从 HTML 里取出所有内联 <script> 的内容（跳过带 src 的外链脚本） */
 function inlineScripts(html: string): string[] {
   const out: string[] = [];
@@ -318,6 +326,23 @@ describe('首屏那张「活书脊」', () => {
     await resetLibrary();
   });
 
+  /**
+   * 插一本「最近上架」的书，让 latestBook() 一定有东西可返回。
+   *
+   * ⚠️ 显式插而不是依赖「库里碰巧有书」：resetLibrary() 之后库是空的，
+   *   靠 `if (row)` 包住断言会让整条测试在空库时**静默通过**。
+   */
+  async function seedLatest(leafName: string, r2Key: string): Promise<void> {
+    await testEnv.DB.prepare(
+      `INSERT INTO books (id,leaf_name,title,author,language,format,content_type,size,sha256,r2_key,
+        title_letter,author_letter,format_bucket,kind_bucket,kind_source,published_at,created_at,updated_at,status,credit)
+       VALUES (?,?,?,'某作者','zh','epub','application/epub+zip',100,'s',?,
+        'L','M','ebook','ebook','derived','2026-12-31','2026-12-31','2026-12-31','published','测试者')`,
+    )
+      .bind(`seed-${r2Key}`, leafName, leafName.replace(/\.[^.]+$/, ''), r2Key)
+      .run();
+  }
+
   it('首页零 D1 依赖（活书脊由前端渲染）', async () => {
     const html = await homeHtml();
     // 容器存在但为空 —— 不是服务端渲染好的
@@ -344,13 +369,68 @@ describe('首屏那张「活书脊」', () => {
   });
 
   it('链接由服务端给出（避免前端拼路径拼错）', async () => {
+    // ⚠️ 必须先插书：这组每条测试开头都是 resetLibrary()，
+    //   不插的话 latestBook() 返回 null，整条测试**静默空转**（看着绿，其实什么都没验）。
+    await seedLatest('链接.epub', 'books/link1');
+    const row = await latestBook(testEnv.DB, '/dav', '最近收录', R2_BASE);
+    expect(row).not.toBeNull();
     // href 在 latestBook() 里拼好并做百分号编码，前端只负责放进去
-    const row = await latestBook(testEnv.DB, '/dav', '最近收录');
-    // 空书库时返回 null，有书时 href 必须完整且无双斜杠
-    if (row) {
-      expect(row.href).not.toContain('//');
-      expect(row.href.startsWith('/dav/最近收录/')).toBe(true);
-    }
+    expect(row!.href).not.toContain('//');
+    expect(row!.href.startsWith('/dav/最近收录/')).toBe(true);
+    // 直链是**绝对**地址，指向 R2 公开域 —— 点它不经过 Worker
+    expect(row!.downloadUrl).toBe(`${R2_BASE}/books/link1`);
+  });
+
+  it('latestBook() 只返回公开字段 —— 内部对象键 r2_key 不许跟出来', async () => {
+    await seedLatest('字段白名单.epub', 'books/keys1');
+    const row = await latestBook(testEnv.DB, '/dav', '最近收录', R2_BASE);
+    expect(row).not.toBeNull();
+    // db.ts 里是**逐字段**构造而不是 `{ ...row }` 展开 —— 后者会把 SELECT
+    // 出来的 r2_key 一起带进返回值。
+    //
+    // ⚠️ 这条测试是「变异测试漏网」后补的：把 db.ts 改成 `...row` 展开时，
+    //   全套测试**一条都没红**。因为 /api/credits 自带一层白名单（它只挑
+    //   title/author/credit/publishedAt/href/downloadUrl 六个字段输出），
+    //   把泄漏挡在了 HTTP 之外。但 latestBook() 是导出的公共函数，
+    //   将来多一个调用方（比如 RSS、OPDS）就会直接把内部键暴露出去，
+    //   而且**不会有人报错**，只是静静多一个字段。所以在这里钉住返回值结构。
+    expect(Object.keys(row!).sort()).toEqual([
+      'author',
+      'credit',
+      'downloadUrl',
+      'href',
+      'leaf_name',
+      'published_at',
+      'title',
+    ]);
+    expect(row!).not.toHaveProperty('r2_key');
+  });
+
+  it('前端优先用直链，且**保留**回退（否则会渲染出 href="undefined"）', async () => {
+    const html = await homeHtml();
+    const script = html.match(/<script>([\s\S]*?)<\/script>/)![1]!;
+    // 必须是 `downloadUrl || href` 这个形状：直链缺席时回退 /dav 路径。
+    //
+    // ⚠️ 这条挡的是一次真实事故的形状（browse-page.ts 的书卡上踩过）：
+    //   直接写 `title.href = latest.downloadUrl;` 在字段缺席时会赋值
+    //   **字符串 "undefined"** —— 浏览器把 `href="undefined"` 当成相对路径，
+    //   点下去变成 `https://站点/undefined`，看起来只是一次普通的下载失败，
+    //   极难定位。所以回退不许省。
+    expect(script, '活书脊必须 downloadUrl 优先、href 兜底').toMatch(
+      /title\.href\s*=\s*latest\.downloadUrl\s*\|\|\s*latest\.href/,
+    );
+  });
+
+  it('没配 R2_PUBLIC_BASE 时 downloadUrl 为 null（而不是 undefined/空串）', async () => {
+    await seedLatest('无直链.epub', 'books/nobase1');
+    // 前端靠 `downloadUrl || href` 回退，null 才会走回退分支；
+    // 空串虽然也是 falsy，但显式 null 让「没配」这件事在 JSON 里可见
+    // （undefined 会被 JSON.stringify 整个丢掉，字段直接消失）。
+    const row = await latestBook(testEnv.DB, '/dav', '最近收录', null);
+    expect(row).not.toBeNull();
+    expect(row!.downloadUrl).toBeNull();
+    // 回退目标仍在：href 照旧拼好
+    expect(row!.href.startsWith('/dav/最近收录/')).toBe(true);
   });
 
   it('文件名里的 # 被编码（不会截断 URL）', async () => {
@@ -361,10 +441,16 @@ describe('首屏那张「活书脊」', () => {
        VALUES ('hash1','C# 编程#2.epub','C# 编程',NULL,'zh','epub','application/epub+zip',100,'s','books/hash1',
         'C','C','ebook','ebook','derived','2026-10-14','2026-10-14','2026-10-14','published','雷锋')`,
     ).run();
-    const row = await latestBook(db, '/dav', '最近收录');
+    const row = await latestBook(db, '/dav', '最近收录', R2_BASE);
     expect(row).not.toBeNull();
     expect(row!.href).not.toContain('#');
     expect(row!.href).toContain('%23');
+    // ⚠️ 直链里**不含书名** —— 对象键是 books/<随机 id>（见 src/lib/r2.ts 顶部
+    //   的论证）。所以 `#` 这类字符根本进不了直链，也就没有截断问题；
+    //   这条断言是钉住那个性质，而不是钉住某个编码结果。
+    expect(row!.downloadUrl).not.toContain('#');
+    expect(row!.downloadUrl).toContain('/books/hash1');
+    expect(row!.downloadUrl).not.toContain('编程');
   });
 
   it('署名缺失时回落到「雷锋」', async () => {
@@ -375,7 +461,7 @@ describe('首屏那张「活书脊」', () => {
        VALUES ('nc1','无署名.epub','无署名',NULL,'zh','epub','application/epub+zip',100,'s','books/nc1',
         'W','W','ebook','ebook','derived','2026-10-13','2026-10-13','2026-10-13','published',NULL)`,
     ).run();
-    const row = await latestBook(db, '/dav', '最近收录');
+    const row = await latestBook(db, '/dav', '最近收录', R2_BASE);
     expect(row).not.toBeNull();
     // NULL credit 由前端兜底成「雷锋」（服务端不猜）
     expect(row!.credit).toBeNull();
@@ -509,13 +595,14 @@ describe('首页不再查 D1（请求预算）', () => {
     //   但同一个测试文件里前面的测试可能已经重新写入过。
     //   这里直接调 latestBook() 验证服务端逻辑，绕开缓存层
     //   （缓存行为本身由 requests.test.ts 的那一组覆盖）。
-    const row = await latestBook(testEnv.DB, '/dav', '最近收录');
+    const row = await latestBook(testEnv.DB, '/dav', '最近收录', R2_BASE);
     expect(row).not.toBeNull();
     expect(row!.title).toBe('最近上架的书');
     expect(row!.author).toBe('某作者');
     expect(row!.credit).toBe('测试者');
     expect(row!.href).not.toContain('//');
     expect(row!.href.startsWith('/dav/最近收录/')).toBe(true);
+    expect(row!.downloadUrl).toBe(`${R2_BASE}/books/lz1`);
 
     // 再验证它真的会出现在响应里（用 purgeByPrefixes 清掉缓存后取）
     const { purgeByPrefixes } = await import('../src/lib/cache');
@@ -524,14 +611,26 @@ describe('首页不再查 D1（请求预算）', () => {
     // 但那是在这条测试开头；中间没有别的清库动作，所以书应该还在）
     const res = await SELF.fetch(`${ORIGIN}/api/credits`);
     const body = (await res.json()) as {
-      latest: { title: string; href: string; credit: string | null; author: string | null };
+      latest: {
+        title: string;
+        href: string;
+        downloadUrl: string | null;
+        credit: string | null;
+        author: string | null;
+      };
     };
     expect(body.latest).not.toBeNull();
     expect(body.latest.title).toBe('最近上架的书');
     expect(body.latest.author).toBe('某作者');
     expect(body.latest.credit).toBe('测试者');
+    // ⚠️ href 的语义**没变**：它仍是书库内的相对路径（WebDAV 路径）。
+    //   直链走的是新字段 downloadUrl —— 前端 `downloadUrl || href`。
+    //   这条断言是防「有人图省事把 href 直接改成直链」，那会让
+    //   href 不再是站内路径，而文档和别的调用方都按站内路径依赖它。
     expect(body.latest.href).not.toContain('//');
     expect(body.latest.href.startsWith('/dav/最近收录/')).toBe(true);
+    // 首页那张卡真正会去的地方：绝对地址、R2 公开域、点它不经过 Worker
+    expect(body.latest.downloadUrl).toBe(`${R2_BASE}/books/lz1`);
   });
 
   it('书库为空时 latest 为 null（前端会移除那张卡）', async () => {

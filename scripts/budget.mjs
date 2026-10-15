@@ -7,8 +7,18 @@
  * 它按真实实现建模，而不是拍脑袋：
  *   - PROPFIND 只读 D1（不调用 R2 list()），所以列表操作不消耗 R2 Class A；
  *     代价是缓存未命中时约 200 行 D1 读取。
- *   - GET 返回 302 跳到 R2 公开域：1 次 Worker 请求 + 1 次 R2 Class B，字节不过 Worker。
- *   - 目录页 HTML 可被 CDN 缓存，重复浏览不消耗 Worker 请求。
+ *   - **浏览器从浏览页点开一本书现在是 R2 直链**：0 次 Worker 请求
+ *     + 1 次 R2 Class B。直链的 Location 由渲染层直接写进书卡 href，
+ *     请求根本不进 Worker。
+ *   - **WebDAV 客户端的 GET 仍然撞 302**：`GET /dav/<书>` 返回
+ *     302 跳到 R2 公开域，1 次 Worker 请求 + 1 次 R2 Class B，
+ *     字节不过 Worker。这一条**没有变** —— rclone / Finder 依赖它。
+ *     所以「下载不再花请求」只对浏览页成立，WebDAV 同步那部分照旧。
+ *   - 未知路径（扫描器的长尾）由 `public/404.html` 应答，不调用 Worker。
+ *   - ⚠️ 目录页 HTML **不是**免费的：它是 Worker 渲染的，每个页面浏览
+ *     都是 1 次请求。曾经这里写着「可被 CDN 缓存，重复浏览不消耗 Worker
+ *     请求」，那句话是错的（Cache API 命中时 Worker 照跑），也是本站
+ *     一度「模型说 16%、现实打满 10 万」的原因之一。
  *
  * 用法：
  *   node scripts/budget.mjs
@@ -106,11 +116,32 @@ function main() {
   const { directories } = treeShape(a.books);
 
   // ── 每次操作的请求成本 ────────────────────────────────────────────────
-  // 浏览会话：进 4 个目录 + 下 3 本书
-  const browseRequests = 4 + 3;
+  // 浏览会话：进 4 个目录 + 下 3 本书。
+  //
+  // 下载那 3 次**不花 Worker 请求**：浏览页的书卡 href 现在是 R2 直链
+  // （`${r2PublicBase}/${encodeR2Key(book.r2_key)}`），点击直接落到 R2，
+  // 完全不进 Worker。以前是 `/dav/<书>` → Worker 回 302 + `no-store`，
+  // 于是**每点一次下载白花一次请求**。
+  //
+  // 但别把这个数字误读成「下载免费」：
+  //   · 这里省掉的只是**浏览页**那一条路；
+  //   · WebDAV 客户端的 `GET /dav/<书>` 仍然花 1 次 Worker 请求（302 未变），
+  //     那部分算在 mountRequests / syncRequests 里；
+  //   · R2 的 Class B 计数照旧 —— 它在 downloadsPerDay 那一行单独记。
+  //
+  // 所以这一栏从 `4 + 3` 变成 `4`。这不是乐观假设，是「请求不再经过
+  // Worker」的直接推论 —— 与 pageViewRequests 那条不同，那条是纠错
+  // （曾经以为缓存能省、其实省不了），这条是真的少了一次调用。
+  const browseRequests = 4;
   // 挂载：客户端列目录树。rclone 有 dir-cache 时只走一遍；Finder 会反复重发
   const mountRequests = 2 * directories;
   // 全库同步：每个目录 1 次 PROPFIND + 每本书 1 次 GET
+  //
+  // 注意这里的 `a.books` **不能**因为「下载已改直链」而删掉：
+  // rclone / Finder 走的是 WebDAV，`GET /dav/<书>` 依然花 1 次 Worker
+  // 请求（302 是 WebDAV 客户端依赖的行为，不能改）。浏览页那条路省下的
+  // 请求只体现在 browseRequests 上。
+  // 真正能让这一项归零的是让 rclone 走 R2 的 S3 端点（见结论处的提示）。
   const syncRequests = directories + a.books;
   // 网页目录页：**1 次请求，一次都不少**。
   //
@@ -182,6 +213,13 @@ function main() {
   const d1RowsWrittenPerDay = a.uploadsPerDay * 3; // upsert + 分桶重建
 
   // ── R2 操作（按月） ───────────────────────────────────────────────────
+  //
+  // 这里才是「下载」真正的记账位置，而且**两种下载都算**：
+  //   · 浏览页的 3 次点击 —— 现在是直链，不再是 Worker 请求，但仍然是
+  //     一次 R2 Class B（GetObject），所以它从 requestsPerDay 搬到了这一行；
+  //   · rclone 全库同步的 `a.books` 次 —— 走 WebDAV，既是 Worker 请求
+  //     （记在 syncRequests）也是 R2 Class B。
+  // 换句话说：直链省的是**请求配额**，不是 R2 的读操作计数。两本账，别混。
   const downloadsPerDay = a.browse * 3 + a.syncs * a.books;
   const r2ClassAPerMonth = a.uploadsPerDay * 30 * 2; // PutObject + CreateMultipartUpload
   const r2ClassBPerMonth = downloadsPerDay * 30;

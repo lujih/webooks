@@ -13,7 +13,16 @@
  *   ────────────────────────────  ──────  ──────
  *   COPY 到 .exe                    201     415   扩展名白名单
  *   UNLOCK 不带 Lock-Token 头       204     400   RFC 4918 §9.11.1
- *   OVERWRITE:F 且目标已存在        201     412   RFC 4918 §9.8.3
+ *   OVERWRITE:F 且目标已存在        201     412   RFC 4918 §10.6 + §8.1
+ *   /favicon.ico                    404     200   由静态资源层服务
+ *   未知路径（/wp-login.php 之类）   Worker  静态 404  不花请求配额
+ *   浏览页书卡 href                 /dav/…  R2 直链   点下载不再花请求配额
+ *
+ * ⚠️ OVERWRITE 那条**没有口令时不能判 fail**：RFC 4918 §10.6 要求
+ *    「The server MUST do authorization checks before checking this or any
+ *    conditional header」，§8.1 更要求授权错误优先于其它错误（否则匿名者
+ *    可以用「412 还是 201」探测目标位置有没有东西）。所以拿到 401 是
+ *    规范行为 —— 缺口令时那条报 skip「无法判定」。详见 CAN_WRITE 处的说明。
  *
  * 任一条返回「修复后的值」，就证明线上是新代码；返回「修复前的值」则说明
  * 部署没生效（或部署到了别的域名/别的 Worker）。
@@ -225,9 +234,12 @@ async function probeUnlockNoToken() {
  * ② 它会落盘（PUT src + dst），而无口令时删不掉 —— 见 CAN_WRITE 处的说明。
  */
 async function probeOverwrite() {
-  const NAME = 'Overwrite: F 撞已有目标（RFC §9.8.3）';
+  const NAME = 'Overwrite: F 撞已有目标（RFC §10.6）';
   if (!CAN_WRITE) {
-    skipWriteProbe(NAME, '未提供 WRITE_TOKEN —— 无口令时服务端按 RFC §8.1 先拒授权，且落盘后删不掉');
+    skipWriteProbe(
+      NAME,
+      '未提供 WRITE_TOKEN —— 无口令时服务端按 RFC 4918 §8.1 先拒授权，且落盘后删不掉',
+    );
     return;
   }
   const src = `${TMP}_ov_src.txt`;
@@ -398,6 +410,88 @@ async function probeUnknownPathIsStatic404() {
   }
 }
 
+/**
+ * 探针 7：**浏览页的书卡必须直链 R2**（点一次下载不再花一次 Worker 请求）
+ *
+ * 这是给一条真实存在的浪费立的哨兵：
+ *
+ *   以前书卡 href 是 `/dav/最近收录/搜神记.epub`，点它会撞上 Worker 的
+ *   302（响应头写死 `cache-control: no-store`）→ 跳 R2。于是**每点开一本
+ *   书就消耗一次请求配额**，而下载的字节本来完全不必经过 Worker。
+ *
+ *   现在 href 直接是 `${r2PublicBase}/books/<id>`，请求根本不进 Worker。
+ *
+ * 判据分三层，缺一层就可能假绿：
+ *   ① 目录页里确实有书卡（没有书就无从验证 —— 报 skip 而不是 pass）
+ *   ② 书卡的 href 是 http(s) **绝对地址**（相对路径一律 fail：`/dav/…` 是
+ *      没改，`""` 或 `undefined` 是拼坏了，两种都不能放过）
+ *   ③ 那个绝对地址真的能拿到书（200/206 + 非 text/html），
+ *      否则可能只是 href 拼错了 —— 「拼错」和「直链」在 ①② 下看起来一样
+ */
+async function probeBookCardsLinkDirectToR2() {
+  const NAME = '书卡直链 R2（不再经 Worker）';
+  try {
+    const res = await fetch(`${DAV}/`, { headers: { accept: 'text/html' } });
+    const html = await res.text();
+    if (res.status !== 200) {
+      results.push({ name: NAME, status: 'skip', detail: `目录页 ${res.status}，无法判定` });
+      return;
+    }
+    // 书卡的 class 是 bookcard（集合卡是 shelfcard，两者都必须区分开）
+    const cards = [...html.matchAll(/<a class="card bookcard" href="([^"]+)"/g)].map((m) => m[1]);
+    if (cards.length === 0) {
+      results.push({ name: NAME, status: 'skip', detail: '这个集合里没有书，无法判定' });
+      return;
+    }
+    // ② 必须是绝对 URL。只断言「不以 /dav/ 开头」是不够的 —— 空的 href、
+    //    或者渲染失败留下的 `href="undefined"` 都是**相对路径**，同样不以
+    //    /dav/ 开头，却会让点击 404（前者还等于没链接）。这里要求 http(s)
+    //    绝对地址，顺带把「直链指向另一个域名」这种错配也挡在外面。
+    //
+    //    顺序：先挑出 `/dav/` 再挑「不是绝对地址」。两种都是 fail，但
+    //    `/dav/` 那条的提示更准确（它说的是「还在花配额」），而 `/dav/` 也
+    //    同样不匹配 http(s)，先判相对地址会把这条诊断吞掉。
+    const viaWorker = cards.filter((h) => h.startsWith('/dav/'));
+    if (viaWorker.length > 0) {
+      results.push({
+        name: NAME,
+        status: 'fail',
+        detail: `${cards.length} 张书卡里有 ${viaWorker.length} 张仍走 /dav/（例：${viaWorker[0]}）`
+          + ' —— 每次点开一本书仍在花请求配额',
+      });
+      return;
+    }
+    const relative = cards.filter((h) => !/^https?:\/\//i.test(h));
+    if (relative.length > 0) {
+      results.push({
+        name: NAME,
+        status: 'fail',
+        detail: `${cards.length} 张书卡里有 ${relative.length} 张**不是绝对地址**（例：${JSON.stringify(relative[0])}）`
+          + ' —— 直链没拼出来，点击会 404 或跳到错误的位置',
+      });
+      return;
+    }
+    // ③ 真去取一本：href 拼错的话这里会拿到 404
+    const probe = cards[0];
+    const book = await fetch(probe, { method: 'HEAD' });
+    const ct = book.headers.get('content-type') || '';
+    const cd = book.headers.get('content-disposition') || '';
+    // R2 公开域对 HEAD 返回 200；带 Range 时是 206。两者都算通。
+    const ok = (book.status === 200 || book.status === 206) && !ct.startsWith('text/html');
+    results.push({
+      name: NAME,
+      status: ok ? 'pass' : 'fail',
+      detail: ok
+        ? `${cards.length} 张书卡全指向 R2 直链，抽查 ${book.status} ${ct}`
+          + (cd ? `，content-disposition 已设置` : '，⚠️ 缺 content-disposition（文件名会是无扩展名的 id）')
+        : `${cards.length} 张书卡是直链，但抽查取不到书：${book.status} ${ct} —— href 可能拼错了`
+          + `（例：${probe}）`,
+    });
+  } catch (err) {
+    results.push({ name: NAME, status: 'skip', detail: String(err.message || err) });
+  }
+}
+
 const ICON = { pass: '✅', fail: '❌', skip: '➖' };
 
 console.log(`线上版本验证：${SITE}`);
@@ -417,6 +511,7 @@ await probeOverwrite();
 await probeStaticFavicon();
 await probeWorkerRoutesWithNavigateHeader();
 await probeUnknownPathIsStatic404();
+await probeBookCardsLinkDirectToR2();
 
 let fail = 0;
 let pass = 0;

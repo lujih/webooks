@@ -28,6 +28,7 @@ import {
 } from '../lib/collections';
 import { findBookByLeaf, getBucketTotal, listBooks, listBucketTotals, type BookRow } from '../lib/db';
 import { httpDate, isoDate, multistatusResponse } from '../lib/http';
+import { encodeR2Key } from '../lib/r2';
 import { davError, davResponse, encodeHref, escapeXml, extractTagNames, multistatus, readDavBody } from '../lib/xml';
 import { allLiveLocks, matchLocksToPaths, lockDiscoveryXml } from '../lib/locks';
 // ── 请求体解析 ──────────────────────────────────────────────────────────
@@ -177,6 +178,18 @@ interface ResourceMeta {
   /** 上传者署名（迁移 0007）；WebDAV 客户端不读这个字段，仅供浏览页用 */
   credit?: string | null;
   format?: string | null;
+  /**
+   * R2 公开域直链，**仅供浏览页书卡用**。
+   *
+   * 有它之后「点一本书」不再经过 Worker：省掉一次请求（免费套餐只有
+   * 10 万次/天），也省掉那次 302 的往返。WebDAV 客户端**必须继续走**
+   * `GET /dav/<路径>` 的 302 —— rclone / Finder 依赖它，而且那条路径
+   * 带鉴权与配额判定，不能绕过。
+   *
+   * 因此它和 author / coverUrl 一样**不进 PROPFIND 的 XML**（见 renderProps
+   * 的白名单），只随 Entry 传给 HTML 渲染。
+   */
+  downloadUrl?: string | null;
 }
 
 // 最大单包上传大小（maxuploadpacketsize，MS 扩展）
@@ -343,6 +356,10 @@ function bookEntry(collection: CollectionId, bucket: string, book: BookRow, r2Pu
       format: book.format_bucket || book.format,
       coverUrl: book.cover_key ? `${r2PublicBase}/${book.cover_key}` : null,
       credit: book.credit,
+      // 直链走 R2 公开域。对象键形如 `books/<随机 id>`（无扩展名、无中文），
+      // 但仍然过 encodeR2Key —— 全站只保留一套「对象键 → URL」的规则，
+      // 否则一旦对象键里出现中文段，这里就是唯一会 404 的那个地方。
+      downloadUrl: `${r2PublicBase}/${encodeR2Key(book.r2_key)}`,
     },
   };
 }

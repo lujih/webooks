@@ -24,6 +24,7 @@ import {
   upsertBookStatement,
 } from '../lib/db';
 import { sniffKindFromBucket } from '../lib/kind-sniff';
+import { r2HttpMetadata } from '../lib/r2';
 import { hasAdminToken } from '../lib/auth';
 import { handleAdminRequests, handleCreditBoard, handleCreditPurge } from './requests';
 import { jsonResponse, textResponse } from '../lib/http';
@@ -41,6 +42,19 @@ import { purgeCreditCache } from './requests';
 
 const BATCH_SIZE = 50;
 const MAX_LIST_LIMIT = 1000;
+
+/**
+ * 回填动作每页最多处理几本。
+ *
+ * 上限卡得比 `MAX_LIST_LIMIT` 小得多，因为这一页里的每一本都要真读 + 真写一遍
+ * 存储：Workers Free 的**子请求上限是 50/次**（D1 与 R2 调用都算），一本最坏是
+ * `head` + `get` + `put` = 3 个，1（本页的 D1 查询）+ 3 × 16 = 49，刚好不越界。
+ * 把 limit 调大不会「更快」，只会撞上子请求上限报错。
+ *
+ * 代价是书多了要翻页（5000 本 = 313 页）。这是免费套餐的硬约束，不是设计缺陷。
+ */
+const MAX_BACKFILL_LIMIT = 16;
+const DEFAULT_BACKFILL_LIMIT = 10;
 
 function authorised(request: Request, url: URL, cfg: Settings): boolean {
   return hasAdminToken(request, url, cfg.adminToken);
@@ -64,6 +78,8 @@ export async function handleAdmin(
       return reindex(env, url);
     case 'rebucket':
       return rebucket(env, url);
+    case 'backfill-disposition':
+      return backfillDisposition(env, url);
     case 'stats':
       return stats(env);
     case 'books':
@@ -570,6 +586,141 @@ async function reindex(env: Env, url: URL): Promise<Response> {
     truncated: listing.truncated,
     nextCursor: listing.truncated ? listing.cursor : null,
     bucketsRebuilt,
+  });
+}
+
+/**
+ * 给库里**已经存在**的书补上 `Content-Disposition`（书卡直链方案的收尾动作）。
+ *
+ * 为什么需要单独跑一次：R2 的 `httpMetadata` **只在写入时生效**，而且 R2 不支持
+ * S3 的 `response-content-disposition` 之类 response-* 覆盖查询参数（实测无效）。
+ * 所以那些在 `src/lib/r2.ts` 落地之前写进去的对象，直链下载下来会叫
+ * `95e860d26bd874cf` 这种随机 id —— 没有扩展名，浏览器也不知道怎么打开。
+ *
+ * 做法：**按 D1 走，不按 R2 列表猜**。
+ *   · 对象键是 `books/<随机 id>`，里面没有扩展名，光看键推不出书名；
+ *     真正权威的书名是 D1 的 `leaf_name` 列。按 list 猜只会得到一堆
+ *     `download` 兜底名（甚至更糟：把 id 当书名写进下载名）。
+ *   · 顺带这也能覆盖「键不在 `books/` 前缀下」的老书（reindex 出过 `library/`）。
+ *
+ * 幂等、可反复跑：已经带对元数据的对象直接跳过（`skipped`），所以中断后
+ * 重跑一次不会重复搬运。`?dryRun=1` 只统计不写，适合第一次上手动之前先看一眼。
+ *
+ * `bytesRewritten` 如实报告这次搬了多少字节：R2 没有「只改元数据」的 API，
+ * 每修一本都要 `get` 真读一遍、`put` 真写一遍（流式，不占内存），所以读与写
+ * 各是这么多字节。R2 的 Class A/B 操作与出网都不按字节计费，这里报出来是为了
+ * 「操作有多大」这件事不靠猜。
+ *
+ * 不需要清任何缓存：对象键与 D1 行都没变，变的只是 R2 响应头，目录列表与书卡
+ * href 完全不受影响。
+ */
+async function backfillDisposition(env: Env, url: URL): Promise<Response> {
+  const after = url.searchParams.get('after') ?? '';
+  const requested = Number.parseInt(
+    url.searchParams.get('limit') ?? String(DEFAULT_BACKFILL_LIMIT),
+    10,
+  );
+  const limit = Math.min(Math.max(requested || DEFAULT_BACKFILL_LIMIT, 1), MAX_BACKFILL_LIMIT);
+  const dryRun = ['1', 'true', 'yes'].includes(
+    (url.searchParams.get('dryRun') ?? '').toLowerCase(),
+  );
+
+  const { results } = await env.DB
+    .prepare(
+      `SELECT id, leaf_name, r2_key, size FROM books
+        WHERE status = 'published' AND id > ?
+        ORDER BY id LIMIT ?`,
+    )
+    .bind(after, limit)
+    .all<{ id: string; leaf_name: string; r2_key: string; size: number }>();
+  const rows = results ?? [];
+
+  let backfilled = 0;
+  let skipped = 0;
+  let missing = 0;
+  let failed = 0;
+  let bytesRewritten = 0;
+  const failures: Array<{ id: string; leafName: string; error: string }> = [];
+
+  for (const row of rows) {
+    // 封面（`covers/`）永远不许带 Content-Disposition：它是 <img> 内联展示的，
+    // 带上 attachment 会让封面在浏览器里变成下载。正常数据里封面只出现在
+    // cover_key 列，这里挡的是「脏数据把封面键写进了 r2_key」。
+    // `uploads/` 是上传暂存区，不该被当成书上架。
+    if (row.r2_key.startsWith('covers/') || row.r2_key.startsWith('uploads/')) {
+      skipped++;
+      continue;
+    }
+
+    try {
+      const head = await env.BUCKET.head(row.r2_key);
+      if (!head) {
+        // D1 有行、R2 没对象：这是数据不一致，值得单独计数（不是「跳过」）
+        missing++;
+        continue;
+      }
+
+      // 目标元数据要**一次给全**：put 会用新的 httpMetadata 整体替换旧值，
+      // 只写 contentDisposition 会把 Content-Type 清成默认值（比不回填更糟）。
+      const want = r2HttpMetadata(row.leaf_name);
+      const current = head.httpMetadata;
+      if (
+        current?.contentDisposition === want.contentDisposition &&
+        current?.contentType === want.contentType
+      ) {
+        skipped++;
+        continue;
+      }
+
+      if (dryRun) {
+        backfilled++;
+        bytesRewritten += head.size;
+        continue;
+      }
+
+      const source = await env.BUCKET.get(row.r2_key);
+      if (!source) {
+        // head 与 get 之间被删掉了（并发删除），不算失败
+        missing++;
+        continue;
+      }
+      const written = await env.BUCKET.put(row.r2_key, source.body, { httpMetadata: want });
+      backfilled++;
+      bytesRewritten += written.size;
+    } catch (err) {
+      failed++;
+      // 只留前几条：一页最多 16 本，多留也没有信息量，反而把响应撑大
+      if (failures.length < 5) {
+        failures.push({
+          id: row.id,
+          leafName: row.leaf_name,
+          error: err instanceof Error ? `${err.name}: ${err.message}` : String(err),
+        });
+      }
+    }
+  }
+
+  const last = rows[rows.length - 1];
+  const nextAfter = rows.length === limit && last ? last.id : null;
+
+  return jsonResponse({
+    action: 'backfill-disposition',
+    after,
+    limit,
+    dryRun,
+    scanned: rows.length,
+    backfilled,
+    skipped,
+    missing,
+    failed,
+    bytesRewritten,
+    nextAfter,
+    failures,
+    note: nextAfter
+      ? `还有下一页，请带上 after=${nextAfter} 再调一次`
+      : dryRun
+        ? '预演完成，没有写入任何对象；去掉 dryRun 参数再跑一次才会真的补上'
+        : '已扫描完全部书；R2 响应头已补上下载名，D1 与目录缓存都不需要改动',
   });
 }
 

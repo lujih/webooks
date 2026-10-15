@@ -20,6 +20,7 @@ import type { Env } from '../config';
 import { ALLOWED_UPLOAD_FORMATS, isAllowedUploadExt, authorBucket, letterBucket, normaliseFormat } from '../lib/collections';
 import { safeEqual } from '../lib/auth';
 import { deriveMetadata, guessAuthorFromText, safeContentTypeFor, sanitiseLeafName } from '../lib/metadata';
+import { r2HttpMetadata } from '../lib/r2';
 import { sniffKindFromBucket } from '../lib/kind-sniff';
 import { adjustBuckets, bucketDeltas, bucketIdentityOf, upsertBook, findBookByLeaf
  } from '../lib/db';
@@ -446,7 +447,10 @@ export async function handleUploadComplete(request: Request, env: Env): Promise<
   const format = normaliseFormat(safeName.split('.').pop());
   // 安全关键：落 R2 的 Content-Type 只按扩展名推导，绝不用 uploads/ 里的元数据
   // 或客户端声明的值 —— R2 对外提供的就是它，信任它等于允许 text/html 托管。
-  const contentType = safeContentTypeFor(safeName);
+  // Content-Disposition 一并由 r2HttpMetadata 生成：网页上传走预签名直传，
+  // 是这条路径上唯一能写下载名的时机，漏掉就只能下载成随机 id。
+  const httpMetadata = r2HttpMetadata(safeName);
+  const contentType = httpMetadata.contentType ?? safeContentTypeFor(safeName);
 
   // 从 uploads/ 搬到 books/ 并登记元数据（自动上架）。
   // 先确认源对象可读（R2 的 get 可能返回 null），再流式搬到目标键。
@@ -456,7 +460,7 @@ export async function handleUploadComplete(request: Request, env: Env): Promise<
   }
   const bookKey = `books/${shortId(8)}`;
   const copied = await env.BUCKET.put(bookKey, source.body, {
-    httpMetadata: { contentType },
+    httpMetadata,
   });
   await env.BUCKET.delete(key);
 

@@ -109,13 +109,14 @@ export function renderBrowsePage(
   const gridOf = (list: Entry[]): string =>
     list
       .map((e, i) => {
-        // encodeHref 做百分号编码：路径段是中文，且文件名可能含 # 之类会截断 URL 的字符
-        const href = esc(`${mountPath}${encodeHref(e.path, e.isCollection)}`);
+        // 服务器上的规范路径：百分号编码（路径段是中文，且文件名可能含 #
+        // 之类会截断 URL 的字符）。目录卡与回退分支都用它。
+        const davHref = esc(`${mountPath}${encodeHref(e.path, e.isCollection)}`);
         const delay = `calc(.05s + ${i} * .035s)`;
         if (e.isCollection) {
           const label = e.meta.displayName.replace(/\/$/, '');
           return `
-      <a class="card shelfcard" href="${href}" style="animation-delay:${delay}">
+      <a class="card shelfcard" href="${davHref}" style="animation-delay:${delay}">
         <span class="shelfmark" aria-hidden="true">
           <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M3 7a2 2 0 0 1 2-2h3.6a2 2 0 0 1 1.6.8l.8 1.2H19a2 2 0 0 1 2 2v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg>
         </span>
@@ -125,6 +126,17 @@ export function renderBrowsePage(
         </span>
       </a>`;
         }
+        // 书卡直接指向 R2 公开域：点一次下载不再消耗一次 Worker 请求。
+        // 这是免费套餐（10 万次/天）下最值钱的一处优化 —— 每次点击原本
+        // 都要经过 Worker 拿一个 302，而那个 302 还带 no-store，缓存不上。
+        //
+        // ⚠️ 不能想当然：downloadUrl 缺席时必须回退到 /dav 路径。
+        // 直接渲染 `href="${e.meta.downloadUrl}"` 会在 undefined 时产出
+        // `href="undefined"` —— 一个相对路径，点击后跳到 /dav/undefined，
+        // 比慢一点糟得多。目录卡永远走 /dav（它必须由 Worker 生成 HTML）。
+        const bookHref = e.meta.downloadUrl
+          ? esc(e.meta.downloadUrl)
+          : davHref;
         const cover = e.meta.coverUrl
           ? `<img src="${esc(e.meta.coverUrl)}" alt="" loading="lazy" decoding="async">`
           : `<span class="nocover">${esc(FORMAT_LABEL[e.meta.format ?? ''] ?? (e.meta.format ?? '').toUpperCase() ?? '书')}</span>`;
@@ -136,7 +148,7 @@ export function renderBrowsePage(
         const creditName = e.meta.credit || '雷锋';
         const credit = `<span class="ccredit" title="上传：${esc(creditName)}">${esc(creditName)}</span>`;
         return `
-      <a class="card bookcard" href="${href}" style="animation-delay:${delay}" title="${esc(e.meta.displayName)}">
+      <a class="card bookcard" href="${bookHref}" style="animation-delay:${delay}" title="${esc(e.meta.displayName)}">
         <span class="cover">${cover}</span>
         <span class="cbody">
           <span class="ctitle">${esc(e.meta.displayName)}</span>

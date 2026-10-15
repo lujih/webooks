@@ -12,6 +12,7 @@
 
 import { SELF } from 'cloudflare:test';
 import { beforeEach, describe, expect, it } from 'vitest';
+import { purgeByPrefixes } from '../src/lib/cache';
 import {
   anonKey,
   normaliseKey,
@@ -24,6 +25,8 @@ import { resetLibrary, testEnv } from './setup';
 
 const ORIGIN = 'https://webooks.test';
 const API = `${ORIGIN}/api/requests`;
+// 本地测试环境里 R2 公开域是 books.test（vitest.config.ts 的 R2_PUBLIC_BASE）
+const R2_BASE = testEnv.R2_PUBLIC_BASE.replace(/\/+$/, '');
 
 function post(body: unknown, ip = '1.2.3.4'): Promise<Response> {
   return SELF.fetch(API, {
@@ -584,6 +587,9 @@ describe('上传者榜单（公开端点）', () => {
   });
 
   it('只返回名字与本数 —— 不泄漏任何管理信息', async () => {
+    // ⚠️ 必须插一本书：不插的话 latest 是 null，下面那个 `if (body.latest)`
+    //   字段白名单**整块空转** —— 看着是绿的，其实 latest 的字段从来没被检查过。
+    await putBook('白名单.epub', 'Alice');
     const res = await SELF.fetch(`${ORIGIN}/api/credits`);
     const body = (await res.json()) as Record<string, unknown>;
     // 这是一个**匿名公开**端点，出现任何额外字段都要重新审视。
@@ -605,9 +611,13 @@ describe('上传者榜单（公开端点）', () => {
       ).toEqual(['books', 'name']);
     }
     if (body.latest) {
+      // 活书脊的字段白名单。`downloadUrl` 是 R2 公开域绝对地址 ——
+      // 它指向的对象是**本来就公开**的（任何人拿到 URL 都能下载），
+      // 不是内部信息，所以可以出现在这个匿名端点上。
       expect(Object.keys(body.latest as object).sort()).toEqual([
         'author',
         'credit',
+        'downloadUrl',
         'href',
         'publishedAt',
         'title',
@@ -616,15 +626,39 @@ describe('上传者榜单（公开端点）', () => {
   });
 
   it('结果被缓存（第二次不再查 D1）', async () => {
-    const t1 = performance.now();
-    await SELF.fetch(`${ORIGIN}/api/credits`);
-    await SELF.fetch(`${ORIGIN}/api/credits`); // 预热，让缓存写入
-    const t2 = performance.now();
-    const r3 = await SELF.fetch(`${ORIGIN}/api/credits`);
-    const t3 = performance.now();
-    expect(r3.status).toBe(200);
-    // 断言「很快」而不是精确时间 —— 缓存命中应该远快于聚合查询
-    expect(t3 - t2).toBeLessThan(50);
+    // ⚠️ 这里曾经断言的是**墙钟时间**（`performance.now()` 之差 < 50ms）。
+    //  那个写法有两个问题：
+    //    · 它测的是「机器闲不闲」而不是「缓存有没有命中」—— CI 上并发跑
+    //     其它测试文件时实测到过 56ms 而红，而缓存其实工作得很好；
+    //    · 它不是一个**证明**：查询变快也可能是 D1 预热、JIT 之类的巧合。
+    //
+    // 换成行为判据：绕开缓存去改 D1，再看端点回的是新值还是旧值。
+    //  回旧值 ⇒ 它读的是缓存，没查 D1。确定性，且不依赖机器负载。
+    // （同一个手法下面「求书墙缓存在数据变化后仍会返回旧数据」那条也在用。）
+    await putBook('缓存判据.epub', '初版署名');
+    const warm = await SELF.fetch(`${ORIGIN}/api/credits`);
+    expect(warm.status).toBe(200);
+    const warmBody = (await warm.json()) as { contributors: { name: string }[] };
+    expect(warmBody.contributors.map((c) => c.name)).toContain('初版署名');
+
+    // 直接改 D1（不经过任何 purge），缓存里仍是刚才那份快照
+    await testEnv.DB.prepare('UPDATE books SET credit = ? WHERE leaf_name = ?')
+      .bind('改过的署名', '缓存判据.epub')
+      .run();
+
+    const cached = await SELF.fetch(`${ORIGIN}/api/credits`);
+    const cachedBody = (await cached.json()) as { contributors: { name: string }[] };
+    expect(
+      cachedBody.contributors.map((c) => c.name),
+      '第二次仍查了 D1 —— 缓存没生效（或这条 URL 的缓存键不稳定）',
+    ).toContain('初版署名');
+
+    // 反向确认：真的清掉缓存后，新值必须立刻出现 ——
+    // 否则上面那条可能只是「端点永远返回旧数据」。
+    await purgeByPrefixes();
+    const fresh = await SELF.fetch(`${ORIGIN}/api/credits`);
+    const freshBody = (await fresh.json()) as { contributors: { name: string }[] };
+    expect(freshBody.contributors.map((c) => c.name)).toContain('改过的署名');
   });
 
   it('书库为空时返回空榜单而不是报错', async () => {
@@ -632,6 +666,61 @@ describe('上传者榜单（公开端点）', () => {
     expect(res.status).toBe(200);
     const body = (await res.json()) as { contributors: unknown[] };
     expect(Array.isArray(body.contributors)).toBe(true);
+  });
+
+  /**
+   * 首页那张「活书脊」的直链。
+   *
+   * 这是 task-1 漏掉的另一半：浏览页的书卡当年改成了 R2 直链，
+   * 但首页这张卡仍然走 `/dav/<路径>` —— 于是首页（流量最大的入口）
+   * 每次点击都还要花一次 Worker 请求。这一组把那条路径钉住。
+   */
+  describe('首页活书脊的下载地址', () => {
+    it('latest.downloadUrl 是 R2 公开域绝对地址，且指向这本书的 r2_key', async () => {
+      await putBook('直链书.epub', 'Bob');
+      await purgeByPrefixes(); // /api/credits 缓存 1 小时，先清掉
+      const row = await testEnv.DB.prepare('SELECT r2_key FROM books WHERE leaf_name = ?')
+        .bind('直链书.epub')
+        .first<{ r2_key: string }>();
+      expect(row?.r2_key).toBeTruthy();
+
+      const res = await SELF.fetch(`${ORIGIN}/api/credits`);
+      const body = (await res.json()) as {
+        latest: { href: string; downloadUrl: string | null } | null;
+      };
+      expect(body.latest).not.toBeNull();
+      // 绝对地址 + R2 公开域 + 就是这本书的对象键
+      expect(body.latest!.downloadUrl).toBe(`${R2_BASE}/${row!.r2_key}`);
+      // ⚠️ href 不变：它仍是站内 WebDAV 路径（别的调用方与文档按此依赖）
+      expect(body.latest!.href.startsWith('/dav/最近收录/')).toBe(true);
+      // 「点一下不经过 Worker」的前提：直链必须是**绝对**地址，
+      // 且主机不是站点自己 —— 否则它还是会打到 Worker 上。
+      expect(body.latest!.downloadUrl!.startsWith(`${R2_BASE}/`)).toBe(true);
+      expect(new URL(body.latest!.downloadUrl!).origin).toBe(new URL(R2_BASE).origin);
+      expect(new URL(body.latest!.downloadUrl!).origin).not.toBe(ORIGIN);
+    });
+
+    it('两本书：latest 取最近上架的那本，直链跟着走', async () => {
+      // 「取最近」这件事原本只有 href 被验过；直链是第二个必须跟着书的字段 ——
+      // 如果 downloadUrl 写成了固定的东西（或取了另一行），这里会红。
+      await putBook('旧书.epub', 'Bob');
+      await testEnv.DB.prepare(
+        `UPDATE books SET published_at = '2020-01-01' WHERE leaf_name = '旧书.epub'`,
+      ).run();
+      await putBook('新书.epub', 'Bob');
+      await testEnv.DB.prepare(
+        `UPDATE books SET published_at = '2030-01-01' WHERE leaf_name = '新书.epub'`,
+      ).run();
+      await purgeByPrefixes();
+
+      const row = await testEnv.DB.prepare('SELECT r2_key FROM books WHERE leaf_name = ?')
+        .bind('新书.epub')
+        .first<{ r2_key: string }>();
+      const res = await SELF.fetch(`${ORIGIN}/api/credits`);
+      const body = (await res.json()) as { latest: { title: string; downloadUrl: string | null } };
+      expect(body.latest.title).toBe('新书');
+      expect(body.latest.downloadUrl).toBe(`${R2_BASE}/${row!.r2_key}`);
+    });
   });
 
   it('首页包含榜单区块，位置在书架之后、使用方式之前', async () => {

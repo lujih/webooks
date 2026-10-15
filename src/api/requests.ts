@@ -355,7 +355,22 @@ export async function handleCreditPublic(request: Request, env: Env): Promise<Re
   //   测试环境（没配 DAV_MOUNT）就会拼出 `/最近收录/...` 这种
   //   少了前缀的路径，而生产环境是 `/dav/最近收录/...` —— 两端不一致。
   const mount = (env.DAV_MOUNT ?? '/dav').trim().replace(/^\/+|\/+$/g, '');
-  const latest = await latestBook(env.DB, mount, collectionSegment('recent'));
+  // R2 公开域基址。这里**自己从 env 取**，而不是让调用方把 cfg.r2PublicBase
+  // 传进来 —— 因为这个函数的签名是 (request, env)，拿不到 Settings。
+  //
+  // ⚠️ 别把它理解成「R2_PUBLIC_BASE 没配时这里会降级」：`/api/credits`
+  //   这条路由排在 `src/index.ts:99` 的 `settings(env)` **之后**，而
+  //   settings() 拿不到 base 就直接抛错 → 路由层回 500
+  //   （「R2_PUBLIC_BASE is not configured」，那是刻意的：README 说它是唯一
+  //   必填项，缺了就不该假装正常）。所以生产路径上这里拿到的 base 一定非空。
+  //   `|| null` 保留是为了让这个函数自洽 —— 单元测试会直接传 null 进来。
+  //
+  //   注意别把这条和 `/api/requests` 搞混：那条**故意**排在 settings() 之前
+  //   （`src/index.ts:81`），为的是没配 base 时求书墙仍能给明确错误而不是 500。
+  //   两条路由的先后是分别定过的，改任何一条之前先看清是哪一条。
+  // 归一化规则与 config.ts 的 settings() 保持一致（去空白、去尾斜杠）。
+  const r2Base = (env.R2_PUBLIC_BASE ?? '').trim().replace(/\/+$/, '');
+  const latest = await latestBook(env.DB, mount, collectionSegment('recent'), r2Base || null);
 
   const payload = {
     totalBooks: totals?.total ?? 0,
@@ -370,7 +385,15 @@ export async function handleCreditPublic(request: Request, env: Env): Promise<Re
           author: latest.author,
           credit: latest.credit,
           publishedAt: latest.published_at,
+          // ⚠️ `href` 的语义**保持原样**：它是「这本书在书库里的位置」，
+          //   站内相对路径 `/dav/最近收录/<文件名>`。
+          //   不要把这里改成直链 —— 它是 WebDAV 路径，前端与文档、
+          //   以及现有测试都按这个语义依赖它。
           href: latest.href,
+          // 新增的**下载**地址：R2 公开域绝对地址，点一下直接命中 R2，
+          // **不经过 Worker**（首页是流量最大的入口，省下的正是最贵的那次）。
+          // 没配 R2_PUBLIC_BASE 时为 null —— 前端必须回退到 href。
+          downloadUrl: latest.downloadUrl,
         }
       : null,
   };

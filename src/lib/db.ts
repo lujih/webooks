@@ -2,6 +2,9 @@
 
 import type { CollectionId } from './collections';
 import { mediaKindOfFormat } from './collections';
+// 「对象键 → URL」全站只允许一套规则（浏览页书卡、GET 的 302 Location、
+// 以及这里的首页活书脊都必须一致，否则同一本书会出现两种 URL）。
+import { encodeR2Key } from './r2';
 
 /** 未留名时的默认署名 */
 export const DEFAULT_CREDIT = '雷锋';
@@ -603,6 +606,12 @@ export async function rebuildBuckets(db: D1Database): Promise<void> {
  * 走的索引是 idx_books_recent2 (status, published_at DESC, id) ——
  * 本轮刚为 /最近收录/ 补的那个，加了 ORDER BY + LIMIT 1 后是 covering，
  * rows_read = 1。
+ *
+ * ⚠️ 本轮为了直链 R2 而多 SELECT 了一列 `r2_key`，它**不在** idx_books_recent2
+ *   里 —— 所以这条查询从「完全走索引」变成了「索引定位 1 行 + 回表 1 次」。
+ *   rows_read 仍是 1（LIMIT 1 只管一行），成本增量是那一次回表。
+ *   这是为了省下一次 **Worker 往返**（首页活书脊点一下原本要经 Worker 302）
+ *   而付的代价，量级上划算；但如果将来这里再加列，要重新算一次。
  */
 export interface LatestBook {
   leaf_name: string;
@@ -612,28 +621,43 @@ export interface LatestBook {
   published_at: string;
   /** 浏览器可点的完整路径（含挂载前缀与集合段），由调用方的前缀拼成 */
   href: string;
+  /**
+   * R2 公开域直链（绝对地址）。首页那张「活书脊」点下去直接命中 R2，
+   * **不经过 Worker** —— 首页是流量最大的入口，省下的正是最贵的那一次。
+   *
+   * 为 null 的两种情况：调用方没传 base（没配 R2_PUBLIC_BASE），
+   * 或行里 r2_key 为空。前端必须回退 href，不能渲染出 `href="undefined"`。
+   */
+  downloadUrl: string | null;
 }
+
+/** SELECT 出来的原始行 —— 比 `LatestBook` 多一列 `r2_key`，且还没有拼好的链接。 */
+type LatestBookRow = Omit<LatestBook, 'href' | 'downloadUrl'> & { r2_key: string };
 
 /**
  * 取最近上架的一本书。
  *
- * `mountPath` 与 `recentSegment` 由调用方传入（而不是在这里读 env）——
- * 保持这个函数是纯查询，路由层负责拼路径。
+ * `mountPath`、`recentSegment`、`r2PublicBase` 都由调用方传入
+ * （而不是在这里读 env）—— 保持这个函数是纯查询，路由层负责拼路径。
+ *
+ * `r2PublicBase` 已经归一化（无尾斜杠）或为 null；传 null 时
+ * `downloadUrl` 也是 null，前端回退到 `href`。
  */
 export async function latestBook(
   db: D1Database,
   mountPath: string,
   recentSegment: string,
+  r2PublicBase: string | null,
 ): Promise<LatestBook | null> {
   const row = await db
     .prepare(
-      `SELECT leaf_name, title, author, credit, published_at
+      `SELECT leaf_name, title, author, credit, published_at, r2_key
          FROM books
         WHERE status = 'published'
         ORDER BY published_at DESC, id
         LIMIT 1`,
     )
-    .first<LatestBook>();
+    .first<LatestBookRow>();
   if (!row) return null;
   // 拼「/dav/最近收录/<文件名>」，文件名做百分号编码
   // （可能含 # 等会截断 URL 的字符）
@@ -644,5 +668,16 @@ export async function latestBook(
   const encoded = encodeURIComponent(row.leaf_name);
   const prefix = mountPath.startsWith('/') ? mountPath : `/${mountPath}`;
   const seg = recentSegment.startsWith('/') ? recentSegment.slice(1) : recentSegment;
-  return { ...row, href: `${prefix}/${seg}/${encoded}` };
+  // ⚠️ 这里**逐字段**构造而不是 `{ ...row }` —— 展开会把 `r2_key`
+  //   一起带进返回值，而 `LatestBook` 是给 /api/credits 用的**公开**结构，
+  //   内部对象键不该出现在那里（真泄漏了也不会有人报错，只会静静多一个字段）。
+  return {
+    leaf_name: row.leaf_name,
+    title: row.title,
+    author: row.author,
+    credit: row.credit,
+    published_at: row.published_at,
+    href: `${prefix}/${seg}/${encoded}`,
+    downloadUrl: r2PublicBase ? `${r2PublicBase}/${encodeR2Key(row.r2_key)}` : null,
+  };
 }

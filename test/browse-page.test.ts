@@ -120,12 +120,30 @@ describe('目录浏览页渲染', () => {
     expect(html).toContain('&lt;img');
   });
 
-  it('书卡链接是百分号编码的可用 URL', async () => {
+  it('书卡直接指向 R2 公开域，不再经过 /dav', async () => {
     await seed(['三体.epub']);
     const res = await browse(`/${encodeURIComponent('按书名')}/S/`);
     const html = await res.text();
-    // href 必须编码（否则中文/特殊字符会破坏链接）；三体按拼音归 S 桶
-    expect(html).toMatch(/href="\/dav\/%E6%8C%89%E4%B9%A6%E5%90%8D\/S\/%E4%B8%89%E4%BD%93\.epub"/);
+    // 书卡 href 是 R2 直链：点一次下载不再消耗一次 Worker 请求
+    //（seed() 里第 0 本的 r2Key 固定为 books/bp-0）
+    expect(html).toContain('href="https://books.test/books/bp-0"');
+    // 反向断言：书卡绝不能再指回 /dav（否则「省一次请求」这个目标就是假的，
+    // 而且 tests 全绿 —— 这是本任务最容易被改坏且不易察觉的一点）
+    expect(html).not.toMatch(/href="\/dav\/%E6%8C%89%E4%B9%A6%E5%90%8D\/S\/%E4%B8%89%E4%BD%93\.epub"/);
+  });
+
+  it('集合卡仍然指向 /dav（目录必须由 Worker 生成 HTML）', async () => {
+    await seed(['三体.epub']);
+    const res = await browse(`/${encodeURIComponent('按书名')}/`);
+    const navHtml = await res.text();
+    // 集合卡是卡片型的另一个分支：改直链时很容易顺手把它一起改掉
+    for (const b of ['S']) {
+      expect(navHtml, `集合卡 ${b} 应仍走 /dav`).toContain(
+        `href="/dav/${encodeURIComponent('按书名')}/${b}/"`,
+      );
+    }
+    // 集成层面再确认一次：目录卡不能是 R2 直链
+    expect(navHtml).not.toContain('href="https://books.test/');
   });
 
   it('中文书按拼音进入对应首字母桶，而不是全部堆在 other', async () => {

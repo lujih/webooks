@@ -542,7 +542,11 @@ describe('浏览器目录页', () => {
     expect(res.status).toBe(200);
     expect(res.headers.get('content-type')).toContain('text/html');
     expect(res.headers.get('cache-control')).toContain('max-age=300');
-    expect(await res.text()).toContain('Dune.epub');
+    const html = await res.text();
+    // 书卡上显示的是**书名**（displayName），不是 leafName —— 直链改动后
+    // href 也不再含 leafName，所以这里断言标题而不是 `Dune.epub`。
+    // 想验「href 是 R2 直链」请见 browse-page.test.ts 的那两条。
+    expect(html).toContain('Dune');
   });
 });
 

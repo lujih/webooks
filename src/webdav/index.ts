@@ -27,6 +27,7 @@ import {
 } from '../lib/db';
 import { methodNotAllowed, shortId, textResponse } from '../lib/http';
 import { safeContentTypeFor, deriveMetadata, sanitiseLeafName } from '../lib/metadata';
+import { encodeR2Key, r2HttpMetadata } from '../lib/r2';
 import { checkPreconditions } from '../lib/preconditions';
 import { parseEpub, coverExtFor, PARSE_SIZE_CAP, type EpubMeta } from '../lib/epub';
 import { sniffKindFromBucket } from '../lib/kind-sniff';
@@ -569,12 +570,15 @@ async function handleMoveCopy(
   // R2 对象复制（COPY）或移动（MOVE 先 copy 后删源）
   const sourceObj = await env.BUCKET.get(sourceBook.r2_key);
   if (!sourceObj) return textResponse(404, 'Source object not found in R2', { allow: ALLOW });
+  // 目标 leafName 要参与元数据推导，所以提到 put 之前（原先在 put 之后才声明）。
+  // 目标扩展名在上面的白名单校验里已经过，这里的 Content-Type 是按**目标**
+  // 名字重新推导的，不是沿用源书 —— 见下方 upsertBook 里的说明。
+  const targetLeafName = sanitiseLeafName(targetLeaf) ?? targetLeaf;
   await env.BUCKET.put(targetR2Key, sourceObj.body, {
-    httpMetadata: { contentType: sourceBook.content_type },
+    httpMetadata: r2HttpMetadata(targetLeafName),
   });
 
   // D1 登记目标
-  const targetLeafName = sanitiseLeafName(targetLeaf) ?? targetLeaf;
   await upsertBook(env.DB, {
     id: targetId,
     leafName: targetLeafName,
@@ -582,6 +586,11 @@ async function handleMoveCopy(
     author: sourceBook.author,
     language: sourceBook.language,
     format: sourceBook.format,
+    // 有意与 R2 对象上写的值不一致，**不是 bug**：这一列描述的是「这本书是
+    // 什么内容」，COPY 源书不改变它的内容类型，所以沿用源书（可能是迁移前
+    // 写入的老值）。而上面 `r2HttpMetadata(targetLeafName)` 描述的是「R2 该
+    // 用什么类型对外提供这个对象」，按目标扩展名重新推导 —— 目标扩展名已经
+    // 过白名单校验。别为了「两边一致」把这里改成目标扩展名推导的值。
     contentType: sourceBook.content_type,
     size: sourceBook.size,
     sha256: sourceBook.sha256,
@@ -739,10 +748,6 @@ async function handleGet(
   });
 }
 
-function encodeR2Key(key: string): string {
-  return key.split('/').map((s) => encodeURIComponent(s)).join('/');
-}
-
 export function renderHtmlIndex(davPath: string, entries: Entry[], mountPath: string): string {
   return renderBrowsePage(davPath, entries, mountPath);
 }
@@ -853,7 +858,11 @@ async function handlePut(request: Request, env: Env, node: DavNode, davPath: str
   const r2Key = `books/${id}`;
   // 安全关键：写入 R2 的 Content-Type **只按扩展名推导**，忽略客户端的声明。
   // R2 对外提供的就是这个值，信任客户端等于允许 text/html 托管（真实漏洞）。
-  const contentType = safeContentTypeFor(leafName);
+  // Content-Disposition 同理 —— 对象键是 `books/<随机 id>`，浏览器只能靠
+  // 这个头把文件存成书名。两者统一由 r2HttpMetadata 生成（见 lib/r2.ts）。
+  const httpMetadata = r2HttpMetadata(leafName);
+  // D1 里单独存一份 Content-Type：语义同上（upsertBook 的 contentType 列）。
+  const contentType = httpMetadata.contentType ?? safeContentTypeFor(leafName);
 
   // 条件请求（RFC 9110 §13.1）：在**写入之前**判定，否则会把别人的书覆盖掉。
   // 同步客户端依赖 If-None-Match: * 做到「仅新建、不覆盖」，服务端必须配合。
@@ -879,7 +888,7 @@ async function handlePut(request: Request, env: Env, node: DavNode, davPath: str
 
   if (parseable) {
     const buf = await request.arrayBuffer();
-    object = await env.BUCKET.put(r2Key, new Uint8Array(buf), { httpMetadata: { contentType } });
+    object = await env.BUCKET.put(r2Key, new Uint8Array(buf), { httpMetadata });
     try {
       parsed = await parseEpub(buf);
       if (parsed?.cover) {
@@ -905,7 +914,7 @@ async function handlePut(request: Request, env: Env, node: DavNode, davPath: str
   } else {
     // 非 EPUB、超大文件、或 chunked：直接流式落 R2，绝不把 body 读进内存
     object = await env.BUCKET.put(r2Key, request.body, {
-      httpMetadata: { contentType },
+      httpMetadata,
     });
   }
 

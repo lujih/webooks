@@ -37,7 +37,9 @@ npm run deploy
 `wrangler deploy --var KEY=VALUE`，不必改文件。
 
 ⚠️ **还要做一件事**：给 R2 桶绑一个**公开自定义域**，填进 `wrangler.jsonc` 的
-`R2_PUBLIC_BASE`。不做的症状是「能列目录，一点下载就 530」。
+`R2_PUBLIC_BASE`。这个地址有两个用途 —— WebDAV 的 `GET` 302 目标，以及浏览页书卡
+的直链。不做的症状是「能列目录，一点下载就 530」（直链会 404/530，Worker 也会在
+第一次请求时就因 `R2_PUBLIC_BASE` 为空而报错）。
 不要用 `r2.dev`（官方明示不适用于生产）。
 
 **完整部署说明（三条路径、GitHub 集成、CI/CD、故障排查）见 [docs/DEPLOY.md](docs/DEPLOY.md)。**
@@ -65,7 +67,7 @@ src/
     cache.ts            条目缓存的键与「写入即失效」逻辑
     metadata.ts         从文件名推导元数据（Phase 1 换成解析 EPUB OPF）
     xml.ts / http.ts    XML 与 HTTP 工具
-  api/admin.ts          reindex / stats / purge
+  api/admin.ts          reindex / stats / purge / backfill-disposition
 migrations/0001_init.sql
 public/                 ★ 静态资源：唯一「不计入请求配额」的一类请求
   favicon.ico           浏览器每次浏览都会猜它；没有它就是每次白花一次请求
@@ -77,14 +79,15 @@ scripts/
   gen-pinyin-table.mjs  生成 src/lib/pinyin-table.ts（同上，运行时零依赖）
   dav-probe.mjs         ★ 线上 DAV 一致性 / 边缘动词放行 / 100-continue 探针
   size-probe.mjs        ★ 请求体 100 MB 边界探针
-test/                   482 个测试（单元 + 端到端 + 回归）
+test/                   单元 + 端到端 + 回归（`npm test` 会报当前条数）
 ```
 
 ---
 
 ## 虚拟目录树（为什么长这样）
 
-请求成本 ≈ **每个目录一次 `PROPFIND` + 每个文件一次 `GET`**。
+请求成本 ≈ **每个目录一次 `PROPFIND` + 每个文件一次 `GET`**（浏览页书卡直连 R2，
+那一侧不花请求；WebDAV 客户端的 `GET` 仍算一次）。
 所以目录数量直接乘进请求数 —— 目录树必须「宽而浅」。
 
 ```
@@ -279,10 +282,32 @@ curl -H "Authorization: Bearer $ADMIN_TOKEN" "https://你的域名/api/admin/reb
 D1 免费额度是 500 万行读/天。10 万次全部未命中 = 2000 万行，**会超**；
 90% 命中率则降到约 200 万行，安全。
 
-### 3. `GET` 返回 302 跳到 R2 公开域
+### 3. 下载完全绕开 Worker：书卡直连 R2，WebDAV 的 `GET` 走 302
 
-下载的字节完全不过 Worker：不占 CPU/内存，不受 100 MB 请求体上限影响，
-还能被 CDN 缓存。R2 出网本来就免费。
+两种客户端各走一条路，但**字节都不过 Worker**：
+
+| 谁 | 怎么下载 | 消耗 Worker 请求？ |
+|---|---|---|
+| 浏览页（浏览器点书卡） | 书卡 href 直接是 `R2_PUBLIC_BASE` 上的对象地址 | ❌ **0 次** |
+| WebDAV 客户端（rclone / Finder / 资源管理器） | `GET /dav/<路径>` → 302 到同一个公开域 | 1 次（读目录时已经在花的那些） |
+
+浏览页那条是**后改的**：更早的时候书卡 href 是 `/dav/<路径>`，所以「点开一本书」
+必须先撞一次 Worker 拿 302；而那个 302 带 `no-store`，CDN 缓存不上，于是每次点击
+都实打实消耗一次配额。现在书卡直接指向 R2，这一次彻底没了（`test/download-direct.test.ts`
+有守卫，防止改回去）。
+
+WebDAV 那条 302 **有意保留**：它带着鉴权与写配额判定，rclone / Finder 也依赖它
+（含 Range 透传），删掉等于把 WebDAV 客户端挡在门外。
+
+两条路的共同点：下载的字节不占 CPU/内存，不受 100 MB 请求体上限影响，还能被
+CDN 缓存。R2 出网本来就免费。
+
+⚠️ **下载名只能靠写入时的 `Content-Disposition`。** 对象键是 `books/<随机 id>`，
+既没有扩展名也没有书名；而 R2 **不支持** S3 的 `response-content-disposition` 之类
+response-* 覆盖参数（实测无效）。所以三条写入路径（WebDAV PUT 的两个分支、COPY/MOVE、
+网页上传 complete）统一用 [src/lib/r2.ts](src/lib/r2.ts) 里的同一个 helper 写入下载名。
+**在它落地之前就存在的对象需要跑一次回填**，否则直链下载下来叫 `95e860d26bd874cf` ——
+命令见下方「数据导入」一节的 `backfill-disposition`。
 
 ### 4. 单目录硬上限 200 条
 
@@ -422,6 +447,34 @@ curl -X POST "https://你的域名/api/admin/reindex?prefix=library/" \
 返回 `nextCursor` 时，带上同一个 cursor 再调一次（R2 列表分页）。
 扫完最后一个前缀才会重建分桶计数，所以中途查询目录树可能是空的。
 
+### 但如果你是从 R2 直接导入的书，还要补一次下载名
+
+对象键 `books/<随机 id>` 里没有书名也没有扩展名，浏览器只能靠对象上的
+`Content-Disposition` 决定「下载下来叫什么」。**这个头只在写入时生效**，
+而 R2 也不支持用查询参数临时覆盖它。所以**在下载名功能上线之前就已经躺在桶里的书**
+需要重写一次元数据：
+
+```bash
+# 先预演：只统计不动对象（建议第一次都这么跑）
+curl -X POST "https://你的域名/api/admin/backfill-disposition?dryRun=1" \
+  -H "Authorization: Bearer $ADMIN_TOKEN"
+
+# 确认数字对得上再真跑，每页 10 本
+curl -X POST "https://你的域名/api/admin/backfill-disposition" \
+  -H "Authorization: Bearer $ADMIN_TOKEN"
+```
+
+返回 `nextAfter` 时，用 `after=<那个值>` 继续调，直到 `nextAfter` 为 `null`。
+逐本处理，所以可以反复跑（已经带对的会进 `skipped`，不会重复搬运字节）。
+返回的 `backfilled / skipped / missing / failed` 四类数量分开计数：
+`backfilled` 是这次重写的本数，`bytesRewritten` 是这些对象的字节数之和
+（每本都是一次 `get` + 一次 `put`，所以实际出入流量约为它的两倍 ——
+R2 没有「只改元数据」的接口，只能整对象重写，这是如实报告，不是估算）。
+`missing` 是「D1 有记录、R2 里没对象」的数据不一致，值得单独看一眼。
+
+每页上限是 **16 本**（`limit` 参数调大也会被 clamp）：Workers Free 的子请求上限是
+50/次，而一本最坏要 `head` + `get` + `put` 三个子请求。
+
 其他管理接口：
 
 ```bash
@@ -537,7 +590,7 @@ npx wrangler secret put UPLOAD_REQUIRE_TURNSTILE   # 值填 1
 ## 测试
 
 ```bash
-npm test          # 482 个测试
+npm test          # 见末尾的「Test Files / Tests」两行
 npm run typecheck
 npm run check:dav  -- --url https://你的域名/dav/   # 线上一致性探针
 npm run check:size -- --url https://你的域名/dav/   # 请求体体积边界
@@ -550,12 +603,18 @@ XML 转义与编码、PROPFIND 请求体解析、Depth 语义、207 响应结构
 未实现方法的明确拒绝、admin 鉴权、**页面内联脚本的语法自检**，
 以及**缓存安全**（每个响应都必须显式声明 `cache-control`，敏感接口不许可缓存）
 与**静态资源层**（`public/` 的产物字节、`_headers` 规则、`404-page` +
-`run_worker_first` 必须覆盖全部 Worker 路由）。
+`run_worker_first` 必须覆盖全部 Worker 路由），还有一组**下载路径不许倒退**的守卫
+（书卡必须直连 R2、必须保留 `/dav` 回退、三处写入路径 —— WebDAV PUT / COPY-MOVE /
+网页上传 complete —— 与回填动作必须共用同一个 helper 带上 `Content-Disposition`，
+详见 `test/download-direct.test.ts`）。
 
 后两组值得一提：静态资源层跑在 Worker **之外**，`SELF.fetch()` 完全看不到它 ——
 所以它们不测运行时行为，而是**在 Node 侧把 `public/` 的真实文件内容读进来当夹具**
 （workerd 的 `node:fs` 是个空壳，读不到仓库文件），把配置与产物本身钉死。
 理由很实际：这一层配错的后果是「线上整站 404，而 400+ 个测试全绿」。
+下载路径那组同理：它断言的是**源码文本本身**（用 `import ... ?raw` 把 `src/` 读进来），
+因为「书卡改回 `/dav`」或「某条写入路径漏掉下载名」都不会让任何行为测试变红 ——
+前者只是每次下载多花一次配额，后者只是下载下来文件名难看，两个都很难在运行时发现。
 
 线上另有几套探针（见 `scripts/`）：
 

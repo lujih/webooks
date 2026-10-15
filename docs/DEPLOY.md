@@ -6,8 +6,9 @@
 
 ## 前置：先把 R2 的公开自定义域准备好
 
-这一步**三条路径都需要，而且最容易漏**。漏掉的症状是：WebDAV 能列目录，但一点下载就
-302 到一个 530 / DNS 失败的地址。
+这一步**三条路径都需要，而且最容易漏**。漏掉的症状有两个：WebDAV 能列目录，但一点
+下载就 302 到一个 530 / DNS 失败的地址；浏览页的书卡也是直接指向这个域的，所以点书卡
+同样打不开。
 
 ```
 Cloudflare Dashboard → R2 → 你的桶 → Settings → Public access → Custom Domains → Connect Domain
@@ -15,6 +16,18 @@ Cloudflare Dashboard → R2 → 你的桶 → Settings → Public access → Cus
 
 绑一个你自己的子域，例如 `books.example.com`，然后把这个地址填进 `wrangler.jsonc` 的
 `R2_PUBLIC_BASE`。
+
+这个地址同时是浏览页书卡 href 的来源：书卡直接指向 `R2_PUBLIC_BASE/books/<id>`，
+所以点一次下载**不消耗 Worker 请求**（WebDAV 客户端那条 302 路径仍然保留）。
+填完之后如果线上是旧数据、下载下来是个随机 id 的文件名，跑一次回填即可：
+
+```bash
+curl -X POST "https://你的域名/api/admin/backfill-disposition?dryRun=1" \
+  -H "Authorization: Bearer $ADMIN_TOKEN"
+```
+
+先 `dryRun=1` 看数字，确认后去掉它真跑，返回 `nextAfter` 则用 `after=<那个值>` 继续调。
+详见 README 的「数据导入」一节。
 
 ⚠️ 不要用 `r2.dev`：官方文档明说 *"not intended for production"*，几百 req/s 就会 429。
 
@@ -223,7 +236,8 @@ curl -X POST "https://你的域名/api/admin/reindex?prefix=library/" \
 |---|---|---|
 | `Couldn't find an auto-provisioned D1 DB named 'webooks-db' for binding 'DB'` | 迁移跑在 deploy 之前，而 D1 要等 deploy 才创建 | Deploy command 改成 `npm run deploy:cloudflare`（deploy 在前）|
 | 访问返回 503 `Database schema is not initialised` | 已部署但还没跑迁移 | `npm run db:migrate`，或重跑一次 deploy command |
-| 下载 302 到 530 / DNS 失败 | R2 公开自定义域没配，或 `R2_PUBLIC_BASE` 没改 | 见本文开头 |
+| 下载 302 到 530 / DNS 失败（含浏览页书卡点不开） | R2 公开自定义域没配，或 `R2_PUBLIC_BASE` 没改 | 见本文开头 |
+| 下载下来是个随机 id 的文件名（如 `95e860d26bd874cf`） | 对象没有 `Content-Disposition`（下载名功能上线前写进去的） | `POST /api/admin/backfill-disposition`，见本文开头 |
 | `PROPFIND` 返回 404 | 表没建 | `npm run db:migrate` |
 | 目录列得出来但一直是空的 | 没跑 reindex，或 reindex 没走到最后一个 cursor | 看 `bucketsRebuilt` 是否为 true |
 | 新增的书 5 分钟内不出现 | PROPFIND 缓存 TTL | 正常。`POST /api/admin/purge?path=/title/A/` 可立即失效 |

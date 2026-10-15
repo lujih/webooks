@@ -459,7 +459,23 @@ ${shelfHtml}
 
     var title = document.createElement('a');
     title.className = 'freshtitle';
-    title.href = latest.href;
+    // 直链优先：R2 公开域是绝对地址，点一下直接命中 R2，**不经过 Worker**。
+    //
+    // ⚠️ 回退**不能**省。真正会用到它的场景不是「没配 R2_PUBLIC_BASE」
+    //   —— 那种情况下全站早就 500 了（settings() 在路由之前就抛错），
+    //   根本轮不到这里。会用到它的是**缓存错配**：这段脚本由站点根路径提供、
+    //   max-age 一小时；而 /api/credits 那份 JSON 也各自缓存 1 小时。
+    //   于是一个刚部署完的窗口里，新脚本可能配上一份**部署前**缓存的响应 ——
+    //   那份 JSON 里压根没有 downloadUrl 字段，取出来是 undefined。
+    //   少了回退就会把「undefined」四个字当路径塞进 DOM，
+    //   点下去变成 /dav/undefined 这种死链，而且它**看起来**只是一次
+    //   普通的下载失败，很难定位。（同一个坑在 browse-page.ts 的书卡上踩过。）
+    //
+    // ⚠️⚠️ 本文件整体是一个模板字符串：**注释里绝对不许出现反引号**。
+    //   它会提前闭合外层模板串，把后面的注释当代码解析。
+    //   我在这一处连续踩了两次（oxc：「Expected ";" but found ...」），
+    //   引号请一律用「」。（真·踩过两次，不是修辞。）
+    title.href = latest.downloadUrl || latest.href;
     title.textContent = latest.title;
 
     var meta = document.createElement('span');
