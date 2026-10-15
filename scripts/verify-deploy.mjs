@@ -429,10 +429,6 @@ for (const r of results) {
 }
 
 console.log('');
-if (pass > 0 && fail === 0) {
-  console.log(`  结论：线上是**新代码**（${pass} 项通过）`);
-  process.exit(STRICT ? 0 : 0);
-}
 if (fail > 0) {
   console.log(`  结论：线上仍是**旧代码**（${fail} 项不符预期）`);
   console.log('');
@@ -442,6 +438,10 @@ if (fail > 0) {
   console.log('    · 部署失败但 CI 没把它标红（看 Actions 页面的日志）');
   console.log('    · 边缘缓存还没更新（等几十秒重跑本脚本）');
   process.exit(STRICT ? 1 : 0);
+}
+if (pass > 0) {
+  console.log(`  结论：线上是**新代码**（${pass} 项通过）`);
+  process.exit(0);
 }
 console.log('  结论：无法判定（所有探针都被跳过）');
 process.exit(STRICT ? 1 : 0);

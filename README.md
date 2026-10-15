@@ -77,7 +77,7 @@ scripts/
   gen-pinyin-table.mjs  生成 src/lib/pinyin-table.ts（同上，运行时零依赖）
   dav-probe.mjs         ★ 线上 DAV 一致性 / 边缘动词放行 / 100-continue 探针
   size-probe.mjs        ★ 请求体 100 MB 边界探针
-test/                   480 个测试（单元 + 端到端 + 回归）
+test/                   482 个测试（单元 + 端到端 + 回归）
 ```
 
 ---
@@ -537,7 +537,7 @@ npx wrangler secret put UPLOAD_REQUIRE_TURNSTILE   # 值填 1
 ## 测试
 
 ```bash
-npm test          # 480 个测试
+npm test          # 482 个测试
 npm run typecheck
 npm run check:dav  -- --url https://你的域名/dav/   # 线上一致性探针
 npm run check:size -- --url https://你的域名/dav/   # 请求体体积边界

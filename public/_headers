@@ -29,7 +29,7 @@
 #   · favicon / robots 在下面各有自己的规则（它们要长缓存）
 #   · 404 页保留平台默认的 `public, max-age=0, must-revalidate` + ETag ——
 #     改版后立刻生效，而静态请求本来就免费，不必靠长缓存省什么
-/* 
+/*
   X-Content-Type-Options: nosniff
   Referrer-Policy: strict-origin-when-cross-origin
   Content-Security-Policy: default-src 'none'; style-src 'unsafe-inline'; img-src 'self' data:; base-uri 'none'; form-action 'none'; frame-ancestors 'none'; object-src 'none'

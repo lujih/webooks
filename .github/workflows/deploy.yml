@@ -186,4 +186,20 @@ jobs:
           if [ -z "$WRITE_TOKEN" ]; then
             echo "::warning::未设置 secret WRITE_TOKEN，三条写探针将被跳过（静态层探针仍会跑）"
           fi
-          node scripts/verify-deploy.mjs --url "$WORKER_URL"
+          # `--strict` 不可省：不加它时探针即使报 ❌ 也退出 0，
+          # 这个 job 就永远不会红 —— 一个不会失败的门卫比没有门卫更糟，
+          # 因为它会被读成「线上已验证通过」。test/static-assets.test.ts 守着这行。
+          #
+          # 边缘传播可能要几十秒（探针自己的失败提示里就列了这一条），
+          # 所以失败后等 30 秒重试一次。真回归会两次都红，不会因此漏掉；
+          # 只有最后一次的结果决定这个 job 的成败。
+          for attempt in 1 2; do
+            if node scripts/verify-deploy.mjs --url "$WORKER_URL" --strict; then
+              exit 0
+            fi
+            if [ "$attempt" = 1 ]; then
+              echo "::warning::首次探测未通过，30 秒后重试（可能是边缘传播延迟）"
+              sleep 30
+            fi
+          done
+          exit 1

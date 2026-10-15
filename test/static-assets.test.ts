@@ -514,4 +514,25 @@ describe('线上验证探针：不许再报假阴性、不许再留垃圾', () =
     // 且缺口令时要发出警告（GitHub 的 ::warning:: 注解），别让它静默。
     expect(workflow, '缺 WRITE_TOKEN 时没有告警').toContain('::warning::');
   });
+
+  it('CI 必须用 --strict 调探针（否则这个 job 永远不会红）', () => {
+    // 缺陷③：探针的三条退出路径全是 `process.exit(STRICT ? 1 : 0)`，
+    // 而不加 --strict 时 STRICT 为 false —— 于是它**即使每一条都报 ❌ 也退出 0**。
+    // 那个 job 因此永远不会失败，比没有门卫更糟：
+    // 它会被读成「线上已验证通过」，而实际上什么都没验证。
+    expect(workflow.length, 'deploy.yml 没读到').toBeGreaterThan(100);
+    expect(workflow, 'CI 调探针时没加 --strict —— 报了错也不会红').toMatch(
+      /node\s+scripts\/verify-deploy\.mjs[^\n]*--strict/,
+    );
+  });
+
+  it('探针的退出码必须真的取决于 STRICT 与结果（不是恒 0）', () => {
+    const src = SNAPSHOT.verifyDeploySource;
+    expect(src.length).toBeGreaterThan(1000);
+    // 曾经写成 `process.exit(STRICT ? 0 : 0)` —— 两个分支一样，
+    // 也就是「成功」那条路径上的恒 0，看着像有意为之。
+    expect(src, 'exit 表达式的两个分支不能相同').not.toMatch(/process\.exit\(\s*STRICT\s*\?\s*0\s*:\s*0\s*\)/);
+    // 成功路径必须无条件退出 0（它不接受「非严格模式」这种说法）
+    expect(src, '成功路径的退出码应当恒为 0').toMatch(/结论：线上是\*\*新代码\*\*/);
+  });
 });
