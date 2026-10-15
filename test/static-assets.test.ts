@@ -288,3 +288,83 @@ describe('预算模型不许倒退（每个断言都对应一次真实误判）'
     expect(src, 'bots 参数消失了，就没法用量控制台的数字反推').toMatch(/bots:\s*0/);
   });
 });
+
+/**
+ * 线上验证探针（scripts/verify-deploy.mjs）的守卫。
+ *
+ * 这个脚本是部署流水线的**最后一道门**：它说「线上仍是旧代码」时，
+ * 我是真的会去追的 —— 本次就追了，而且追的是一个不存在的东西。
+ *
+ * 它错过两次，两次都是自己的问题：
+ *   ① **假阴性**：CI 的 verify-live job 只传 `--url`，不传 WRITE_TOKEN，
+ *      于是它拿一个匿名请求去测「Overwrite: F 撞已有目标」，拿到 401
+ *      （RFC 4918 §8.1 要求先拒授权，这是**正确**行为）却报
+ *      `❌ 期望 412（新代码），实际 401` + `结论：线上仍是旧代码`。
+ *      代码完全正确的部署被自己的门卫判成失败。
+ *   ② **留垃圾**：同一轮里它还真的去写。本库 PUT 匿名可写、DELETE 需要口令，
+ *      所以缺口令时它造得出垃圾却删不掉 —— 实测书库从 4 本变 8 本，
+ *      多出来的 `__deploycheck_*` 只能手工清。
+ *
+ * 两个缺陷的共同根因是同一个：**它没有先问「我有权限收场吗」**。
+ * 下面钉住的就是这个判断必须存在、且必须挡在写操作之前。
+ */
+describe('线上验证探针：不许再报假阴性、不许再留垃圾', () => {
+  const src = SNAPSHOT.verifyDeploySource;
+  const workflow = SNAPSHOT.deployWorkflow;
+
+  it('源码读到了（否则下面的断言会假绿）', () => {
+    expect(src.length, 'verify-deploy.mjs 没读到，快照键或路径变了').toBeGreaterThan(1000);
+  });
+
+  it('必须有「能不能收场」的判定，且它挡在三个写探针之前', () => {
+    // 判定的名字本身就把结论说清楚了：不是「有没有权限」，是「跑了能不能收场」。
+    expect(src, 'CAN_WRITE 判定不见了').toMatch(/const CAN_WRITE\s*=/);
+    // 且它必须真的**取决于口令**。只断言「存在一个叫 CAN_WRITE 的常量」不够 ——
+    // 变异验证抓到过：把它改成 `const CAN_WRITE = true` 后所有断言照样绿，
+    // 而那正是最坏的形态（守卫看着在、实则永远放行）。
+    expect(src, 'CAN_WRITE 不再取决于口令 —— 守卫被架空了').toMatch(
+      /const CAN_WRITE = TOKEN\.length > 0;/,
+    );
+
+    const guardIdx = src.indexOf('const CAN_WRITE');
+    expect(guardIdx, 'CAN_WRITE 不见了').toBeGreaterThan(-1);
+
+    // 三个写探针的**函数定义**都必须在判定之后出现。
+    // 用函数定义而不是调用点：调用点在后，那是执行顺序；这里要钉的是
+    // 「写这一段的代码时，作者必须先看到那个判定」。
+    for (const fn of ['async function probeCopyWhitelist', 'async function probeUnlockNoToken', 'async function probeOverwrite']) {
+      const fnIdx = src.indexOf(fn);
+      expect(fnIdx, `${fn} 不见了`).toBeGreaterThan(-1);
+      expect(fnIdx, `${fn} 排在 CAN_WRITE 之前 —— 写这段时看不到「能不能收场」`).toBeGreaterThan(guardIdx);
+    }
+  });
+
+  it('写探针必须被 CAN_WRITE 挡住（缺口令时一个字节都不许写）', () => {
+    // 三个写探针各自的第一句都必须是「没有口令就跳过」的早退。
+    // 这条断言防的是「只在注释里写了要检查、代码却没做」——
+    // 那正是上一版的形态：注释说「需要写口令才能跑」，代码照跑。
+    const skipCalls = src.match(/skipWriteProbe\(/g) ?? [];
+    // 1 处定义 + 3 处调用
+    expect(skipCalls.length, `skipWriteProbe 应被 3 个写探针调用，实际出现 ${skipCalls.length} 次`).toBe(4);
+  });
+
+  it('Overwrite 探针不许在缺口令时判 fail（401 是规范要求，不是缺陷）', () => {
+    // 曾经的写法直接把任何非 412 判成 fail，于是匿名请求稳定拿到一个 ❌。
+    // 现在它必须在缺口令时走 skip 分支。
+    expect(src, 'Overwrite 探针又变成无条件 fail 了').toMatch(/if \(!CAN_WRITE\) \{[\s\S]{0,200}?skipWriteProbe/);
+    // 且论证必须留在源码里 —— 下一个改这里的人要知道 401 是有意为之。
+    expect(src, 'RFC 4918 §10.6 的授权优先论证被删了').toContain('10.6');
+    expect(src, '§8.1「授权错误优先」的论证被删了').toContain('8.1');
+  });
+
+  it('CI 必须把 WRITE_TOKEN 传进探针（否则三条探针永远 skipped）', () => {
+    // 这是缺陷①的直接成因：探针支持口令，但 CI 从来不传。
+    // 不传时它不会红，只会静默跳过 —— 静默是这里最坏的失败模式。
+    expect(workflow.length, 'deploy.yml 没读到').toBeGreaterThan(100);
+    expect(workflow, 'CI 没把 WRITE_TOKEN 传给探针 —— 三条写探针会静默跳过').toMatch(
+      /WRITE_TOKEN:\s*\$\{\{\s*secrets\.WRITE_TOKEN\s*\}\}/,
+    );
+    // 且缺口令时要发出警告（GitHub 的 ::warning:: 注解），别让它静默。
+    expect(workflow, '缺 WRITE_TOKEN 时没有告警').toContain('::warning::');
+  });
+});

@@ -6,10 +6,11 @@
 #   所以走 GitHub Actions —— 免费额度对公开仓库无限。
 #
 # ────────────────────────────────────────────────────────────────────────
-# 需要在仓库 Settings → Secrets and variables → Actions 里配两个 secret：
+# 需要在仓库 Settings → Secrets and variables → Actions 里配 secret：
 #
 #   CLOUDFLARE_API_TOKEN   权限范围见下方注释
 #   CLOUDFLARE_ACCOUNT_ID  Cloudflare 控制台右侧栏可见
+#   WRITE_TOKEN            可选，但**强烈建议配** —— 见下方说明
 #
 # API Token 需要的权限（Dashboard → My Profile → API Tokens → Create Token
 # → Edit Cloudflare Workers template，再补两项）：
@@ -20,6 +21,16 @@
 #   Account  · Account Settings    : Read    wrangler 需要（读 account_id）
 #
 # token 绝不能写进仓库或 workflow 文件，只能放 Actions secrets。
+#
+# WRITE_TOKEN 是站点的 WebDAV 写口令（和 `wrangler secret put WRITE_TOKEN`
+# 设的必须是同一个值）。不配它不会让 CI 变红，但会让线上验证的最后三条
+# 探针**静默跳过** —— 而那三条才是「线上跑的到底是不是新代码」的真正判据。
+# 之前就是这样：探针拿一个匿名请求去测一条「无口令必须 401」的用例
+# （RFC 4918 §8.1 要求先拒授权），于是稳定打印
+#   `❌ 期望 412（新代码），实际 401` + `结论：线上仍是旧代码`
+# 一次完全正确的部署被自己的门卫判成失败。
+# 备注：缺口令时那三条探针还会**往真实书库写文件而删不掉**（本库 PUT 匿名可写、
+# DELETE 需要口令），所以现在改成「跑了不能收场就不跑」，宁可不测也不留垃圾。
 #
 # 另外建议配一个仓库变量（Secrets and variables → Actions → Variables）：
 #   WORKER_URL = https://你的域名
@@ -163,9 +174,16 @@ jobs:
       - name: 用行为探针确认线上是新代码
         env:
           WORKER_URL: ${{ vars.WORKER_URL }}
+          # 写探针需要口令。**不传它这三条探针会全部跳过**，于是「线上是不是
+          # 新代码」永远拿不到结论 —— 之前就是这样：探针不带口令去测一条
+          # 「无口令必须 401」的用例，稳定报假阴性（❌ + 结论：线上仍是旧代码）。
+          WRITE_TOKEN: ${{ secrets.WRITE_TOKEN }}
         run: |
           if [ -z "$WORKER_URL" ]; then
             echo "::warning::未设置仓库变量 WORKER_URL，跳过线上验证"
             exit 0
+          fi
+          if [ -z "$WRITE_TOKEN" ]; then
+            echo "::warning::未设置 secret WRITE_TOKEN，三条写探针将被跳过（静态层探针仍会跑）"
           fi
           node scripts/verify-deploy.mjs --url "$WORKER_URL"

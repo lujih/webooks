@@ -7,6 +7,8 @@ export interface StaticAssetsSnapshot {
   files: Record<string, string>;
   wranglerJsonc: string;
   budgetSource: string;
+  verifyDeploySource: string;
+  deployWorkflow: string;
 }
 
 // 让 cloudflare:test 里 env 的类型与 src/config.ts 的 Env 对齐

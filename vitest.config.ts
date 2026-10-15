@@ -40,6 +40,11 @@ function readStaticAssetsSnapshot() {
     // 同样只能这样读到 —— 测试要钉的是它的「诚实性」：
     // 不许再把 Cache API 命中当成省请求，也不许在忙日会打满时说「不会停摆」。
     budgetSource: read('scripts/budget.mjs'),
+    // 线上验证探针。它有两个已实测的事故：缺口令时报假阴性（把正确的部署
+    // 判成「线上仍是旧代码」），以及缺口令时还去写、留下删不掉的垃圾。
+    // 两者都只能在这层钉住 —— 脚本跑在 CI 里，测试够不着。
+    verifyDeploySource: read('scripts/verify-deploy.mjs'),
+    deployWorkflow: read('.github/workflows/deploy.yml'),
   };
 }
 

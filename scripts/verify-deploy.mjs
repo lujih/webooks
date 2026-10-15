@@ -20,15 +20,20 @@
  *
  * 用法：
  *   node scripts/verify-deploy.mjs --url https://你的域名
- *   node scripts/verify-deploy.mjs --url https://你的域名 --strict
+ *   WRITE_TOKEN=xxx node scripts/verify-deploy.mjs --url https://你的域名
+ *   WRITE_TOKEN=xxx node scripts/verify-deploy.mjs --url https://你的域名 --strict
  *
  * `--strict` 时有任何一条不符合预期就 exit 1（供 CI 用）。
  *
- * ⚠️ 这个脚本会**往书库里写临时文件**（因为要测 PUT/COPY 的行为）。
- *   所以需要写口令才能跑；跑完它自己会清理。
- *   注意：这三条探针都需要书已经上架过 —— 没有书时 COPY/PUT 的行为
- *   与预期不同（会 404 或 415），脚本会把那种情况标为「无法判定」而不是
- *   「失败」。
+ * ⚠️ 写探针会**往书库里写临时文件**。而没有 WRITE_TOKEN 时它们会全部跳过，
+ *   原因是本库的设计不对称：PUT（新增）匿名可写，DELETE（删除）需要口令。
+ *   于是缺口令的探针能造垃圾、却清不掉垃圾（实测：一条命令让书库从 4 本
+ *   变 8 本，多出来的 `__deploycheck_*` 只能手工清）。
+ *   所以现在的规矩是「跑了不能收场就不跑」—— 报「无法判定」而不是留垃圾。
+ *   配置 CI 时请把 WRITE_TOKEN 传进来，否则这三条探针永远拿不到结论。
+ *
+ * 需要的环境变量：
+ *   WRITE_TOKEN  写口令。缺失时三条写探针跳过（其余两条静态层探针照跑）。
  */
 
 /**
@@ -80,17 +85,47 @@ async function cleanup(name) {
 }
 
 /**
+ * ⚠️ 没有口令时**根本不能跑写探针** —— 它们会往真实书库里留下删不掉的垃圾。
+ *
+ * 这是实测出来的，不是假想：在本地带真实 D1 的 `wrangler dev` 上跑一次
+ * 不带 WRITE_TOKEN 的探针，书库从 4 本变成 8 本，多出来的全是
+ * `__deploycheck_*` 文件，而且**删不掉**。
+ *
+ * 成因是本库一个有意的设计不对称：
+ *   · PUT（新增）匿名即可 —— 这是产品的核心诉求，不能为了探针让步
+ *   · DELETE（删除）需要口令 —— 破坏性操作必须设防
+ * 于是探针能造垃圾、却清不掉垃圾。cleanup() 里 DELETE 拿到 401 被
+ * 静默吞掉（`catch {}` 是故意的「尽力而为」），垃圾就此留在库里。
+ *
+ * 所以这里改成**直接不写**：判据不是「跑不跑得动」，而是「跑了能不能收场」。
+ * 三条写探针都需要口令，缺口令时统一报「无法判定」并把原因说清楚 ——
+ * 报 skip 是诚实的（真的没测），比造一堆垃圾去换一个结论好得多。
+ */
+const CAN_WRITE = TOKEN.length > 0;
+
+/** 写探针的守卫：无口令时直接记 skip，绝不落盘 */
+function skipWriteProbe(name, detail) {
+  results.push({ name, status: 'skip', detail });
+  return false;
+}
+
+/**
  * 探针 1：COPY 到被禁扩展名 → 必须是 415
  *
  * 修复前 handleMoveCopy 完全绕过扩展名白名单，所以这里会 201 且真的入库。
  */
 async function probeCopyWhitelist() {
+  const NAME = 'COPY 扩展名白名单（.exe）';
+  if (!CAN_WRITE) {
+    skipWriteProbe(NAME, '未提供 WRITE_TOKEN —— 落盘后删不掉，不留垃圾（见 CAN_WRITE 处说明）');
+    return;
+  }
   const src = `${TMP}_src.txt`;
   const dst = `${TMP}_inject.exe`;
   try {
     const put = await call('PUT', src, { body: 'probe' });
     if (put.status >= 400) {
-      results.push({ name: 'COPY 扩展名白名单', status: 'skip', detail: `PUT 被拒(${put.status})，无法继续` });
+      results.push({ name: NAME, status: 'skip', detail: `PUT 被拒(${put.status})，无法继续` });
       return;
     }
     await put.text();
@@ -100,7 +135,7 @@ async function probeCopyWhitelist() {
     await cp.text();
 
     results.push({
-      name: 'COPY 扩展名白名单（.exe）',
+      name: NAME,
       status: status === 415 ? 'pass' : 'fail',
       detail: `期望 415（新代码），实际 ${status}`,
     });
@@ -108,7 +143,7 @@ async function probeCopyWhitelist() {
     await cleanup(dst);
     await cleanup(src);
   } catch (err) {
-    results.push({ name: 'COPY 扩展名白名单', status: 'skip', detail: String(err.message || err) });
+    results.push({ name: NAME, status: 'skip', detail: String(err.message || err) });
   }
 }
 
@@ -119,11 +154,16 @@ async function probeCopyWhitelist() {
  * 无 token UNLOCK = 任何人都能释放别人的锁。
  */
 async function probeUnlockNoToken() {
+  const NAME = 'UNLOCK 缺 Lock-Token（RFC §9.11.1）';
+  if (!CAN_WRITE) {
+    skipWriteProbe(NAME, '未提供 WRITE_TOKEN —— 落盘后删不掉，不留垃圾（见 CAN_WRITE 处说明）');
+    return;
+  }
   const name = `${TMP}_lock.epub`;
   try {
     const put = await call('PUT', name, { body: 'probe' });
     if (put.status >= 400) {
-      results.push({ name: 'UNLOCK 需要 token', status: 'skip', detail: `PUT 被拒(${put.status})` });
+      results.push({ name: NAME, status: 'skip', detail: `PUT 被拒(${put.status})` });
       return;
     }
     await put.text();
@@ -145,7 +185,7 @@ async function probeUnlockNoToken() {
     await un.text();
 
     results.push({
-      name: 'UNLOCK 缺 Lock-Token（RFC §9.11.1）',
+      name: NAME,
       status: status === 400 ? 'pass' : 'fail',
       detail: `期望 400（新代码），实际 ${status}`,
     });
@@ -165,14 +205,37 @@ async function probeUnlockNoToken() {
  * 探针 3：Overwrite: F 且目标已存在 → 必须是 412
  *
  * 修复前 handleMoveCopy 完全不读 Overwrite 头，所以必然 201 并破坏目标。
+ *
+ * ⚠️ 必须带口令才跑，两个理由：
+ *
+ * ① 不带口令时**无法判定**，且报 fail 是错的 —— 这是线上踩出来的：
+ *    CI 的 verify-live job 只传 `--url` 不传 WRITE_TOKEN（见 deploy.yml），
+ *    于是它在**代码完全正确**的部署上稳定打印
+ *    `❌ 实际 401` + `结论：线上仍是旧代码`，一次交付被自己的门卫判成
+ *    假阴性，差点让我去追一个不存在的 bug。
+ *
+ *    401 在这里是**规范要求**，不是缺陷。RFC 4918 §10.6：
+ *      「The server MUST do authorization checks before checking this or
+ *        any conditional header.」
+ *    §8.1 进一步要求「MUST return authorization errors in preference to
+ *    other errors」—— 理由正是本站在意的那件事：不要用「412 还是 201」
+ *    向匿名者泄露「目标位置是否已有资源」。所以覆盖已存在目标时，
+ *    无口令必须 401，有口令才轮到 412 出场。
+ *
+ * ② 它会落盘（PUT src + dst），而无口令时删不掉 —— 见 CAN_WRITE 处的说明。
  */
 async function probeOverwrite() {
+  const NAME = 'Overwrite: F 撞已有目标（RFC §9.8.3）';
+  if (!CAN_WRITE) {
+    skipWriteProbe(NAME, '未提供 WRITE_TOKEN —— 无口令时服务端按 RFC §8.1 先拒授权，且落盘后删不掉');
+    return;
+  }
   const src = `${TMP}_ov_src.txt`;
   const dst = `${TMP}_ov_dst.txt`;
   try {
     const p1 = await call('PUT', src, { body: 'probe-src' });
     if (p1.status >= 400) {
-      results.push({ name: 'Overwrite 头', status: 'skip', detail: `PUT 源文件被拒(${p1.status})` });
+      results.push({ name: NAME, status: 'skip', detail: `PUT 源文件被拒(${p1.status})` });
       return;
     }
     await p1.text();
@@ -186,7 +249,7 @@ async function probeOverwrite() {
     await cp.text();
 
     results.push({
-      name: 'Overwrite: F 撞已有目标（RFC §9.8.3）',
+      name: NAME,
       status: status === 412 ? 'pass' : 'fail',
       detail: `期望 412（新代码），实际 ${status}`,
     });
@@ -194,7 +257,7 @@ async function probeOverwrite() {
     await cleanup(dst);
     await cleanup(src);
   } catch (err) {
-    results.push({ name: 'Overwrite 头', status: 'skip', detail: String(err.message || err) });
+    results.push({ name: NAME, status: 'skip', detail: String(err.message || err) });
   }
 }
 
@@ -291,9 +354,11 @@ async function probeWorkerRoutesWithNavigateHeader() {
 const ICON = { pass: '✅', fail: '❌', skip: '➖' };
 
 console.log(`线上版本验证：${SITE}`);
-if (!TOKEN) {
-  console.log('  ⚠️ 未设置 WRITE_TOKEN 环境变量 —— 探针会跳过（它需要写权限）');
-  console.log('     设置后重跑：WRITE_TOKEN=xxx node scripts/verify-deploy.mjs --url …');
+if (!CAN_WRITE) {
+  console.log('  ⚠️ 未设置 WRITE_TOKEN 环境变量');
+  console.log('     三条写探针会跳过：本库 PUT 匿名可写、DELETE 需要口令，');
+  console.log('     所以缺口令时探针能造垃圾却清不掉 —— 宁可不测，也不留垃圾。');
+  console.log('     拿到结论：WRITE_TOKEN=xxx node scripts/verify-deploy.mjs --url …');
 }
 console.log('');
 

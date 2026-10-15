@@ -112,19 +112,40 @@ Dashboard → My Profile → API Tokens → Create Token
   Secrets:
     CLOUDFLARE_API_TOKEN  = 上一步的 token
     CLOUDFLARE_ACCOUNT_ID = Dashboard 右侧栏的 Account ID
-    ADMIN_TOKEN           = 那串随机值
+    WRITE_TOKEN           = 站点的 WebDAV 写口令（可选，但强烈建议配）
   Variables（可选，但强烈建议）:
     WORKER_URL            = https://webooks.<你的子域>.workers.dev
 ```
 
-`WORKER_URL` 用来在部署后自动跑冒烟测试和 `dav-probe`。
+`WORKER_URL` 用来在部署后自动跑冒烟测试、`dav-probe` 和
+`scripts/verify-deploy.mjs`（行为探针 —— 它比对「修复前/后的返回码」，所以能
+真正回答「线上跑的到底是不是新代码」）。
+
+**`WRITE_TOKEN` 不配不会让 CI 变红，但会让最后三条探针静默跳过**，而那三条
+才是版本判定的真正判据。之前的配置就是这样，结果探针拿一个匿名请求去测一条
+「无口令必须 401」的用例（RFC 4918 §8.1 要求先拒授权），稳定打印
+
+```
+❌ Overwrite: F 撞已有目标（RFC §9.8.3）   期望 412（新代码），实际 401
+结论：线上仍是旧代码（1 项不符预期）
+```
+
+—— 一次完全正确的部署被自己的门卫判成失败，让人去追一个不存在的问题。
+
+另外，缺口令时那三条探针还会**往真实书库写临时文件而删不掉**（本站设计上
+PUT 匿名可写、DELETE 需要口令），实测一条命令就把书库从 4 本变 8 本、多出来的
+`__deploycheck_*` 只能手工清。所以探针现在的规矩是「跑了不能收场就不跑」：
+没有 `WRITE_TOKEN` 时它们报「无法判定」并说明原因，一个字节都不写。
+
+（`ADMIN_TOKEN` 不在这个列表里 —— 它是用 `npx wrangler secret put ADMIN_TOKEN`
+直接设到 Worker 上的，CI 不需要它。早期文档把它列在这里是错的。）
 
 ### 3. push 即部署
 
 工作流（[.github/workflows/deploy.yml](../.github/workflows/deploy.yml)）会依次做：
 
 ```
-typecheck → npm test → npm run budget → d1 migrations apply → wrangler deploy → 冒烟测试
+typecheck → npm test → npm run budget → d1 migrations apply → wrangler deploy → 行为探针
 ```
 
 PR 只跑校验不部署；`workflow_dispatch` 可手动触发，并能关掉部署只做演练。
