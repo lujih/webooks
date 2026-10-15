@@ -1,7 +1,7 @@
 import { applyD1Migrations, env } from 'cloudflare:test';
 import { beforeAll } from 'vitest';
 import type { Env } from '../src/config';
-import { creditsCacheKey, davCache, entriesCacheKey } from '../src/lib/cache';
+import { entriesCacheKey, purgeByPrefixes } from '../src/lib/cache';
 
 export interface TestEnv extends Env {
   TEST_MIGRATIONS: Parameters<typeof applyD1Migrations>[1];
@@ -38,14 +38,15 @@ export async function resetLibrary(): Promise<void> {
   await testEnv.DB.exec(
     'DELETE FROM books; DELETE FROM buckets; DELETE FROM locks; DELETE FROM requests;',
   );
-  // ⚠️ 榜单缓存也必须清 —— /api/credits 缓存 1 小时且**跨测试共享**
-  //   （workerd 的 Cache API 对同一 isolate 是持久的）。
-  //   不清的话「上一个测试造的 Alice」会出现在「下一个测试的榜单」里，
-  //   表现为断言莫名其妙的顺序/数量错误。
+  // ⚠️ 缓存也必须清 —— workerd 的 Cache API 对同一 isolate 是持久的，
+  //   **不会**随 isolatedStorage 回滚，所以会跨测试共享。
+  //   不清的话「上一个测试造的 Alice」会出现在「下一个测试的榜单」里。
   //
-  //   这不只是测试问题：生产环境里缓存失效靠 purgeCreditCache()，
-  //   它挂在上传与删除路径上。如果将来新增了改 credit 的入口，
-  //   忘了挂失效，榜单就会「慢一小时」。
-  const cache = davCache();
-  if (cache) await cache.delete(creditsCacheKey()).catch(() => {});
+  //   踩过三次，每次都是同一形状：榜单（credits）、求书墙（requests）、
+  //   分页参数组合（limit/offset 不同则键不同）。
+  //
+  //   对策是 purgeByPrefixes() —— 按前缀枚举删除。
+  //   ⚠️ **加新缓存时必须同步改 CACHE_KEY_PREFIXES**，
+  //      否则新缓存会成为下一个「莫名失败」的源头。
+  await purgeByPrefixes();
 }

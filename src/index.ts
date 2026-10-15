@@ -49,7 +49,20 @@ async function route(request: Request, env: Env): Promise<Response> {
     const path = url.pathname;
 
     if (path === '/health') {
-      return Response.json({ ok: true, service: 'webooks' });
+      // ⚠️ 这个响应是**编译期常量**（连 D1 都不查），却完全没缓存 ——
+      //   每次探针/监控调用都实打实消耗 1 次 Worker 请求。
+      //
+      //   30 秒足够：健康检查关心的是「站点活着」而不是「这一秒活着」，
+      //   而真正的故障（Worker 挂了、D1 连不上）会持续远超过 30 秒。
+      //   缓存 30 秒最多让故障发现晚半分钟，换来的是探针成本降到 1/30。
+      //
+      //   注：这里返回 ok:true 不代表「真的健康」—— 它只证明 Worker 在跑。
+      //   要检查 D1/R2 得看具体业务接口。所以这个端点的语义
+      //   对缓存是免疫的：它本来就不该被依赖来做实时判断。
+      return Response.json(
+        { ok: true, service: 'webooks' },
+        { headers: { 'cache-control': 'public, max-age=30' } },
+      );
     }
 
     // 求书（匿名公开接口，同样在 settings() 之前）
@@ -123,11 +136,27 @@ async function route(request: Request, env: Env): Promise<Response> {
       });
     }
 
-    // 上传页（需要 Turnstile 公钥才能工作）
+    // 上传页
     if (path === '/upload' || path === '/upload/') {
+      // ⚠️ 原来是 no-store，理由是「页面里有 Turnstile 公钥」——
+      //   但那是**公钥**，本来就可以公开，而且它极少变动。
+      //   结果：每次有人点「上架一本」都消耗 1 次 Worker 请求。
+      //
+      // 缓存 10 分钟。风险点与对策：
+      //   · Turnstile 公钥轮换后，最长 10 分钟内访客拿到旧 key
+      //     → 表现为「上传页验证码不显示」。10 分钟可接受，
+      //       且轮换密钥本来就要配套刷新页面。
+      //   · 页面内联 JS 依赖 env 里读到的 siteKey → 已确认只有这一个
+      //     变量，其余全是编译期常量（见 uploadHtml 的入参）。
+      //
+      // 想彻底消除这个风险：把 siteKey 改成前端 fetch /api/turnstile-config，
+      // 那样页面本身可以无限缓存。但那是另一次改动，先拿这 10 分钟。
       return new Response(uploadHtml(env.TURNSTILE_SITE_KEY ?? ''), {
         status: 200,
-        headers: { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' },
+        headers: {
+          'content-type': 'text/html; charset=utf-8',
+          'cache-control': 'public, max-age=600',
+        },
       });
     }
 

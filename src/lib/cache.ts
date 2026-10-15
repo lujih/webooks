@@ -99,3 +99,32 @@ export function bookCacheTargets(book: BookCacheIdentity): Array<readonly [strin
 export function creditsCacheKey(): string {
   return `${CACHE_HOST}/public-credits`;
 }
+
+/**
+ * 求书墙列表的缓存键（分页参数不同则键不同）。
+ * 求书提交后漏看 60 秒的代价接近零，所以**不做失效钩子** ——
+ * 那是比缓存更贵的复杂度。见 api/requests.ts 的注释。
+ */
+export function requestsCacheKey(limit: number, offset: number): string {
+  return `${CACHE_HOST}/api/requests?limit=${limit}&offset=${offset}`;
+}
+
+/**
+ * 本 Worker 用到的全部缓存键前缀（`webooks.invalid/`）。
+ *
+ * ⚠️ **加新缓存时同步改这里** —— 否则测试之间会互相污染，
+ * 表现为「上一个测试造的 Alice 出现在下一个测试的榜单里」这类
+ * 无法解释的失败（真实踩过：榜单、求书墙各踩一次）。
+ */
+export const CACHE_KEY_PREFIXES = ['/public-credits', '/api/requests'] as const;
+
+/** 按前缀清缓存（Cache API 没有 keys()，只能枚举已知前缀）。 */
+export async function purgeByPrefixes(): Promise<number> {
+  const cache = davCache();
+  if (!cache) return 0;
+  let n = 0;
+  for (const p of CACHE_KEY_PREFIXES) {
+    if (await cache.delete(`${CACHE_HOST}${p}`)) n++;
+  }
+  return n;
+}

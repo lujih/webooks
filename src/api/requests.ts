@@ -18,7 +18,7 @@
 
 import type { Env } from '../config';
 import { jsonResponse } from '../lib/http';
-import { creditsCacheKey, davCache } from '../lib/cache';
+import { creditsCacheKey, davCache, requestsCacheKey } from '../lib/cache';
 import { guardWrite } from '../lib/throttle';
 import {
   DEFAULT_CREDIT_NAME,
@@ -35,13 +35,51 @@ export async function handleRequests(request: Request, env: Env): Promise<Respon
   if (request.method === 'GET') {
     const limit = clampInt(url.searchParams.get('limit'), 50, 1, 200);
     const offset = clampInt(url.searchParams.get('offset'), 0, 0, 100_000);
+
+    // ⚠️ 这条路径原来**完全没有缓存**，而它是求书墙的唯一数据源：
+    //   每次打开 /requests = 1 次 Worker 请求 + 1 次 D1 聚合查询。
+    //   求书墙是匿名公开页面，刷新的成本应该由缓存而不是 D1 承担。
+    //
+    // 缓存 60 秒。比榜单的 1 小时短，因为求书是「有人刚提交了就该看到」的
+    // 场景 —— 但即便漏看 1 分钟也没有任何损失（清单本身不是实时数据）。
+    //
+    // 服务端 Cache API + 客户端 max-age 双层：
+    //   · 客户端层挡住同一个人的连续刷新
+    //   · 服务端层挡住**不同访客**的同一份查询 —— 这一层才是省 D1 的关键
+    //
+    // ⚠️ 不在这里做失效钩子：求书提交本身会改变列表，但漏看 60 秒的代价
+    //   接近于零，而失效需要在上传/标记/删除三条路径上各挂一次钩子，
+    //   漏挂一处就是「改了半天没变」。60 秒是更划算的取舍。
+    const cache = davCache();
+    const cacheKey = requestsCacheKey(limit, offset);
+    if (cache) {
+      const hit = await cache.match(cacheKey);
+      if (hit) {
+        return new Response(await hit.text(), { headers: hit.headers });
+      }
+    }
+
     const { rows, total } = await listWall(env.DB, limit, offset);
-    return jsonResponse({
+    const payload = JSON.stringify({
       total,
       limit,
       offset,
       requests: rows.map(publicView),
     });
+    const headers = {
+      'content-type': 'application/json; charset=utf-8',
+      'cache-control': 'public, max-age=60',
+    };
+    if (cache) {
+      try {
+        await cache.put(cacheKey, new Response(payload, {
+          headers: { ...headers, 'cache-control': 'public, max-age=60' },
+        }));
+      } catch {
+        /* 缓存写失败不影响功能 */
+      }
+    }
+    return new Response(payload, { headers });
   }
 
   if (request.method !== 'POST') {

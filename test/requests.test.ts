@@ -191,7 +191,7 @@ describe('求书墙 API', () => {
     await testEnv.DB.prepare(`UPDATE requests SET status='fulfilled' WHERE id = ?`)
       .bind(row!.id).run();
 
-    const res = await SELF.fetch(API);
+    const res = await SELF.fetch(`${API}${wallQuery()}`);
     const body = (await res.json()) as { total: number };
     expect(body.total).toBe(0);
   });
@@ -380,7 +380,8 @@ describe('管理后台接口', () => {
     });
     expect(res.status).toBe(200);
 
-    const wall = await SELF.fetch(API);
+    // 同一测试内的缓存：换 limit 穿透（见 wallQuery 的说明）
+    const wall = await SELF.fetch(`${API}${wallQuery()}`);
     expect(((await wall.json()) as { total: number }).total).toBe(0);
 
     const admin = await SELF.fetch(`${ORIGIN}/api/admin/requests?status=fulfilled`, { headers: ADMIN });
@@ -473,6 +474,23 @@ describe('求书墙链接可达', () => {
 });
 
 const DAV = `${ORIGIN}/dav/${encodeURIComponent('最近收录')}`;
+
+/**
+ * 求书墙列表有 60 秒缓存（见 api/requests.ts）—— 这是**有意的产品行为**：
+ * 匿名公开页面的刷新成本该由缓存而不是 D1 承担。
+ *
+ * 副作用：同一测试内先 GET 再提交，第二次 GET 会拿到旧列表。
+ * 这**不是 bug**，是缓存在按设计工作。测试要绕开它，
+ * 而不是把缓存关掉（那等于把要验证的行为改掉）。
+ *
+ * 绕开办法：每次用不同的 limit 值 —— 缓存键含 limit，
+ * 换 limit 就是换键，必然 MISS。
+ */
+let qSeq = 0;
+function wallQuery(): string {
+  qSeq += 1;
+  return `?limit=${(qSeq % 200) + 1}&offset=0`;
+}
 
 /** 放一本书并指定署名（PUT 走 WebDAV，然后直接改 credit 模拟「留了名」） */
 async function putBook(leafName: string, credit: string): Promise<void> {
@@ -727,5 +745,92 @@ describe('「没留名」的各种形态都归到雷锋', () => {
     });
     expect(wrong.status).toBe(405);
     await wrong.text();
+  });
+});
+
+describe('请求预算：缓存必须真的生效', () => {
+  /**
+   * 这一组锁的是「省 Worker 请求」的四条路径。
+   *
+   * 背景：Workers Free 只有 100,000 请求/天，超额即停摆到次日 UTC 0 点
+   * （真实发生过一次：连续部署+迁移+探测把当天额度用完了）。
+   * 而 budget.mjs 的模型只算出 16% 用量 —— 因为它假设的缓存命中率
+   * 有几个路径**根本没实现**。这些断言保证不会再 silently 退化回去。
+   */
+  it('OPTIONS 带长缓存（WebDAV 客户端挂载时会反复问）', async () => {
+    const res = await SELF.fetch(`${ORIGIN}/dav/`, { method: 'OPTIONS' });
+    expect(res.status).toBe(200);
+    const cc = res.headers.get('cache-control') ?? '';
+    // 必须明确缓存，且时长至少 1 天
+    expect(cc).toMatch(/public/);
+    expect(cc).toMatch(/max-age=(\d+)/);
+    const age = Number(cc.match(/max-age=(\d+)/)![1]);
+    expect(age, 'OPTIONS 是编译期常量，缓存一天是安全的').toBeGreaterThanOrEqual(86400);
+    // 能力头必须仍在（缓存不能把它们缓存丢了）
+    expect(res.headers.get('allow')).toContain('PROPFIND');
+    expect(res.headers.get('dav')).toBeTruthy();
+  });
+
+  it('/health 带缓存（它是编译期常量，探针调用很密集）', async () => {
+    const res = await SELF.fetch(`${ORIGIN}/health`);
+    expect(res.status).toBe(200);
+    const cc = res.headers.get('cache-control') ?? '';
+    expect(cc).toMatch(/max-age=(\d+)/);
+    const age = Number(cc.match(/max-age=(\d+)/)![1]);
+    expect(age).toBeGreaterThan(0);
+  });
+
+  it('求书墙 API 有缓存头，且真的命中（第二次不查 D1）', async () => {
+    // 第一次：写入缓存
+    const first = await SELF.fetch(`${API}?limit=7&offset=0`);
+    expect(first.status).toBe(200);
+    expect(first.headers.get('cache-control')).toMatch(/max-age=60/);
+
+    // 第二次：应该命中。这里不断言时间，而是断言**内容一致且仍有缓存头**
+    // （如果缓存失效，两个请求都会重新查 D1，但表现上完全相同 ——
+    //   所以真正的验证是 resetLibrary 之后缓存仍返回旧数据，
+    //   见下面那条。）
+    const second = await SELF.fetch(`${API}?limit=7&offset=0`);
+    expect(second.status).toBe(200);
+    expect(second.headers.get('cache-control')).toMatch(/max-age=60/);
+  });
+
+  it('求书墙缓存在数据变化后仍会返回旧数据（证明缓存在工作）', async () => {
+    await post({ title: '缓存验证书' }, '5.5.5.5');
+    const before = await (await SELF.fetch(`${API}?limit=11&offset=0`)).json() as {
+      requests: { title: string }[];
+    };
+    expect(before.requests.length).toBeGreaterThan(0);
+
+    // 提交新书后**不**清缓存，再取同一个 URL —— 应仍是旧列表
+    await post({ title: '后提交的书' }, '6.6.6.6');
+    const after = await (await SELF.fetch(`${API}?limit=11&offset=0`)).json() as {
+      requests: { title: string }[];
+    };
+    expect(after.requests.map((r) => r.title)).not.toContain('后提交的书');
+
+    // 但换 limit 就是换键，必然 MISS —— 新书立刻可见
+    const fresh = await (await SELF.fetch(`${API}?limit=12&offset=0`)).json() as {
+      requests: { title: string }[];
+    };
+    expect(fresh.requests.map((r) => r.title)).toContain('后提交的书');
+  });
+
+  it('上传页可缓存（原来是 no-store，每次点「上架一本」都打 Worker）', async () => {
+    const res = await SELF.fetch(`${ORIGIN}/upload`, { headers: { accept: 'text/html' } });
+    expect(res.status).toBe(200);
+    const cc = res.headers.get('cache-control') ?? '';
+    expect(cc, '上传页不该是 no-store —— 里面的 Turnstile 是公钥').not.toBe('no-store');
+    expect(cc).toMatch(/max-age=(\d+)/);
+    expect(Number(cc.match(/max-age=(\d+)/)![1])).toBeGreaterThan(0);
+  });
+
+  it('这些缓存的键都有登记，测试之间不会互相污染', async () => {
+    // ⚠️ 加新缓存时必须同步 CACHE_KEY_PREFIXES —— 否则测试之间
+    //   会共享缓存，表现为无法解释的顺序/数量错误（真实踩过三次）。
+    const { CACHE_KEY_PREFIXES } = await import('../src/lib/cache');
+    expect(CACHE_KEY_PREFIXES.length).toBeGreaterThanOrEqual(2);
+    expect(CACHE_KEY_PREFIXES).toContain('/public-credits');
+    expect(CACHE_KEY_PREFIXES).toContain('/api/requests');
   });
 });

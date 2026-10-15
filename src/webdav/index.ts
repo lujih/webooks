@@ -78,12 +78,26 @@ export async function handleDav(
   const method = request.method.toUpperCase();
 
   if (method === 'OPTIONS') {
+    // ⚠️ 这里是全站**最大的单点浪费**，之前完全没有 cache-control。
+    //
+    // OPTIONS 回答的是「这个端点支持哪些方法」—— 一份几乎永不变的能力
+    // 描述。但 WebDAV 客户端的行为恰恰是「反复问」：
+    //   · rclone / Finder 挂载时会先对根和每个目录发一次 OPTIONS
+    //   · 部分客户端（Windows 资源管理器）每次刷新都重新问
+    //   · 200 个目录的挂载 = 200+ 次 OPTIONS，每次都实打实消耗 1 次 Worker 请求
+    //
+    // 缓存 1 天。这不会影响正确性：allow/dav/ms-author-via 三个头
+    // 都是编译期常量，改了它们必然伴随代码部署，届时缓存自然失效。
+    //
+    // 代价：如果哪天要临时关掉某个方法，最多 1 天内客户端仍会试。
+    // 相比每天省下的请求，这个代价可以忽略。
     return new Response(null, {
       status: 200,
       headers: {
         allow: ALLOW,
         dav: DAV_HEADER,
         'ms-author-via': 'DAV',
+        'cache-control': 'public, max-age=86400',
       },
     });
   }
