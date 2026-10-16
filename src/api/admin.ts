@@ -9,6 +9,7 @@ import {
   authorBucket, letterBucket,
   bucketSegment,
   collectionSegment,
+  isAllowedUploadExt,
   mediaKindOfFormat,
 } from '../lib/collections';
 import {
@@ -30,6 +31,7 @@ import { handleAdminRequests, handleCreditBoard, handleCreditPurge } from './req
 import { jsonResponse, textResponse } from '../lib/http';
 import {
   deriveMetadata,
+  extensionOf,
   guessAuthorFromText,
   leafNameFromKey,
   normaliseAuthor,
@@ -533,6 +535,7 @@ async function reindex(env: Env, url: URL): Promise<Response> {
 
   const statements: D1PreparedStatement[] = [];
   let skipped = 0;
+  let rejectedByExt = 0;
 
   for (const object of listing.objects) {
     // R2 控制台创建的"目录占位对象"（键以 / 结尾且为 0 字节）跳过
@@ -543,6 +546,17 @@ async function reindex(env: Env, url: URL): Promise<Response> {
     const leafName = sanitiseLeafName(leafNameFromKey(object.key));
     if (!leafName) {
       skipped++;
+      continue;
+    }
+    // 扩展名白名单：与 WebDAV PUT（src/webdav/index.ts）和网页上传共用同一个
+    // 判定函数。reindex 是第三个入口，曾经漏掉这一关 —— R2 控制台或其它通道
+    // 塞进来的 .exe / .m4a 跑一次 reindex 就直接入库上架。
+    //
+    // 单独计数而不是混进 skipped：运维要从响应里看出「少了的书是因为格式
+    // 不允许」，否则只会看到「扫了 500 个只入库 480 本」而不知道另外 20 个
+    // 去哪了。
+    if (!isAllowedUploadExt(extensionOf(leafName))) {
+      rejectedByExt++;
       continue;
     }
     const meta = deriveMetadata(leafName);
@@ -583,6 +597,10 @@ async function reindex(env: Env, url: URL): Promise<Response> {
     prefix,
     indexed: statements.length,
     skipped,
+    // 扩展名不在白名单里、被拒收的对象数。与 skipped 分开暴露：
+    // 「前缀下的占位对象 / 非法文件名」和「格式不允许」是两件不同的事，
+    // 混在一起运维就没法判断这次 reindex 为什么少了几本。
+    rejectedByExt,
     truncated: listing.truncated,
     nextCursor: listing.truncated ? listing.cursor : null,
     bucketsRebuilt,
@@ -625,15 +643,24 @@ async function backfillDisposition(env: Env, url: URL): Promise<Response> {
     (url.searchParams.get('dryRun') ?? '').toLowerCase(),
   );
 
+  // 多查一行当作「还有没有下一页」的探针：只多取 1 行，不额外发 D1 查询，
+  // 但能给**确定的**答案。不要用 `rows.length === limit` 去推断 —— 那只说明
+  // 「这一页装满了」，装满了和「后面还有」是两件事：库里刚好剩最后一页时，
+  // 页满会返回一个非 null 的 nextAfter，而按 nextAfter 分页的客户端（包括
+  // `while (nextAfter) …` 这种写法）会白打一次请求才发现是空的。
+  // 线上实测过这个假信号：16 本全库、limit=16 时 scanned=16 却仍返回 nextAfter。
   const { results } = await env.DB
     .prepare(
       `SELECT id, leaf_name, r2_key, size FROM books
         WHERE status = 'published' AND id > ?
         ORDER BY id LIMIT ?`,
     )
-    .bind(after, limit)
+    .bind(after, limit + 1)
     .all<{ id: string; leaf_name: string; r2_key: string; size: number }>();
-  const rows = results ?? [];
+  const fetched = results ?? [];
+  const hasMore = fetched.length > limit;
+  // 探针那一行只用来判断有没有下一页，不参与回填，否则会多改一本。
+  const rows = hasMore ? fetched.slice(0, limit) : fetched;
 
   let backfilled = 0;
   let skipped = 0;
@@ -701,7 +728,8 @@ async function backfillDisposition(env: Env, url: URL): Promise<Response> {
   }
 
   const last = rows[rows.length - 1];
-  const nextAfter = rows.length === limit && last ? last.id : null;
+  // hasMore 是探针给出的确定答案（见上面的查询），不是「页满」的推断。
+  const nextAfter = hasMore && last ? last.id : null;
 
   return jsonResponse({
     action: 'backfill-disposition',

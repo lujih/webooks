@@ -389,3 +389,70 @@ describe('线上探针：地址不可达不许伪装成「没什么可验的」'
       .toContain('results.map((r) =>');
   });
 });
+
+/**
+ * 2026-10-16 那轮「拿实测替换拍脑袋的常数」的守卫。
+ *
+ * 背景：budget.mjs 里有两个数是估的，估错的方向都一样 —— **低估**：
+ *   · `cacheHitRate: 0.9` 没有任何实测，而且被乘错了地方（见第三条）
+ *   · `d1RowsWrittenPerDay = uploadsPerDay * 3` 漏掉了 D1 把每个被改写的
+ *     二级索引条目都算一行；实测一次上传 22 行，**错约 7 倍**
+ * 这两个数都不大，但错法很有代表性：常数一旦没写清「怎么测出来的」，
+ * 下一个人既不敢改也不知道该不该信。所以这里不只钉数值，还钉**依据在不在**。
+ */
+describe('预算模型：缓存命中率与 D1 行写必须是实测值', () => {
+  it('命中率拆成了两个参数，且都不是当年的 0.9', () => {
+    // 实测四种场景差得极远（0% / 50% / 87.5% / 100%），一个数盖不住。
+    expect(BUDGET, 'cacheHitRate 又变回那个没有依据的 0.9 了').toMatch(/cacheHitRate: 0\.5,/);
+    expect(BUDGET, '遍历那一路的命中率参数被删了').toMatch(/cacheHitRateTraversal: 0\.0,/);
+  });
+
+  it('命中率注释里必须留着「怎么测的」—— 测法、清键前提与各档实测值', () => {
+    // 只留数字、不留测法，下一个人无法判断它是否还成立。
+    expect(BUDGET, '注释里没有实测日期').toMatch(/2026-10-16/);
+    expect(BUDGET, '注释里没有观测点（x-dav-cache）').toMatch(/x-dav-cache/);
+    expect(BUDGET, '注释里没有「先清键」这个前提 —— 不清会把冷测成热').toMatch(/purge/);
+    // 四种场景里至少要留下遍历（0%）、热重跑（100%）、挂载会话（50%）。
+    expect(BUDGET, '没写明遍历场景实测为 0%').toMatch(/0%/);
+    expect(BUDGET, '没写明 TTL 内重跑可以到 100%').toMatch(/100%/);
+    expect(BUDGET, '没写明挂载会话的形状（每目录列两次 → 50%）').toMatch(/50%/);
+  });
+
+  it('浏览页那 4 次不许乘任何命中率（它压根不查条目缓存）', () => {
+    // 这是那轮实测最值钱的一条：浏览页走 `GET /dav/<目录>/`，而
+    // handleGet 直接 collectDavEntries() 现算，全仓库只有
+    // src/webdav/propfind.ts 会 cache.match(entriesCacheKey(...))。
+    // 三路分解之前是 `propfindCount = a.browse * 4 + …` 整体乘
+    // (1 - 0.9)，等于把 90% 的浏览页 D1 读取凭空抹掉。
+    expect(BUDGET, 'browseReads 又被乘上命中率了').toMatch(
+      /const browseReads = a\.browse \* 4;/,
+    );
+    expect(BUDGET, '旧的「一锅端」写法又回来了').not.toMatch(
+      /const cacheMisses = propfindCount \* \(1 - a\.cacheHitRate\);/,
+    );
+    // 三路必须各自独立出现，否则等于又合并成一笔糊涂账。
+    expect(BUDGET, '挂载那一路没接命中率参数').toMatch(/const mountMisses = /);
+    expect(BUDGET, '同步那一路没接遍历命中率参数').toMatch(/const syncMisses = /);
+  });
+
+  it('D1 行写按实测的 22 行/次上传，不许退回漏算索引的 ×3', () => {
+    expect(BUDGET, 'd1RowsWrittenPerDay 又用那个漏算索引的 ×3 了').not.toMatch(
+      /a\.uploadsPerDay \* 3; *\/\/ *upsert/,
+    );
+    expect(BUDGET, '没按实测的每次上传 22 行建模').toMatch(/const D1_ROWS_PER_UPLOAD = 22;/);
+    expect(BUDGET, '行写没用常量乘').toMatch(
+      /const d1RowsWrittenPerDay = a\.uploadsPerDay \* D1_ROWS_PER_UPLOAD;/,
+    );
+  });
+
+  it('行写注释必须说清「22 是怎么来的」—— 索引放大才是主项', () => {
+    // 22 里只有 1 行是书本身，其余 21 行全是索引。这个反直觉的点
+    // 正是当年估成 3 的原因，必须写下来。
+    expect(BUDGET, '没写明 rows_written = 1 表行 + 索引条目数').toMatch(/1 表行/);
+    expect(BUDGET, '没写明 books 表有 16 个索引').toMatch(/16 个索引/);
+    // 三种场景（新桶 / 稳态 / 覆盖）的数字都要在，否则 22 是孤证。
+    expect(BUDGET, '没写明新桶首见的 27 行').toMatch(/27 行/);
+    expect(BUDGET, '没写明稳态的 22 行').toMatch(/22 行/);
+    expect(BUDGET, '没写明覆盖上传的 21 行').toMatch(/21 行/);
+  });
+});
