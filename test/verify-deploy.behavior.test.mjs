@@ -226,10 +226,16 @@ async function startFakeSite() {
  * 写口令预检是 DELETE，属于 Worker 侧，所以这里也回挂死 —— 预检一挂，
  * 三条写探针按脚本的设计全部 skip，正好复刻线上那次现场。
  *
- * ⚠️ 挂死必须真的**不回字节**，而不是回 5xx：探针区分的是
- *   「拿到了响应但不对」（fail）与「压根没拿到响应」（skip），
- *   假绿场景属于后者。回 5xx 会把 Worker 变成「活着但答错」，
- *   那是另一种场景，测不到这条守卫。
+ * ⚠️ 「Worker 挂掉」必须实现成**连不上**（丢弃 socket），而不是回 5xx：
+ *   探针区分的是「拿到了响应但不对」（fail）与「压根没拿到响应」（skip），
+ *   假绿场景属于后者。回 5xx 会把 Worker 变成「活着但答错」，那是另一种场景。
+ *
+ * ⚠️⚠️ 这里丢 socket 而不是**真的挂死不回**是刻意的。两者在脚本眼里完全等价
+ *   （都走 fetch 抛异常 → 记 skip → `没有一条只有 Worker 才能应答`），
+ *   但代价差 300 倍：真挂死要各自耗满 `RETRY_TIMEOUT_MS × 2 + 退避`
+ *   （读侧 ≈24.5s/次，写侧 20s/次），一个测试就 30~40s；丢 socket 实测
+ *   64ms 就抛 `UND_ERR_SOCKET`。**别把它「升级」成真挂死** —— 那样只会
+ *   让 `npm run check` 慢一个数量级，而断言强度一点不变。
  */
 async function startCacheOnlySite() {
   const log = [];
@@ -244,16 +250,17 @@ async function startCacheOnlySite() {
       res.end(ICO_BYTES);
       return;
     }
-    // Worker 挂死：接受连接，永不响应。
+    // Worker 已死：立刻丢弃连接（不回字节）。
+    req.socket.destroy();
     return;
   });
   await new Promise((r) => server.listen(0, '127.0.0.1', r));
   return {
     url: `http://127.0.0.1:${server.address().port}`,
     log,
-    // ⚠️ 必须先 closeAllConnections()：这个服务器**故意**留着若干挂死的连接，
-    //   只调 close() 的话 Node 会等它们自己消失，afterEach 直接卡死（实测
-    //   `Hook timed out in 10000ms`）。把连接掐掉正是「Worker 已死」的语义。
+    // ⚠️ 必须先 closeAllConnections()：探针的 keep-alive 连接还挂着，
+    //   只调 close() 的话 Node 要等它们自己消失，afterEach 会卡死
+    //   （实测 `Hook timed out in 10000ms`）。
     close: () => new Promise((r) => {
       server.closeAllConnections();
       server.close(r);
