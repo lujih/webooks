@@ -53,8 +53,27 @@ webdav.org 的规格清单里被标记为 *obsoleted* 的只有 **RFC 2518**，�
 > **一把都读不到**。原有测试只验 XML 良构性（标签配对）—— 而
 > `<D:lock>…</D:lock>` 恰恰是良构的，所以没拦住。
 > 现由 `test/lock-xml.test.ts` 按 DTD 逐条校验。
-| §14.14 | href 内是锁令牌 URI | 转义后写入，解析还原即裸 URI，与 `Lock-Token` 头一致 | ✅ |
-| §6.5 / §10.5 | `Lock-Token: "<" absolute-URI ">"` | 带尖括号形式 | ✅ |
+| §14.7 / §14.14 | `lockdiscovery` 的 `<D:href>` 内是**令牌 URI 本体** | XML 里是裸 `urn:uuid:…`；尖括号只出现在头部（见 §10.5 行） | ✅ 已修正 |
+| §6.5 / §10.5 | `Lock-Token: "<" absolute-URI ">"` | 头部出口一律走 `toCodedUrl()`：LOCK 响应与 423 的 `lock-token` 头都带尖括号；DB 里存的是裸本体 | ✅ |
+
+> **2026-10-17 订正**：`§14.14` 那一行此前写的是「转义后写入，解析还原即裸 URI，**与 `Lock-Token` 头一致**」并标 ✅ ——
+> **判据本身就是错的**：§10.5 要求头部是带尖括号的 Coded-URL，§14.7 要求 XML 里是 URI 本体，
+> 「与头部一致」恰恰是 bug 的表现。这就是它长期存活的原因：文档标 ✅ → 无人复核 → 缺陷长期存活。
+>
+> 实际后果（线上复现）：`newLockToken()` 返回带括号形态并入库，`<D:href>` 里于是多一层尖括号。
+> 规范客户端走 §9.10.1 设计的自救路径（被 423 挡住 → 读响应体／PROPFIND 发现锁 → 用 href 拼
+> `Lock-Token` 头）时拼出 `<<urn:uuid:…>>` → 服务端逐字符比较失配 → **409**，
+> **客户端无法用自己刚建的那把锁的 XML 形态解除它**；只有「建锁当下就记住响应头」的客户端能自救。
+> 而我们自己的 423 响应体里嵌的正是 `lockDiscoveryXml(...)`，所以这条自救路径对规范客户端本来是走不通的。
+>
+> 自研探针为什么没抓到：`scripts/rfc-probe.mjs` 的旧检查只做 `body.includes(bare)`，而
+> `&lt;urn:uuid:xxx&gt;` **也包含** `urn:uuid:xxx` 这个子串；两个探针又都只用头部令牌（从响应头拿的形态一直是对的）。
+> 现由 `test/lock-xml.test.ts` 的端到端用例兜底：LOCK → `PROPFIND Depth:0` 取 href → 用 href **原样**拼
+> `Lock-Token` → UNLOCK 必须 204。
+>
+> 兼容性：DB 里可能还有 TTL 内的存量行是带括号形态。比较路径两侧统一做 `stripBrackets()` 归一
+> （`If:` 抓取、`Lock-Token` 头比较、刷新查行、删除），所以存量锁不会变成解不开的孤儿 —— 见
+> `test/lock-xml.test.ts` 的「兼容存量行」用例。
 | §9.10.2 | 无 body + `If:` 头 = 刷新锁 | 支持刷新 | ⚠️ 已修正 |
 
 > **2026-10-14 订正**：本条此前标 ✅，实测是错的：
@@ -98,7 +117,7 @@ webdav.org 的规格清单里被标记为 *obsoleted* 的只有 **RFC 2518**，�
 ## 自测基线
 
 ```bash
-# 协议语义（21 项）——⚠️ 必须带 --token：LOCK 现在需要写口令，不带会把 401 误报成不合规
+# 协议语义（22 项）——⚠️ 必须带 --token：LOCK 现在需要写口令，不带会把 401 误报成不合规
 node scripts/rfc-probe.mjs --url https://<host>/dav/ --token "$WRITE_TOKEN"
 
 # 完整挂载握手（16 步）——同样必须带 --token，否则第 6~8 步的锁流程无法验证
@@ -108,11 +127,14 @@ node scripts/webdav-litmus.mjs --url https://<host>/dav/ --token "$WRITE_TOKEN"
 npx vitest run test/xml-wellformed.test.ts
 ```
 
-当前实测（2026-10-17，本地 `wrangler dev` 全量跑）：`rfc-probe` **21/21**（带 `--token`）；
+当前实测（2026-10-17，本地 `wrangler dev` 全量跑）：`rfc-probe` **22/22**（带 `--token`）；
 不带 `--token` 时为 **16 项（15 ✅ + 1 ⚠️）** —— 其中 6 条锁协议检查被**一行显式说明替代**
 （「未提供 --token，跳过锁协议检查，401 属预期」），`If-Match` 那 1 项因无凭据记 ⚠️。
 `webdav-litmus` **16/16**（带 `--token`）；XML 良构全部通过。
-（原文档写的 `14/14` 在本次改动前就已是陈旧数字 —— 脚本里的检查项早已增加到 21 条。）
+（原文档写的 `14/14` 是陈旧数字；`21` 也是 —— 本次为令牌形态修复新增了
+「锁令牌 href 是裸 URI」「用 href 拼出的 Coded-URL 等于响应头」两条检查，
+其中前者在修复前**永远是 ✅**：旧判据只做 `body.includes(bare)`，而带括号的
+`&lt;urn:uuid:…&gt;` 也包含裸子串 —— 判据写错正是这个 bug 长期存活的原因。）
 
 > ⚠️ **不带 `--token` 时这两个探针的行为**（都已实测）：
 > `LOCK` 会返回 **401**（本站有意要求写口令，见偏离表），这不是协议退化。

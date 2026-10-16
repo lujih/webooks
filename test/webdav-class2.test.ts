@@ -138,8 +138,15 @@ describe('PROPFIND 活锁注入 lockdiscovery', () => {
       const { results } = await testEnv.DB.prepare('SELECT resource, token FROM locks').all();
       throw new Error(`DIAG: pf has no lockdiscovery. token=${token} lockRows=${JSON.stringify(results)}`);
     }
-    // lockdiscovery 里的 token 经 XML 转义（< 变 &lt;），所以匹配转义后的形式
-    const escapedToken = token.replace(/</g, '&lt;').replace(/>/g, '&gt;');
-    expect(xml).toContain(escapedToken);
+    // §14.14：lockdiscovery 里的 href 是**令牌 URI 本体**（裸 urn:uuid:…），
+    // 尖括号只属于头部形态（§10.5 Lock-Token）。所以正文里既没有 `<` 也没有
+    // `&lt;` —— 用解析器读出来必须正好等于响应头剥掉尖括号后的值。
+    const bare = token.replace(/^</, '').replace(/>$/, '');
+    expect(xml).toContain(bare);
+    // 2026-10-17 修：此前正文里是 `&lt;urn:uuid:…&gt;`（多一层尖括号），
+    // 规范客户端据此拼 `Lock-Token: <` + href + `>` 会得到 `<<urn:uuid:…>>`
+    // → 服务端比较失配 → 409，客户端解不开自己刚建的锁。
+    expect(xml, 'href 里不许再出现带括号的令牌形态').not.toContain(`&lt;${bare}&gt;`);
+    expect(xml, 'href 里不许出现未转义的裸尖括号令牌').not.toContain(`<${bare}>`);
   });
 });

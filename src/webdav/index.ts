@@ -36,10 +36,13 @@ import { purgeCreditCache } from '../api/requests';
 import {
   acquireLock,
   allLiveLocks,
+  extractLockTokens,
   liveLockForResource,
   parseTimeoutHeader,
   releaseLock,
+  stripBrackets,
   sweepExpiredLocks,
+  toCodedUrl,
   lockDiscoveryXml,
 } from '../lib/locks';
 import { guardWrite } from '../lib/throttle';
@@ -174,10 +177,12 @@ async function handleLockedWrite(
   // 读路径（GET/HEAD/PROPFIND）不受锁约束 —— 锁只挡写，不挡读。
   const lock = await liveLockForResource(env.DB, davPath);
   if (lock) {
-    // 提取 If 头里的 lock-token；与活锁 token 匹配 → 持锁者，放行
+    // 提取 If 头里的 lock-token；与活锁 token 匹配 → 持锁者，放行。
+    // 两侧都做 stripBrackets 归一：客户端按 §10.5 发来的是 Coded-URL（带括号），
+    // 库里可能还有旧代码存的带括号存量行 —— 任一形态都要能对上。
     const ifHeader = request.headers.get('if');
-    const ifTokens: string[] = ifHeader ? (ifHeader.match(/<urn:uuid:[0-9a-f-]+>/gi) ?? []) : [];
-    if (ifTokens.includes(lock.token)) {
+    const ifTokens = ifHeader ? extractLockTokens(ifHeader) : [];
+    if (ifTokens.includes(stripBrackets(lock.token))) {
       return run();
     }
     return lockConflictResponse(lock, davPath);
@@ -208,7 +213,9 @@ function lockConflictResponse(lock: { token: string; resource: string; owner: st
       status: 423,
       headers: {
         'content-type': 'application/xml; charset=utf-8',
-        'lock-token': lock.token,
+        // 头部出口一律走 Coded-URL（§10.1 / §10.5）：令牌本体是裸 URI，
+        // 尖括号只属于头部形态。带括号的形态**只能**在这里出现。
+        'lock-token': toCodedUrl(lock.token),
       },
     },
   );
@@ -259,10 +266,10 @@ async function handleLock(
   void typeMatch; // locktype 恒为 write（§14.15），解析它只是为了文档完整性
 
   // 刷新：If 头带 lock-token。RFC 4918 §9.10.2：If: (<token>) 表示刷新。
-  // token 形如 <urn:uuid:xxx>，If 头是 ( <token> )。
+  // 头部里是 Coded-URL（带尖括号），令牌本体是裸 URI —— extractLockTokens
+  // 两种形态都吃并归一成裸形态，与库里的存量行比较时再由 acquireLock 归一。
   const ifHeader = request.headers.get('if');
-  // 从 If: (<urn:uuid:...>) 里提取 token（最内层第一个 <...>）
-  const ifToken = ifHeader?.match(/<urn:uuid:[0-9a-f-]+>/i)?.[0] ?? null;
+  const ifToken = ifHeader ? (extractLockTokens(ifHeader)[0] ?? null) : null;
 
   // RFC 4918 §9.10.2: 如果资源已被另一个 exclusive 锁持有，刷新自己的锁 OK，新建则 423
   try {
@@ -288,7 +295,9 @@ async function handleLock(
       status: 200,
       headers: {
         'content-type': 'application/xml; charset=utf-8',
-        'lock-token': lock.token,
+        // §9.10.1：LOCK 响应头回 Coded-URL 形态（带尖括号）。
+        // 正文里的 lockdiscovery 是裸 URI —— 同一把锁，两端形态本就不同。
+        'lock-token': toCodedUrl(lock.token),
       },
     });
   } catch (err) {
@@ -309,8 +318,8 @@ async function handleLock(
           status: 423,
           headers: {
             'content-type': 'application/xml; charset=utf-8',
-            // §11.3：让客户端知道冲突的是哪把锁
-            ...(live ? { 'lock-token': live.token } : {}),
+            // §11.3：让客户端知道冲突的是哪把锁（同样是头部形态）
+            ...(live ? { 'lock-token': toCodedUrl(live.token) } : {}),
           },
         },
       );
@@ -335,9 +344,16 @@ async function handleUnlock(request: Request, env: Env, davPath: string): Promis
       { status: 400, headers: { 'content-type': 'application/xml; charset=utf-8' } },
     );
   }
-  // 带 token 必须与资源锁匹配
+  // 带 token 必须与资源锁匹配。
+  //
+  // 两侧都按令牌本体（裸 URI）比较：客户端按 §10.5 发来的是 Coded-URL，
+  // 而库里可能还有旧代码存下的带括号存量行 —— 只要本体一致就算匹配。
+  // 删除时用 live.token（**库里那一行的原样**）而不是回头用请求头：
+  // 存量行时头是 `<urn:uuid:…>`、库里也是带括号，正好都能删掉；若客户端
+  // 用了裸形态而库是带括号形态，用头去 DELETE 会因为字符串不等而**静默失败**
+  // 留锁不放 —— 那正是本任务要修掉的那一类「刚建的锁解不开」。
   const live = await liveLockForResource(env.DB, davPath);
-  if (!live || live.token !== tokenHeader) {
+  if (!live || stripBrackets(live.token) !== stripBrackets(tokenHeader)) {
     // §9.11.1：409 (Conflict) + 'lock-token-matches-request-uri'。
     // ⚠️ 原实现用的 `<D:unlock-response>` 在 RFC 4918 全文里**零命中**
     //   —— 它来自从未实现的 RFC 3253 (DeltaV)。客户端按规范找不到这个
@@ -351,7 +367,7 @@ async function handleUnlock(request: Request, env: Env, davPath: string): Promis
       },
     );
   }
-  await releaseLock(env.DB, tokenHeader);
+  await releaseLock(env.DB, live.token);
   return new Response(null, { status: 204 });
 }
 

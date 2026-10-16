@@ -208,11 +208,25 @@ if (!TOKEN) {
   check('LOCK 响应是良构 XML（标签配对）', wf.err === null,
     wf.err ? `解析错误：${wf.err}` : '标签配对正确', 'RFC 4918 §8.2');
 
-  // §14.14 + §10.5：正文里的 token 与响应头一致，且是原样 URI（转义后解析还原）
+  // §14.14 + §10.5：正文里的 href 是**令牌 URI 本体**（裸），头部才是 Coded-URL。
+  //
+  // ⚠️ 2026-10-17 订正：这条检查原来只做 `body.includes(bare)` ——
+  //    而旧代码输出的 `&lt;urn:uuid:xxx&gt;` **也包含** `urn:uuid:xxx` 这个子串，
+  //    所以它在 bug 存在期间一直是 ✅。判据本身写错了（「与 Lock-Token 头一致」
+  //    恰好是 bug 的表现 —— 头部按 §10.5 带括号、XML 里按 §14.7 是本体），
+  //    缺陷因此长期存活。现在按元素取值判：必须正好是
+  //    `<D:href>urn:uuid:…</D:href>`，且不许出现带括号的形态。
   if (token) {
     const bare = token.replace(/^</, '').replace(/>$/, '');
-    check('锁令牌在正文与 Lock-Token 头中一致（解析还原后）', body.includes(bare),
-      `期望 ${bare}`, 'RFC 4918 §14.14');
+    const exact = body.includes(`<D:href>${bare}</D:href>`);
+    const bracketed = body.includes(`&lt;${bare}&gt;`) || body.includes(`<D:href><${bare}>`);
+    check('锁令牌 href 是裸 URI（尖括号只属于头部形态）', exact && !bracketed,
+      bracketed
+        ? '正文里出现了带括号形态 → 客户端拼出 <<urn:uuid:…>> → 409，解不开自己刚建的锁'
+        : `期望 <D:href>${bare}</D:href>`, 'RFC 4918 §14.14 / §10.5 / §9.10.7');
+    // 反向：把 href 的形态补成 Coded-URL，必须正好等于响应头（自救路径可走通）
+    check('用 href 拼出的 Coded-URL 等于响应头 Lock-Token', `<${bare}>` === token,
+      `href+括号=<${bare}> 头=${token}`, 'RFC 4918 §10.1');
   }
 
   // §10.7：Timeout 头必须是 Second-<digits>，服务端要真的采纳。

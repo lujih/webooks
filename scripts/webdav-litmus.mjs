@@ -166,12 +166,30 @@ async function main() {
       headers: { 'content-type': 'application/xml', timeout: 'Second-300' },
       body: '<?xml version="1.0"?><D:lockinfo xmlns:D="DAV:"><D:locktype><D:write/></D:locktype><D:lockscope><D:exclusive/></D:lockscope><D:depth>infinity</D:depth></D:lockinfo>',
     });
+    // 统一归一成**令牌本体**（裸 URI）存着；该补括号的地方（step 7 的 If 头、
+    // step 8 的 Lock-Token 头）各自按 §10.1 的 Coded-URL 补回来。
+    // 这样两条路径（200 响应头 / 423 正文）拿到的东西形态一致，
+    // 也不会出现「头里发了裸 URI」这种依赖服务端宽容度的写法。
     lockToken = res.headers.get('lock-token');
+    lockToken = lockToken ? lockToken.replace(/^</, '').replace(/>$/, '') : null;
     let ok = res.status === 200 && !!lockToken && body.includes('<D:lockdiscovery>');
-    // 若已有锁（423），从 lockdiscovery 里提取 token 供后续 unlock
+    // 若已有锁（423），从 lockdiscovery 里提取 token 供后续 unlock。
+    //
+    // ⚠️ 2026-10-17 修两处：
+    //   ① 旧正则 `/<urn:uuid:[0-9a-f-]+/` 是**死正则** —— 正文里的令牌要么是
+    //      转义形态 `&lt;urn:uuid:…&gt;`（旧代码的产物），要么是裸 URI
+    //      `urn:uuid:…`（§14.14 要求的形态），两种都匹配不到开头那个 `<`。
+    //   ② 旧代码匹配到之后无条件写 `ok = true`，是**掩盖式赋值**：无论 423 的
+    //      真实原因是什么，只要 body 里凑巧出现令牌片段就记成通过，把失败
+    //      伪装成成功。现在 ok 只在**确实取到这把锁的令牌**时才置真。
+    //   注意取出的必须是**本体**（裸 URI）：step 7 拼 If 头、step 8 拼
+    //   Lock-Token 头时会各自补回该有的括号形态。
     if (!ok && res.status === 423) {
-      const m = body.match(/<urn:uuid:[0-9a-f-]+/);
-      if (m) { lockToken = m[0]; ok = true; }
+      const m = body.match(/&lt;(urn:uuid:[0-9a-f-]+)&gt;|(urn:uuid:[0-9a-f-]+)/);
+      if (m) {
+        lockToken = m[1] ?? m[2] ?? null;
+        ok = !!lockToken && body.includes('<D:activelock>');
+      }
     }
     if (!TOKEN && res.status === 401) {
       record(true, '未提供 --token：LOCK → 401（本站要求写口令，属预期不是退化）',
@@ -183,21 +201,25 @@ async function main() {
   }
 
   // 7) LOCK 刷新
+  //    If 头按 §10.4 是 `(<Coded-URL>)`：lockToken 存的是本体，这里补回尖括号。
+  //    旧写法 `(${lockToken})` 在裸形态下会发出 `(urn:uuid:…)`，缺一层尖括号 ——
+  //    服务端宽容能吃下，但探针本身就成了不规范客户端的样本，失去验证价值。
   if (lockToken) {
     const { res } = await reqAuth('/', {
       method: 'LOCK',
-      headers: { 'content-type': 'application/xml', if: `(${lockToken})`, timeout: 'Second-300' },
+      headers: { 'content-type': 'application/xml', if: `(<${lockToken}>)`, timeout: 'Second-300' },
       body: '<D:lockinfo xmlns:D="DAV:"><D:locktype><D:write/></D:locktype></D:lockinfo>',
     });
-    record(res.status === 200, 'LOCK 刷新（If: <token>）→ 200',
+    record(res.status === 200, 'LOCK 刷新（If: (<token>)）→ 200',
       `status=${res.status}`, 'RFC 4918 §9.10.2');
   } else {
     console.log(`      ${C.dim}（无锁令牌，跳过刷新 —— 未提供 --token 时锁流程无法验证）${C.r}`);
   }
 
   // 8) UNLOCK —— 必须释放，否则 Depth:infinity 根锁会挡死后续所有写操作
+  //    §10.5：Lock-Token 头是 Coded-URL，本体外面必须包一层尖括号。
   if (lockToken) {
-    const { res } = await req('/', { method: 'UNLOCK', headers: { 'lock-token': lockToken } });
+    const { res } = await req('/', { method: 'UNLOCK', headers: { 'lock-token': `<${lockToken}>` } });
     record(res.status === 204, 'UNLOCK → 204（释放根锁）', `status=${res.status}`, 'RFC 4918 §9.11');
   }
 

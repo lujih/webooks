@@ -165,7 +165,7 @@ describe('每个产出 XML 的接口都必须是良构 XML', () => {
 });
 
 describe('锁令牌在 XML 里的表示', () => {
-  it('正文里的 href 是转义后的 URI；解析出来等于 Lock-Token 头的裸 URI', async () => {
+  it('正文里的 href 是裸 URI；Lock-Token 头才是带尖括号的 Coded-URL', async () => {
     await dav(LEAF, { method: 'PUT', body: 'x' });
     const res = await dav(LEAF, {
       method: 'LOCK',
@@ -177,17 +177,27 @@ describe('锁令牌在 XML 里的表示', () => {
     expect(header).toMatch(/^<urn:uuid:[0-9a-f-]+>$/);
     const bare = header.slice(1, -1);
 
-    // 令牌本身含尖括号，必须做 XML 转义，否则不是良构 XML（实测过）。
-    // 转义是「文本层表示」，解析后客户端拿到的仍是裸 URI。
-    expect(xml).toContain(`<D:href>&lt;${bare}&gt;</D:href>`);
-    // 绝不能出现未转义的裸尖括号令牌（那会让 XML 非法）
-    expect(xml).not.toContain(`<D:href><${bare}>`);
+    // ⚠️ 2026-10-17 订正：本条断言此前编码的正是那个 bug ——
+    //   它要求正文里出现 `<D:href>&lt;${bare}&gt;</D:href>`，
+    //   即把**头部形态**当成了令牌值写进 XML，多一层尖括号。
+    //   RFC 4918：§10.1 Coded-URL = "<" absolute-URI ">" 是头部语法；
+    //   §14.7/§14.14 的 href 里是 URI 本体。§9.10.7 的官方例子把两者
+    //   摆在一起：`Lock-Token: <urn:uuid:…>` 带括号、
+    //   `<D:href>urn:uuid:…</D:href>` 裸。同一令牌，两端形态本就不同。
+    //   后果：规范客户端拿 href 拼 `Lock-Token: <` + href + `>` 得到
+    //   `<<urn:uuid:…>>` → 409，**解不开自己刚建的锁**。
+    expect(xml).toContain(`<D:href>${bare}</D:href>`);
+    // 绝不能出现带括号（转义或未转义）的形态
+    expect(xml, 'href 里不许再有头部形态的令牌').not.toContain(`&lt;${bare}&gt;`);
+    expect(xml, '未转义的尖括号令牌会让 XML 非法').not.toContain(`<D:href><${bare}>`);
 
-    // 用解析器确认：转义还原后正好等于响应头里的令牌
+    // 用解析器确认：href 的取值解析出来后是**裸 URI**，不是头部形态
     const m = xml.match(/<D:locktoken><D:href>([^<]*)<\/D:href><\/D:locktoken>/);
     expect(m, '应能取出 locktoken/href').toBeTruthy();
     const decoded = m![1]!.replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&amp;/g, '&');
-    expect(decoded).toBe(header);
+    expect(decoded, 'href 的值是令牌 URI 本体').toBe(bare);
+    // 反过来：把头部的括号加上去，正好是合法的 Coded-URL
+    expect(`<${decoded}>`).toBe(header);
   });
 });
 

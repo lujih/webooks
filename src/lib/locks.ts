@@ -78,11 +78,48 @@ export function parseTimeoutHeader(value: string | null): number {
   return DEFAULT_LOCK_SECONDS;
 }
 
-/** 生成一个 urn:uuid 格式的锁 token */
+/**
+ * 生成一个 urn:uuid 格式的锁 token —— 返回**裸 URI**，不带尖括号。
+ *
+ * ⚠️ 形态问题（2026-10-17 修）：返回值和入库值都必须是裸 URI：
+ *   · §14.7 / §14.14：`<D:locktoken><D:href>` 里要的是 URI 本体
+ *   · §10.1 / §10.5：`Coded-URL = "<" absolute-URI ">"` 是**头部**语法，
+ *     只有 `Lock-Token` 响应头出口才由 toCodedUrl() 加尖括号
+ * 同一把锁，XML 里裸、头部带括号（§9.10.7 的官方例子就是这么写的）。
+ * 旧实现把带括号形态当令牌本体存进 DB，导致 href 多一层尖括号、规范
+ * 客户端拿 href 拼 Lock-Token 后无法解锁（详见 stripBrackets 的注释）。
+ */
 export function newLockToken(): string {
   // RFC 4918 §12.1：lock-token 必须 URN，推荐 urn:uuid:<uuid>
   const b = crypto.randomUUID();
-  return `<urn:uuid:${b}>`;
+  return `urn:uuid:${b}`;
+}
+
+/**
+ * 剥掉 Coded-URL 的尖括号，得到令牌本体（幂等，裸形态原样返回）。
+ *
+ * 为什么比较时必须两侧归一：DB 里可能还有**存量行**是带括号形态
+ * （旧代码存进去的，TTL 内不会立刻消失），而客户端按 §10.5 发来的
+ * 头一定带括号。两侧任一形态都要能对上，否则「刚建完就解不开」。
+ */
+export function stripBrackets(token: string): string {
+  return token.replace(/^</, '').replace(/>$/, '');
+}
+
+/** 令牌本体的头部形态：`Coded-URL = "<" absolute-URI ">"`（§10.1 / §10.5，幂等） */
+export function toCodedUrl(token: string): string {
+  return token.startsWith('<') ? token : `<${token}>`;
+}
+
+/**
+ * 从 `If:` / `Lock-Token` 头里抽出令牌本体（两种形态都吃）。
+ *
+ * If 头按 §10.4 是 `If: (<token>)`，里面是 Coded-URL（带括号）；但客户端
+ * 少写一层尖括号的情况存在，把裸形态也认下来不花什么成本，且能顺带
+ * 容忍 `<<urn:uuid:…>>` 这种旧 bug 的产物（去掉的只是最外层一对）。
+ */
+export function extractLockTokens(header: string): string[] {
+  return (header.match(/<?urn:uuid:[0-9a-f-]+>?/gi) ?? []).map(stripBrackets);
 }
 
 export async function acquireLock(
@@ -102,20 +139,28 @@ export async function acquireLock(
 
   // 刷新：资源上已有同 token 的活锁 → 直接更新超时（不重新创建）
   if (opts.refreshToken) {
+    // 归一后比较：调用方给的是裸形态，而库里可能还有旧代码存下的带括号
+    // 存量行（TTL 内）。SQL 里同时匹配两种形态，取回**库里那一行的原样**
+    // token 继续用 —— 否则客户端拿 XML 里的裸 href 来刷新会查不到行，
+    // 走进「新造一把锁」分支，与 §9.10.2 的刷新语义不符。
+    const refresh = stripBrackets(opts.refreshToken);
     const existing = await db
-      .prepare(`SELECT token FROM locks WHERE token = ? AND resource = ?`)
-      .bind(opts.refreshToken, opts.resource)
+      .prepare(
+        `SELECT token FROM locks
+          WHERE (token = ? OR token = ?) AND resource = ?`,
+      )
+      .bind(refresh, `<${refresh}>`, opts.resource)
       .first<{ token: string }>();
     if (existing) {
       await db
         .prepare(
           `UPDATE locks SET expires_at = ?, timeout_sec = ? WHERE token = ?`,
         )
-        .bind(expires, opts.timeoutSec, opts.refreshToken)
+        .bind(expires, opts.timeoutSec, existing.token)
         .run();
       return {
         lock: {
-          token: opts.refreshToken,
+          token: existing.token,
           resource: opts.resource,
           owner: opts.owner ?? null,
           type: opts.type,
@@ -305,14 +350,21 @@ export async function liveLockForResource(
  *   2. 而当时的测试只做 `expect(xml).toContain(...)` 字符串匹配，一路绿灯。
  *   现在由 test/xml-wellformed.test.ts 用严格检查器兜底。
  *
- * 关于 token 要不要转义（这里很容易改错，两个方向都试过）：
- *   锁令牌是 `<urn:uuid:…>`，**本身含尖括号**。
- *   · 不转义 → 正文里出现 `<D:href><urn:uuid:…></D:href>`，
- *     XML 解析器会把 `<urn:uuid:…>` 当成标签 → 依然不是合法 XML（实测过）。
- *   · 转义 → 解析器读出来的文本值恰好就是 `<urn:uuid:…>`，
- *     正是 §14.14 要求的「单个锁令牌 URI」。
- *   所以**必须转义**：转义是 XML 文本层的表示问题，与「值是什么」无关。
- *   客户端解析后拿到的仍是裸 URI，与 Lock-Token 响应头里的一致。
+ * 关于 token 的形态与转义（这里很容易改错，三个方向都试过）：
+ *   锁令牌的本体是**裸 URI** `urn:uuid:…`（§14.7 / §14.14），尖括号是**头部**
+ *   语法（§10.1 `Coded-URL = "<" absolute-URI ">"`，§10.5 `Lock-Token`）。
+ *   · 输出 `<D:href><urn:uuid:…></D:href>`（不转义、且值自带括号）→ 解析器把
+ *     `<urn:uuid:…>` 当标签 → **不是合法 XML**（实测过）。
+ *   · 输出 `<D:href>&lt;urn:uuid:…&gt;</D:href>`（转义了「带括号的值」）→
+ *     良构，但解析出来的文本值是 `<urn:uuid:…>`，**多一层尖括号**：
+ *     规范客户端据此拼 `Lock-Token: <` + href + `>` 得到 `<<urn:uuid:…>>`，
+ *     服务端逐字符比较失配 → 409，客户端**无法用自己刚建的锁的 XML 形态解锁**。
+ *     这个形态长期存活，因为 docs/rfc-compliance.md 当时把判据写成
+ *     「与 Lock-Token 头一致」—— 那是拿 bug 当标准（循环论证）。
+ *   · 正确输出：`<D:href>urn:uuid:…</D:href>`（裸 URI）。此时
+ *     `Lock-Token: <` + href + `>` 恰好是合法 Coded-URL。
+ *   转义函数仍然保留：owner / href 都可能含 `<` `&`，注入防护不能因为
+ *   令牌形态变了就丢掉（escapeOwner 见下）。
  *
  * ⚠️ 第三处历史事故：元素名与子元素顺序都写错了。
  *   原实现输出 `<D:lockdiscovery><D:lock>…`，而 RFC 4918 的 DTD 是：
@@ -350,8 +402,13 @@ export function lockDiscoveryXml(lock: LockRow, requestHref: string): string {
     ownerXml +
     // ⚠️ timeout 必须在 locktoken 之前（DTD 的 sequence 约束）
     `<D:timeout>Second-${lock.timeoutSec}</D:timeout>` +
-    // token 含 <>，必须做 XML 转义，否则不是良构 XML
-    `<D:locktoken><D:href>${escapeOwner(lock.token)}</D:href></D:locktoken>` +
+    // §14.14：href 里是**令牌 URI 本体**（裸），不是头部的 Coded-URL 形态。
+    // stripBrackets 同时兜住 DB 里 TTL 内的存量行（旧代码存的是带括号形态）——
+    // 无论库里是什么形态，XML 出去的一律是裸 URI，规范客户端据此拼
+    // `Lock-Token: <` + href + `>` 就能直接解开自己刚建的锁。
+    // 仍然走 escapeOwner：令牌本该是 urn:uuid:…，但存储层不做信任假设，
+    // 万一有脏数据也不会把 `<` 注入成标记（转义后解析回来仍是原值）。
+    `<D:locktoken><D:href>${escapeOwner(stripBrackets(lock.token))}</D:href></D:locktoken>` +
     // §14.12：lockroot 给出被锁资源 URL（SHOULD）
     // href 要做百分号编码：§8.3 要求响应里每个 href 用同一种格式，
     // 而同一份响应的 <D:response><D:href> 是编码过的。
