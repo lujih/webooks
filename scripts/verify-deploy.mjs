@@ -98,6 +98,122 @@ async function cleanup(name) {
   }
 }
 
+/* ────────────────────────────────────────────────────────────────────────
+ * 有界重试 —— 只给**读**请求用，且只对「fetch 直接抛异常」重试。
+ *
+ * ## 为什么需要它（实测，不是假想）
+ *
+ * 线上跑 15 次，有 1 次 `书卡直链 R2` 报「fetch failed」，那条就从 5 项通过
+ * 掉成 4 项。`fetch failed` 是 undici 的网络层错误，不是 HTTP 状态码 ——
+ * 它只可能来自 DNS / 连接 / TLS 那一层。
+ *
+ * 两个域名都同时解析出 AAAA 和 A（`books.cszxorx.dpdns.org` 实测 2+2，
+ * `webooks.cszxorx.dpdns.org` 也有 AAAA）。undici 默认 `autoSelectFamily`
+ * 会把两类地址放进同一个 race；当某条路（典型是本机没有出口的 IPv6）被
+ * 选中时，请求要等它**超完连接超时才回落**，偶尔直接以
+ * `UND_ERR_CONNECT_TIMEOUT` 冒泡成 `fetch failed`。实测同一 URL 连续 12 次
+ * 的耗时：1286,10470,1100,1172,877,965,897,949,1408,1073 —— 那条 10470ms
+ * 明显超出正常路径一个数量级。
+ * ⚠️ 归因注意：「IPv6 坏路」是与当时的链路状态绑定的推断 —— 隔天
+ * `curl -6` 已能 0.8s 通（IPv6 出口恢复了），挂起却换了个形态（见下）。
+ * **能确定的是**「偶发的网络层挂起/失败存在且重试即可恢复」；具体是哪条
+ * 地址家族、哪一跳的问题，会随链路变化，别把那一步写死。
+ *
+ * 关键在于**重试真的会恢复**：undici 不会把上一轮坏掉的地址钉死在连接池
+ * 里，第二次请求重新选路就落到好路上了。实测 12 次里有 1 次第一次超时报
+ * `TimeoutError`，第二次 999ms 正常 200。
+ *
+ * ## 参数（为什么是这几个数）
+ *
+ * · 2 次尝试（1 次重试）：CI 的 verify-live job 自己已经「失败等 30 秒再跑
+ *   一遍」（deploy.yml 的 `for attempt in 1 2`）。那是给「边缘传播延迟」
+ *   的兜底；本重试是给**单条请求**的网络层瞬时失败兜底，两者是串联的两层。
+ *   只重试一次就够 —— 网络抖动大多是单次的，再加次数只是把总时长推高，
+ *   而 verify-live 是门卫，时长敏感。
+ * · 每次 8s：实测正常请求 0.5~2s 偶发 5~8s（同一秒内重测就有 6s 的样本，
+ *   40 连发则 0 条超 4s —— 慢是**间歇性**的，不是恒定慢）。8s 卡在
+ *   「正常波动的上沿」之外，又比 undici 默认 10s 早 2s 失败，从而
+ *   **把一次挂起变成一次快速重试**。这一条比「重试几次」更关键：
+ *   没有超时，重试只是把 10s 的挂起多来几遍。
+ * · 500ms 退避：只退避一次，取 500ms 是为了让最坏总时长
+ *   （8s + 0.5s + 8s ≈ 16.5s）稳稳压在 CI 的 30 秒窗口内，留出一半余量。
+ *   不做指数退避 —— 只有一个故障源时指数退避没有第二次可退对象，纯浪费。
+ *
+ * ## 为什么只对「抛异常」重试
+ *
+ * 拿到 HTTP 响应（哪怕是 500、502）说明**链路是通的**，那是对端应用或边缘
+ * 的问题，重试既救不回来又只会拉长门卫时长、还可能把一次真故障洗成绿灯。
+ * 所以判据是「有没有 resolve 出 Response」，而不是状态码好不好看。
+ *
+ * ## 为什么不给写探针用（这是硬边界，不是保守）
+ *
+ * 本库 PUT 匿名可写、DELETE 需要口令。`probeCopyWhitelist` /
+ * `probeUnlockNoToken` / `probeOverwrite` / `probeWriteToken` 一旦重试
+ * PUT/COPY：
+ *   · 写入类请求重试 = 要么重复落一份同名书、要么把 COPY 撞成 overwrite
+ *     的语义搅乱，线上留下删不掉的垃圾（脚本头部注释里那个 4 本变 8 本的
+ *     实测就是这么来的）；
+ *   · DELETE/COPY 重试若第一次其实**已经生效**（响应在回程丢了），第二次
+ *     会打到不存在的目标上，探针读到 404 而不是 201/415/412，直接把
+ *     「代码是对的」误判成 fail —— 比 flake 更糟。
+ * 而且写探针已经用状态机挡住了它们（`canWrite()`），丢一次就报 skip 收场，
+ * 不需要重试去补。所以这里在实现层面直接禁掉：写入方法一进来就抛，
+ * 让「以后有人顺手把写探针也改成走这个 helper」这件事**编译期就暴露**。
+ */
+
+/** 写类方法：绝不走重试（见上面「为什么不给写探针用」） */
+const WRITE_METHODS = new Set(['PUT', 'POST', 'DELETE', 'COPY', 'MOVE', 'LOCK', 'UNLOCK', 'PROPPATCH', 'MKCOL']);
+
+/** 单次尝试的超时（ms）。实测正常 0.9~1.4s，坏路烧满 10s */
+const RETRY_TIMEOUT_MS = 8000;
+/** 总尝试次数：1 次首发 + 1 次重试 */
+const RETRY_ATTEMPTS = 2;
+/** 唯一一次退避（ms）。让最坏总时长 ≈16.5s < CI 的 30s 窗口 */
+const RETRY_BACKOFF_MS = 500;
+
+/** 被重试救回来的次数，报告时要如实说出来（见 retryNotice） */
+let retriedRecovered = 0;
+
+/**
+ * 带超时的只读 fetch：仅网络层异常重试，HTTP 响应一律原样返回。
+ *
+ * 返回 `{ res, attempts }`，`attempts > 1` 表示靠重试才拿到响应。
+ */
+async function fetchRead(url, init = {}) {
+  const method = String(init.method || 'GET').toUpperCase();
+  if (WRITE_METHODS.has(method)) {
+    throw new Error(`fetchRead 不接受写类方法 ${method} —— 写探针重试会在线上留垃圾`);
+  }
+  let lastErr;
+  for (let attempt = 1; attempt <= RETRY_ATTEMPTS; attempt++) {
+    try {
+      // 超时是这里的主角：没有它，一次连接挂起会让 CI 一直卡到 GitHub 的
+      // 6 小时上限（见 REPORT「后续建议」）。
+      const res = await fetch(url, { ...init, method, signal: AbortSignal.timeout(RETRY_TIMEOUT_MS) });
+      if (attempt > 1) retriedRecovered++;
+      return { res, attempts: attempt };
+    } catch (err) {
+      lastErr = err;
+      if (attempt < RETRY_ATTEMPTS) {
+        await new Promise((r) => setTimeout(r, RETRY_BACKOFF_MS));
+      }
+    }
+  }
+  throw lastErr;
+}
+
+/**
+ * 重试痕迹的说明文案。
+ * 一条探针是靠重试才过的，读者必须知道 —— 否则「这次验证有多可信」这个问题
+ * 就没有答案（静默重试会把 1/15 的抖动洗成「稳定通过」）。
+ */
+function retryNotice(attempts) {
+  if (attempts <= 1) return '';
+  return ` ⚠️⚠️ 第 1 次请求在网络层失败（${RETRY_TIMEOUT_MS}ms 超时），`
+    + `**重试后才通过**（共 ${attempts} 次尝试）—— 本次结论可信度略降，`
+    + '若反复出现说明到该主机的链路有问题';
+}
+
 /**
  * 写口令的**可用性**（不是「有没有传」）。
  *
@@ -379,7 +495,7 @@ async function probeOverwrite() {
  */
 async function probeStaticFavicon() {
   try {
-    const res = await fetch(`${SITE}/favicon.ico`);
+    const { res, attempts } = await fetchRead(`${SITE}/favicon.ico`);
     const ct = res.headers.get('content-type') || '';
     const cc = res.headers.get('cache-control') || '';
     const body = new Uint8Array(await res.arrayBuffer());
@@ -402,9 +518,9 @@ async function probeStaticFavicon() {
       results.push({
         name: '_headers 规则生效（favicon）',
         status: cc.includes('604800') ? 'pass' : 'fail',
-        detail: cc.includes('604800')
-          ? cc
-          : `期望 max-age=604800（_headers 生效），实际 "${cc}"（可能是默认头）`,
+        detail: (cc.includes('604800') ? cc
+          : `期望 max-age=604800（_headers 生效），实际 "${cc}"（可能是默认头）`)
+          + retryNotice(attempts),
       });
     }
   } catch (err) {
@@ -439,8 +555,15 @@ async function probeWorkerRoutesWithNavigateHeader() {
   const routes = ['/', '/upload', '/requests', '/upload/', '/requests/', '/admin/', '/dav/'];
   try {
     const bad = [];
+    let navAttempts = 1;
     for (const path of routes) {
-      const res = await fetch(`${SITE}${path}`, { headers: NAV });
+      // ⚠️ attempts 是**每次循环**的局部值，收尾的 retryNotice 要的是
+      //    「整轮路由列表里有没有一次靠重试」。所以循环里记到外层变量，
+      //    变量名也区分开（navAttempts）—— 直接引用循环里的 attempts 会在
+      //    循环结束后 ReferenceError，被下面的 catch 吞成一条假 skip
+      //    （实测踩过：探针报「attempts is not defined」）。
+      const { res, attempts } = await fetchRead(`${SITE}${path}`, { headers: NAV });
+      if (attempts > navAttempts) navAttempts = attempts;
       const csp = res.headers.get('content-security-policy');
       const body = await res.text();
       // 成功判据：有 CSP（=Worker 生成的 HTML）且正文里有本站的 <title>
@@ -451,9 +574,10 @@ async function probeWorkerRoutesWithNavigateHeader() {
     results.push({
       name: '浏览器导航头下 Worker 路由仍可达',
       status: bad.length === 0 ? 'pass' : 'fail',
-      detail: bad.length === 0
+      detail: (bad.length === 0
         ? `${routes.length} 条路由带 sec-fetch-mode:navigate 均正常`
-        : `❌ 被静态层抢答：${bad.join(' ')} —— 检查 wrangler.jsonc 的 run_worker_first 是否漏了这条路径`,
+        : `❌ 被静态层抢答：${bad.join(' ')} —— 检查 wrangler.jsonc 的 run_worker_first 是否漏了这条路径`)
+        + retryNotice(navAttempts),
     });
   } catch (err) {
     results.push({ name: '浏览器导航头探测', status: 'skip', detail: String(err.message || err) });
@@ -487,7 +611,7 @@ async function probeUnknownPathIsStatic404() {
   };
   const path = `/${TMP}_nope`;
   try {
-    const res = await fetch(`${SITE}${path}`, { headers: NAV });
+    const res = await fetchRead(`${SITE}${path}`, { headers: NAV }).then((r) => r.res);
     const body = await res.text();
     const isStaticPage = res.status === 404 && /没有这一页/.test(body);
     const isWorkerText = body.trim() === 'Not Found';
@@ -526,7 +650,7 @@ async function probeUnknownPathIsStatic404() {
 async function probeBookCardsLinkDirectToR2() {
   const NAME = '书卡直链 R2（不再经 Worker）';
   try {
-    const res = await fetch(`${DAV}/`, { headers: { accept: 'text/html' } });
+    const { res, attempts: listAttempts } = await fetchRead(`${DAV}/`, { headers: { accept: 'text/html' } });
     const html = await res.text();
     if (res.status !== 200) {
       results.push({ name: NAME, status: 'skip', detail: `目录页 ${res.status}，无法判定` });
@@ -567,8 +691,12 @@ async function probeBookCardsLinkDirectToR2() {
       return;
     }
     // ③ 真去取一本：href 拼错的话这里会拿到 404
+    //
+    // ⚠️ 这一步打的是 **R2 公开域**（books.…），不是 Worker 域名 —— 不同
+    //   主机、不同链路。它也是 15 次里唯一 flake 过一次的那一步，所以走
+    //   fetchRead（带重试 + 超时）；这里只发 HEAD，是只读方法，安全。
     const probe = cards[0];
-    const book = await fetch(probe, { method: 'HEAD' });
+    const { res: book, attempts } = await fetchRead(probe, { method: 'HEAD' });
     const ct = book.headers.get('content-type') || '';
     const cd = book.headers.get('content-disposition') || '';
     // R2 公开域对 HEAD 返回 200；带 Range 时是 206。两者都算通。
@@ -576,15 +704,37 @@ async function probeBookCardsLinkDirectToR2() {
     results.push({
       name: NAME,
       status: ok ? 'pass' : 'fail',
-      detail: ok
+      detail: (ok
         ? `${cards.length} 张书卡全指向 R2 直链，抽查 ${book.status} ${ct}`
           + (cd ? `，content-disposition 已设置` : '，⚠️ 缺 content-disposition（文件名会是无扩展名的 id）')
         : `${cards.length} 张书卡是直链，但抽查取不到书：${book.status} ${ct} —— href 可能拼错了`
-          + `（例：${probe}）`,
+          + `（例：${probe}）`)
+        + retryNotice(attempts)
+        + retryNotice(listAttempts),
     });
   } catch (err) {
     results.push({ name: NAME, status: 'skip', detail: String(err.message || err) });
   }
+}
+
+/**
+ * 往 Actions 页面上打一条 error annotation。
+ *
+ * 为什么要专门做这件事：**日志在本仓库是拿不到的**
+ * （`/actions/jobs/<id>/logs` 返回 `403 Must have admin rights`），
+ * 而 annotation 接口不需要权限。所以 annotations 是这里唯一能看到的
+ * 失败详情 —— 没有它，CI 上只留一句「Process completed with exit code 1」，
+ * 排查就只能靠猜。
+ *
+ * ⚠️ 所以每个失败分支都必须打，且必须带上**具体是哪些探针、判据是什么**。
+ * 这是踩过的坑：前两个探针缺陷（假阴性、口令错）之所以各查了两轮，
+ * 正是因为 annotation 里只有 exit code，没有任何可读信息。
+ */
+function emitFailureAnnotation(title, detail) {
+  if (typeof process === 'undefined' || process.env.GITHUB_ACTIONS !== 'true') return;
+  // 单条 annotation 有长度限制，超了 Actions 会截断；先压成一行再发。
+  const oneLine = String(detail).replace(/\s+/g, ' ').trim();
+  console.log(`::error title=${title}::${oneLine.slice(0, 900)}`);
 }
 
 const ICON = { pass: '✅', fail: '❌', skip: '➖' };
@@ -627,6 +777,15 @@ for (const r of results) {
 }
 
 console.log('');
+// ⚠️ 静默重试会把「这次靠运气才通过」洗成「稳定通过」。本脚本的价值是判断
+// 线上跑的是不是新代码，所以凡是有请求是靠重试才拿到的，必须在这一行
+// 单独说出来 —— 否则读者只能从「5 项通过」推断一切正常。
+if (retriedRecovered > 0) {
+  console.log(`  ⚠️ 本轮有 ${retriedRecovered} 次请求在网络层失败后**靠重试才拿到响应**。`);
+  console.log('     结论仍然有效，但这次不是一次干净的单次通过；若反复出现，');
+  console.log('     说明到该主机的链路不稳（DNS/连接/TLS），值得单独查。');
+  console.log('');
+}
 if (fail > 0) {
   console.log(`  结论：线上仍是**旧代码**（${fail} 项不符预期）`);
   console.log('');
@@ -635,6 +794,12 @@ if (fail > 0) {
   console.log('    · 部署到了另一个 Worker / 另一个域名');
   console.log('    · 部署失败但 CI 没把它标红（看 Actions 页面的日志）');
   console.log('    · 边缘缓存还没更新（等几十秒重跑本脚本）');
+  emitFailureAnnotation(
+    '线上仍是旧代码',
+    `${fail} 项探针与预期不符：`
+      + results.filter((r) => r.status === 'fail' && r.kind !== 'credential')
+        .map((r) => `${r.name}（${r.detail}）`).join('；'),
+  );
   process.exit(STRICT ? 1 : 0);
 }
 if (credentialFail > 0) {
@@ -653,12 +818,11 @@ if (credentialFail > 0) {
   console.log('     ⚠️ ADMIN_TOKEN 不能当写口令用 —— 两者是各自独立的密钥，');
   console.log('        拿管理口令发 DELETE 一样是 401。');
   console.log('     订正 secret 后重跑：GitHub → Settings → Secrets → Actions。');
-  // 打 error annotation：Actions 页面上一眼能看到，不必翻日志才知道是配置问题。
-  if (typeof process !== 'undefined' && process.env.GITHUB_ACTIONS === 'true') {
-    console.log('::error title=写口令预检失败（凭据问题，不是代码问题）::'
-      + 'WRITE_TOKEN 与 Worker 上的值不一致，或误填了 ADMIN_TOKEN。'
-      + '三条写探针本轮未运行，其余探针的结论仍然有效。订正后重跑本 job。');
-  }
+  emitFailureAnnotation(
+    '写口令预检失败（凭据问题，不是代码问题）',
+    'WRITE_TOKEN 与 Worker 上的值不一致，或误填了 ADMIN_TOKEN。'
+      + '三条写探针本轮未运行，其余探针的结论仍然有效。订正后重跑本 job。',
+  );
   process.exit(STRICT ? 1 : 0);
 }
 if (pass > 0) {
@@ -666,34 +830,44 @@ if (pass > 0) {
   process.exit(0);
 }
 
-// 到这里：没有 fail（否则上面就退出了）、没有 pass。可能是全部被跳过，
-// 也可能是 skip 混着 pass —— 但 pass 已经在上面处理掉了，所以此刻
-// 一定是一项都没验成。
+// ⚠️ 修正一处已被证伪的归因：这段注释（以及 f0c1ba8 的提交信息）曾断言
+// 「CI 红是因为 WORKER_URL 配错」，依据只是「剩下 5 条探针本地全过」。
+// 用户确认 WORKER_URL 没问题，本地连跑 14 次也全过 —— 症状吻合不等于
+// 假设成立。所以下面只陈述**已核实的事实**（一条探针都没跑起来），
+// 把可能原因列成待查清单，不下断言。
 //
-// ⚠️ 这里曾经印「无法判定（所有探针都被跳过）」就 exit 1，而那正是
-// **WORKER_URL 配错时的输出**：所有探针都 fetch failed → 全 skip →
-// 一句「无法判定」把「地址根本不通」说成了「没什么可验的」。这两种
-// 情况的处置完全相反（一个要改仓库变量，一个要改代码），不能混。
-//
-// 所以先分辨：是「站点压根没连上」还是「连上了但没东西可验」。
+// 「连不上」和「没有东西可验」的处置完全不同，所以必须分开报：前者查
+// 地址与网络，后者才轮到改配置。
 const siteDown = skip > 0 && results.every((r) => r.status !== 'pass' && r.status !== 'fail');
 if (siteDown) {
   console.log(`  结论：**连不上 ${SITE}** —— ${skip} 条探针全部没能取到任何响应`);
   console.log('');
   console.log('  ⚠️ 这不是代码问题：一条探针都没跑起来，验不到任何东西。');
-  console.log('     最常见的原因是 `--url`（CI 里是仓库变量 WORKER_URL）');
-  console.log('     指向了一个不存在的地址。Worker 的 workers.dev 子域是');
-  console.log('     <worker 名>.<账户子域>.workers.dev，不等于自定义域；');
-  console.log('     域名不存在时 DNS 会给一个通配地址，连接直接超时而不是 404，');
-  console.log('     于是症状是「每条探针 fetch failed」而不是「探针报 fail」。');
-  console.log('     先确认这个地址能打开：curl -m 20 -o /dev/null -w "%{http_code}" <地址>/health');
-  console.log('     订正后重跑本 job。');
-  if (typeof process !== 'undefined' && process.env.GITHUB_ACTIONS === 'true') {
-    console.log('::error title=探针连不上目标站点::'
-      + `${SITE} 无法访问，${skip} 条探针全部未运行，本轮没有验证任何东西。`
-      + '请检查仓库变量 WORKER_URL 是否指向了正确的自定义域。');
-  }
+  console.log('     可能的原因（按本项目实际踩过的顺序）：');
+  console.log('       · `--url` 的值本身有问题（CI 里它来自仓库变量 WORKER_URL）——');
+  console.log('         少了 https:// 前缀会让每条 fetch');
+  console.log('         直接抛「Failed to parse URL」，症状同样是全部 skip；');
+  console.log('       · 指向了一个打不开的地址。域名不存在时 DNS 会给一个通配地址，');
+  console.log('         连接直接超时而不是 404，于是症状是「每条探针 fetch failed」');
+  console.log('         而不是「探针报 fail」；');
+  console.log('       · runner 出网被拦（DNS 或 443 不通）—— 与探针本身无关。');
+  console.log('     自己确认地址通不通：');
+  console.log(`       curl -m 20 -o /dev/null -w '%{http_code}' ${SITE}/health`);
+  emitFailureAnnotation(
+    '探针连不上目标站点',
+    `${SITE} 无法访问，${skip} 条探针全部未运行，本轮没有验证任何东西。`
+      + '可能原因：URL 缺 https:// 前缀 / 域名不可达 / runner 出网被拦。',
+  );
 } else {
   console.log('  结论：无法判定（探针全部跳过，没有一条跑起来）');
+  // 兜底分支同样要打 annotation。否则这里就只剩一句
+  // `Process completed with exit code 1`，而本仓库 `/actions/jobs/<id>/logs`
+  // 返回 403 Must have admin rights —— annotation 是唯一能看到的通道。
+  // 所以这里必须带上每条探针的明细。
+  emitFailureAnnotation(
+    '探针全部跳过，无法判定',
+    `${skip} 条探针既没 pass 也没 fail：`
+      + results.map((r) => `${r.name} → ${r.detail}`).join('；'),
+  );
 }
 process.exit(STRICT ? 1 : 0);

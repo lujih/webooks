@@ -87,7 +87,11 @@ describe('线上探针：书卡直链回归要能被发现', () => {
   it('探针必须真的去取那本书，不能只看 href 长得对', () => {
     // 「href 拼错了」和「href 是直链」在只看字符串时无法区分：
     // 两者都不是 /dav/ 开头。所以必须发一次请求确认拿得到字节。
-    expect(VERIFY, '没有对直链发请求 —— href 拼错会假绿').toMatch(/await fetch\(probe, \{ method: 'HEAD' \}\)/);
+    // （探针走 fetchRead —— 带 8s 超时 + 网络层瞬时失败的一次重试，
+    //   见 scripts/verify-deploy.mjs 里的实测注释。写法可以变，
+    //   「对 probe 发了请求」这件事不能变。）
+    expect(VERIFY, '没有对直链发请求 —— href 拼错会假绿').toMatch(/fetchRead\(\s*probe\b/);
+    expect(VERIFY).toMatch(/method: 'HEAD'/);
     expect(VERIFY).toMatch(/content-disposition/);
   });
 
@@ -231,8 +235,11 @@ describe('线上探针：口令配错不许伪装成「线上是旧代码」', (
     expect(body, '没点明这不是代码问题').toContain('不是代码问题');
     expect(body, '没说 ADMIN_TOKEN 不能当写口令用').toContain('ADMIN_TOKEN');
     expect(body, '没给出修复命令').toMatch(/wrangler secret put WRITE_TOKEN/);
-    // 打 error annotation：Actions 页面上要一眼看到，不必翻日志
-    expect(body, '没有 GitHub error annotation').toContain('::error');
+    // 打 error annotation：Actions 页面上要一眼看到，不必翻日志。
+    // 断言的是「调用了 emitFailureAnnotation」而不是字面量 `::error` ——
+    // 那行 `console.log('::error …')` 现在被封在这个函数里（三个失败分支
+    // 都在用它，内联三份会把同一段逻辑抄三遍）。
+    expect(body, '没有打 GitHub error annotation').toContain('emitFailureAnnotation(');
     // 且必须是「如实报未验完」的语义 —— 绿灯比红灯危险：这个项目反复在打
     // 假绿（探针没跑却说「已验证通过」）。三条写探针没跑就是没验到。
     expect(body, '凭据分支必须照样 exit（--strict 下 exit 1），不能 exit 0 —— 那就是假绿')
@@ -257,13 +264,16 @@ describe('线上探针：口令配错不许伪装成「线上是旧代码」', (
 });
 
 describe('线上探针：地址不可达不许伪装成「没什么可验的」', () => {
-  // 这是第五个真实缺陷，而且正是它让上面第四个缺陷一直查不清：
-  // CI 的 `vars.WORKER_URL` 指向了 `webooks.lujih.workers.dev`（不存在，
-  // DNS 给通配地址 → 连接超时）。那个地址上所有探针都 fetch failed →
-  // 全 skip → 旧版打印「无法判定（所有探针都被跳过）」。
-  // 一句「无法判定」听起来像「这儿没什么可验」，而真实情况是
-  // **一条探针都没跑起来**。两种情况的处置完全相反：一个是改仓库变量，
-  // 一个是改代码。混在一起就只能靠猜 —— 我照着「无法判定」追了两轮。
+  // 这是第五个真实缺陷。旧版在「所有探针都 fetch failed」时打印
+  // 「无法判定（所有探针都被跳过）」，听起来像「这儿没什么可验」，
+  // 而真实情况是**一条探针都没跑起来**。两种情况的处置完全相反，
+  // 混在一起就只能靠猜。
+  //
+  // ⚠️ 订正一处误判：这个缺陷是照着「CI 的 WORKER_URL 配错了」这条
+  // 推断去修的，症状确实吻合（对着一个不存在的域名跑，全部 skip +
+  // 「无法判定」+ exit 1，与 CI 一模一样）。但用户确认 WORKER_URL 没问题，
+  // 本地连跑 14 次也全过 —— **症状吻合不等于假设成立**。
+  // 仍然成立的是「区分这两种情况」这件事本身，所以测试只钉行为，不钉归因。
 
   /** 结论区（从汇总循环到文件末尾） */
   function tailAfterSummary(): string {
@@ -295,7 +305,8 @@ describe('线上探针：地址不可达不许伪装成「没什么可验的」'
     expect(body, '没点明这不是代码问题').toContain('不是代码问题');
     expect(body, '没说该改 WORKER_URL').toContain('WORKER_URL');
     expect(body, '没告诉读者怎么自己验一下地址通不通').toMatch(/curl -m 20/);
-    expect(body, '没有 GitHub error annotation').toContain('::error');
+    // 同上：断言「调用了 emitFailureAnnotation」而不是字面量 `::error`。
+    expect(body, '没有打 GitHub error annotation').toContain('emitFailureAnnotation(');
   });
 
   it('「连不上」分支必须排在「新代码」分支之后、且照样 exit 1', () => {
@@ -325,5 +336,56 @@ describe('线上探针：地址不可达不许伪装成「没什么可验的」'
     ]) {
       expect(VERIFY, `缺少结论文案：${text}`).toContain(text);
     }
+  });
+
+  it('每个失败分支都必须发 error annotation，且带上探针明细', () => {
+    // 为什么值得钉：本仓库 `/actions/jobs/<id>/logs` 返回
+    // `403 Must have admin rights` —— 日志根本读不到，annotations 接口是
+    // 唯一能看到的通道。少了它，CI 上就只剩一句
+    // `Process completed with exit code 1`，排查只能靠猜。
+    //
+    // 前两个探针缺陷各查了两轮，正是因为 annotation 里只有 exit code。
+    expect(VERIFY, 'emitFailureAnnotation 函数没了').toMatch(/function emitFailureAnnotation\(/);
+    // 函数内部：只在 Actions 里发（本地跑别污染终端），且要压成一行
+    // —— Actions 对单条 annotation 有长度上限，超了会截断。
+    const fn = VERIFY.slice(VERIFY.indexOf('function emitFailureAnnotation('));
+    const fnBody = fn.slice(0, fn.indexOf('\n}\n'));
+    expect(fnBody, '没判断是否在 Actions 里运行').toContain("GITHUB_ACTIONS !== 'true'");
+    expect(fnBody, '没把多行明细压成一行（超长会被 Actions 截断）').toMatch(/replace\(\/\\s\+\/g, ' '\)/);
+    // ⚠️ 下面两条是补一个**实测存活**的变异：光断言「四个分支都调用了
+    // emitFailureAnnotation」的话，把函数体改成开头就 `return;`（整个函数
+    // 成了空壳、谁都没收到 annotation）依然 21 条全绿 —— 因为调用点还在，
+    // 行为没了。所以必须断言函数体**真的会输出**那条 annotation。
+    expect(fnBody, 'emitFailureAnnotation 没有真的输出 ::error —— 函数成了空壳')
+      .toMatch(/console\.log\(`::error/);
+    expect(fnBody, '没有截断上限：超长 annotation 会被 Actions 截掉后半段')
+      .toMatch(/\.slice\(0, \d+\)/);
+
+    // 四个结局里，前三个都是「判定失败」，各自都必须发 annotation。
+    const branches: Array<[string, string]> = [
+      ['结论：线上仍是**旧代码**', '旧代码分支'],
+      ['if (credentialFail > 0)', '凭据分支'],
+      ['const siteDown =', '连不上分支'],
+      ['结论：无法判定（探针全部跳过', '兜底分支'],
+    ];
+    const tail = tailAfterSummary();
+    for (const [anchor, label] of branches) {
+      const idx = VERIFY.indexOf(anchor);
+      expect(idx, `找不到${label}`).toBeGreaterThan(0);
+      // 只看本分支：从锚点切到下一个分支的锚点
+      const nexts = branches
+        .map(([a]) => VERIFY.indexOf(a))
+        .filter((i) => i > idx);
+      const end = nexts.length > 0 ? Math.min(...nexts) : VERIFY.length;
+      const body = VERIFY.slice(idx, end);
+      expect(body, `${label}没有发 error annotation`).toContain('emitFailureAnnotation(');
+    }
+    // 明细必须具体到「哪条探针、判据是什么」，不能只写一句结论。
+    const oldCode = tail.slice(tail.indexOf('结论：线上仍是**旧代码**'), tail.indexOf('if (credentialFail > 0)'));
+    expect(oldCode, '旧代码分支必须点名是哪几条探针不符预期')
+      .toContain("results.filter((r) => r.status === 'fail' && r.kind !== 'credential')");
+    const fallback = tail.slice(tail.indexOf('结论：无法判定（探针全部跳过'));
+    expect(fallback, '兜底分支必须带上每条探针的明细，否则无从排查')
+      .toContain('results.map((r) =>');
   });
 });
