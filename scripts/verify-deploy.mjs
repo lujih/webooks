@@ -164,8 +164,15 @@ async function cleanup(name) {
 /** 写类方法：绝不走重试（见上面「为什么不给写探针用」） */
 const WRITE_METHODS = new Set(['PUT', 'POST', 'DELETE', 'COPY', 'MOVE', 'LOCK', 'UNLOCK', 'PROPPATCH', 'MKCOL']);
 
-/** 单次尝试的超时（ms）。实测正常 0.9~1.4s，坏路烧满 10s */
-const RETRY_TIMEOUT_MS = 8000;
+/**
+ * 单次尝试的超时（ms）。
+ *
+ * 选 12s 而不是 8s：实测 Worker 域 p99 就在 7~8.3s（实测 p99=6922/8315ms，
+ * 各有一次请求正好撞在 8s 预算边界上被自己的 signal 杀掉）。8s 会把本来能过的
+ * 探针打成 skip —— 那比慢几秒糟糕得多。坏路（坏 IPv6 地址）烧满 10s 就自己
+ * 抛 ConnectTimeoutError，12s 预算不会误伤它。
+ */
+const RETRY_TIMEOUT_MS = 12000;
 /** 总尝试次数：1 次首发 + 1 次重试 */
 const RETRY_ATTEMPTS = 2;
 /** 唯一一次退避（ms）。让最坏总时长 ≈16.5s < CI 的 30s 窗口 */
@@ -173,6 +180,8 @@ const RETRY_BACKOFF_MS = 500;
 
 /** 被重试救回来的次数，报告时要如实说出来（见 retryNotice） */
 let retriedRecovered = 0;
+/** 重试用尽、最终仍失败的次数（见 exhaustedNotice） */
+let retriedExhausted = 0;
 
 /**
  * 带超时的只读 fetch：仅网络层异常重试，HTTP 响应一律原样返回。
@@ -196,10 +205,24 @@ async function fetchRead(url, init = {}) {
       lastErr = err;
       if (attempt < RETRY_ATTEMPTS) {
         await new Promise((r) => setTimeout(r, RETRY_BACKOFF_MS));
+      } else {
+        retriedExhausted++;
       }
     }
   }
   throw lastErr;
+}
+
+/**
+ * 重试用尽时的说明文案。
+ *
+ * ⚠️ 这一条比 retryNotice 更重要：catch 里裸写 String(err.message) 只会得到
+ * 'fetch failed'，读者分不出「试了 2 次都没成」和「根本没试过」。而这两件事
+ * 对结论的意义完全不同：前者是链路问题，后者是单点偶发。
+ */
+function exhaustedNotice(err, attempts = RETRY_ATTEMPTS) {
+  const why = err?.cause?.code || err?.code || err?.name || String(err);
+  return ` ⚠️ 已重试 ${attempts} 次仍失败（${why}，网络层，非 HTTP 状态码）—— 不是代码问题，是链路问题`;
 }
 
 /**
@@ -209,7 +232,9 @@ async function fetchRead(url, init = {}) {
  */
 function retryNotice(attempts) {
   if (attempts <= 1) return '';
-  return ` ⚠️⚠️ 第 1 次请求在网络层失败（${RETRY_TIMEOUT_MS}ms 超时），`
+  // ⚠️ 不要写死「超时」：网络层失败也可能是 DNS 抖动、连接被重置、TLS 中断，
+  // 它们都比预算早得多到达。确切原因见每条探针下方那行 `［dbg］`。
+  return ` ⚠️⚠️ 第 1 次请求在**网络层**失败（DNS / 连接 / TLS / 超时，非 HTTP 状态码），`
     + `**重试后才通过**（共 ${attempts} 次尝试）—— 本次结论可信度略降，`
     + '若反复出现说明到该主机的链路有问题';
 }
@@ -524,7 +549,7 @@ async function probeStaticFavicon() {
       });
     }
   } catch (err) {
-    results.push({ name: '静态资源层', status: 'skip', detail: String(err.message || err) });
+    results.push({ name: '静态资源层', status: 'skip', detail: String(err.message || err) + exhaustedNotice(err) });
   }
 }
 
@@ -580,7 +605,7 @@ async function probeWorkerRoutesWithNavigateHeader() {
         + retryNotice(navAttempts),
     });
   } catch (err) {
-    results.push({ name: '浏览器导航头探测', status: 'skip', detail: String(err.message || err) });
+    results.push({ name: '浏览器导航头探测', status: 'skip', detail: String(err.message || err) + exhaustedNotice(err) });
   }
 }
 
@@ -625,7 +650,7 @@ async function probeUnknownPathIsStatic404() {
           : `${res.status}，正文 ${body.length}B 既不像 public/404.html 也不像 Worker 文本`,
     });
   } catch (err) {
-    results.push({ name: '未知路径静态 404', status: 'skip', detail: String(err.message || err) });
+    results.push({ name: '未知路径静态 404', status: 'skip', detail: String(err.message || err) + exhaustedNotice(err) });
   }
 }
 
@@ -713,7 +738,7 @@ async function probeBookCardsLinkDirectToR2() {
         + retryNotice(listAttempts),
     });
   } catch (err) {
-    results.push({ name: NAME, status: 'skip', detail: String(err.message || err) });
+    results.push({ name: NAME, status: 'skip', detail: String(err.message || err) + exhaustedNotice(err) });
   }
 }
 
@@ -780,6 +805,9 @@ console.log('');
 // ⚠️ 静默重试会把「这次靠运气才通过」洗成「稳定通过」。本脚本的价值是判断
 // 线上跑的是不是新代码，所以凡是有请求是靠重试才拿到的，必须在这一行
 // 单独说出来 —— 否则读者只能从「5 项通过」推断一切正常。
+if (retriedExhausted > 0) {
+  console.log(`  ❌ 有 ${retriedExhausted} 次请求**重试用尽仍失败**（已各试 ${RETRY_ATTEMPTS} 次）—— 是链路问题，不是代码问题`);
+}
 if (retriedRecovered > 0) {
   console.log(`  ⚠️ 本轮有 ${retriedRecovered} 次请求在网络层失败后**靠重试才拿到响应**。`);
   console.log('     结论仍然有效，但这次不是一次干净的单次通过；若反复出现，');
