@@ -84,7 +84,11 @@ const results = [];
 async function call(method, path, init = {}) {
   const headers = { ...(init.headers || {}) };
   if (TOKEN) headers['x-write-token'] = TOKEN;
-  return fetch(`${DAV}/${path}`, { ...init, method, headers });
+  // 写路径也要有界：假站点/坏链路上一次挂起的连接会占满整个 job
+  // （实测无超时时 290s 仍不结束）。**只加超时，绝不加重试** ——
+  // 重试 PUT 会重复落书；重试 COPY overwrite 会在首次已成功后拿到
+  // 404/201，把正确代码判成 fail（比 flake 更糟）。
+  return fetch(`${DAV}/${path}`, { ...init, method, headers, signal: AbortSignal.timeout(WRITE_TIMEOUT_MS) });
 }
 
 /** 清理：尽力而为，失败不影响结论 */
@@ -135,8 +139,10 @@ async function cleanup(name) {
  *   「正常波动的上沿」之外，又比 undici 默认 10s 早 2s 失败，从而
  *   **把一次挂起变成一次快速重试**。这一条比「重试几次」更关键：
  *   没有超时，重试只是把 10s 的挂起多来几遍。
- * · 500ms 退避：只退避一次，取 500ms 是为了让最坏总时长
- *   （8s + 0.5s + 8s ≈ 16.5s）稳稳压在 CI 的 30 秒窗口内，留出一半余量。
+ * · 500ms 退避：只退避一次。最坏总时长 = 12s + 0.5s + 12s ≈ 24.5s（2 次尝试）。
+ *   ⚠️ 不要拿「CI 有 30 秒窗口」当依据 —— 那个窗口不存在；deploy.yml 的
+ *   sleep 30 是两次**整轮探针**之间的间隔，不是单请求预算。真正的约束是
+ *   verify-live 这个 job 的 timeout-minutes（见 deploy.yml）。
  *   不做指数退避 —— 只有一个故障源时指数退避没有第二次可退对象，纯浪费。
  *
  * ## 为什么只对「抛异常」重试
@@ -175,8 +181,11 @@ const WRITE_METHODS = new Set(['PUT', 'POST', 'DELETE', 'COPY', 'MOVE', 'LOCK', 
 const RETRY_TIMEOUT_MS = 12000;
 /** 总尝试次数：1 次首发 + 1 次重试 */
 const RETRY_ATTEMPTS = 2;
-/** 唯一一次退避（ms）。让最坏总时长 ≈16.5s < CI 的 30s 窗口 */
+/** 唯一一次退避（ms）。2 次尝试最坏 ≈24.5s（12s + 0.5s + 12s）*/
 const RETRY_BACKOFF_MS = 500;
+/** 写路径单次超时（ms）。比读侧宽裕：写探针串 PUT→LOCK→UNLOCK→cleanup，
+ *  且 probeUnlockNoToken 的锁 timeout 是 Second-30 */
+const WRITE_TIMEOUT_MS = 20_000;
 
 /** 被重试救回来的次数，报告时要如实说出来（见 retryNotice） */
 let retriedRecovered = 0;
@@ -384,11 +393,14 @@ async function probeCopyWhitelist() {
       status: status === 415 ? 'pass' : 'fail',
       detail: `期望 415（新代码），实际 ${status}`,
     });
-
-    await cleanup(dst);
-    await cleanup(src);
   } catch (err) {
     results.push({ name: NAME, status: 'skip', detail: String(err.message || err) });
+  } finally {
+    // ⚠️ 清理必须在 finally：上面任何一步抛异常（断连、超时）时，
+    // happy-path 末尾的 cleanup 一行都不会执行，垃圾就永久留在书库里 ——
+    // 而下一轮探针用新 stamp，永远扫不到上一轮的残留。实测踩过。
+    await cleanup(dst);
+    await cleanup(src);
   }
 }
 
@@ -435,14 +447,16 @@ async function probeUnlockNoToken() {
       detail: `期望 400（新代码），实际 ${status}`,
     });
 
-    // 解锁 + 删除，别把临时文件留在书库里
+    // 解锁（尽力而为；删除交给 finally 的 cleanup）
     if (token) {
       const rel = await call('UNLOCK', name, { headers: { 'lock-token': token } });
       await rel.text().catch(() => {});
     }
-    await cleanup(name);
   } catch (err) {
     results.push({ name: 'UNLOCK 需要 token', status: 'skip', detail: String(err.message || err) });
+  } finally {
+    // 同 probeCopyWhitelist：清理必须在 finally，异常路径也要清场
+    await cleanup(name);
   }
 }
 
@@ -501,11 +515,12 @@ async function probeOverwrite() {
       status: status === 412 ? 'pass' : 'fail',
       detail: `期望 412（新代码），实际 ${status}`,
     });
-
-    await cleanup(dst);
-    await cleanup(src);
   } catch (err) {
     results.push({ name: NAME, status: 'skip', detail: String(err.message || err) });
+  } finally {
+    // 同 probeCopyWhitelist：清理必须在 finally，异常路径也要清场
+    await cleanup(dst);
+    await cleanup(src);
   }
 }
 
@@ -763,6 +778,17 @@ function emitFailureAnnotation(title, detail) {
 }
 
 const ICON = { pass: '✅', fail: '❌', skip: '➖' };
+// 只有 Worker 才能应答的探针名 —— 绿灯要求其中至少一条真的跑过
+// （favicon/静态层由边缘缓存应答，不能作为 Worker 存活的证据）。
+const WORKER_ONLY_PROBES = new Set([
+  '浏览器导航头下 Worker 路由仍可达',
+  '未知路径由静态 404 应答（不花请求）',
+  '书卡直链 R2（不再经 Worker）',
+  '写口令预检（DELETE 不存在的叶子）',
+  'COPY 扩展名白名单（.exe）',
+  'UNLOCK 缺 Lock-Token（RFC §9.11.1）',
+  'Overwrite: F 撞已有目标（RFC §10.6）',
+]);
 
 console.log(`线上版本验证：${SITE}`);
 if (writeTokenState === 'absent') {
@@ -853,9 +879,26 @@ if (credentialFail > 0) {
   );
   process.exit(STRICT ? 1 : 0);
 }
-if (pass > 0) {
+// ⚠️ 「有通过」不等于「验到了」。favicon 由边缘缓存服务 7 天
+// （_headers 的 max-age=604800）—— 它的 pass **不是 Worker 活着的证据**：
+// 实测 Worker 全部探针 fetch failed、只剩 favicon + 口令预检活着时，
+// 这里曾打出「线上是新代码（2 项通过）」+ exit 0 + 零 annotation。
+// 所以绿灯还要求至少一条**只有 Worker 才能应答**的探针真的跑过
+// （navigate 路由 / 静态404 / 书卡直链 / 三条写探针）。
+const workerAnswered = results.filter((r) => r.status !== 'skip' && WORKER_ONLY_PROBES.has(r.name));
+if (pass > 0 && workerAnswered.length > 0) {
   console.log(`  结论：线上是**新代码**（${pass} 项通过）`);
   process.exit(0);
+}
+if (pass > 0 && workerAnswered.length === 0) {
+  console.log(`  ⚠️ 有 ${pass} 项通过，但没有一条**只有 Worker 才能应答**的探针跑成 ——`);
+  console.log('     （favicon 由边缘缓存服务 7 天，它 pass 不代表 Worker 活着）');
+  console.log('     本轮不发放绿灯：写探针/路由探针全部未能验证。');
+  emitFailureAnnotation(
+    '探针未真正验证 Worker（不许拿绿）',
+    `${pass} 项通过但全是缓存可应答的探针，Worker 相关探针 ${results.filter((r) => WORKER_ONLY_PROBES.has(r.name)).length} 条全 skip。`,
+  );
+  process.exit(STRICT ? 1 : 0);
 }
 
 // ⚠️ 修正一处已被证伪的归因：这段注释（以及 f0c1ba8 的提交信息）曾断言

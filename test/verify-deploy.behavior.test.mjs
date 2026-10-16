@@ -215,6 +215,52 @@ async function startFakeSite() {
   };
 }
 
+/**
+ * 「只剩边缘缓存活着」的站点替身 —— B6 要的形态。
+ *
+ * 线上实测过的假绿就是这么来的：favicon 被边缘缓存按 `max-age=604800`
+ * 服务了 7 天，于是在 Worker 已经全死的情况下它照样是绿的；脚本过去只看
+ * 「有没有通过项」，于是打出 `结论：线上是新代码`。
+ *
+ * 形态：**只有一条**探针能应答（favicon），其余一律「Worker 挂掉」。
+ * 写口令预检是 DELETE，属于 Worker 侧，所以这里也回挂死 —— 预检一挂，
+ * 三条写探针按脚本的设计全部 skip，正好复刻线上那次现场。
+ *
+ * ⚠️ 挂死必须真的**不回字节**，而不是回 5xx：探针区分的是
+ *   「拿到了响应但不对」（fail）与「压根没拿到响应」（skip），
+ *   假绿场景属于后者。回 5xx 会把 Worker 变成「活着但答错」，
+ *   那是另一种场景，测不到这条守卫。
+ */
+async function startCacheOnlySite() {
+  const log = [];
+  const server = createServer((req, res) => {
+    const path = (req.url || '/').split('?')[0];
+    log.push({ method: req.method, path });
+    if (path === '/favicon.ico') {
+      res.writeHead(200, {
+        'content-type': 'image/x-icon',
+        'cache-control': 'public, max-age=604800, immutable',
+      });
+      res.end(ICO_BYTES);
+      return;
+    }
+    // Worker 挂死：接受连接，永不响应。
+    return;
+  });
+  await new Promise((r) => server.listen(0, '127.0.0.1', r));
+  return {
+    url: `http://127.0.0.1:${server.address().port}`,
+    log,
+    // ⚠️ 必须先 closeAllConnections()：这个服务器**故意**留着若干挂死的连接，
+    //   只调 close() 的话 Node 会等它们自己消失，afterEach 直接卡死（实测
+    //   `Hook timed out in 10000ms`）。把连接掐掉正是「Worker 已死」的语义。
+    close: () => new Promise((r) => {
+      server.closeAllConnections();
+      server.close(r);
+    }),
+  };
+}
+
 // ────────────────────────────────────────────────────────────────────────────
 // 运行被测脚本
 // ────────────────────────────────────────────────────────────────────────────
@@ -498,4 +544,119 @@ describe('verify-deploy.mjs 的行为（真跑脚本，不是读源码）', () =
     // 对它发 DELETE 是防御性清理，允许）。
     expect(deleteNames.length).toBeGreaterThanOrEqual(putNames.length);
   });
+});
+// ────────────────────────────────────────────────────────────────────────────
+// 绿灯不许建立在「没验到」之上
+//
+// 下面两条针对的是 2026-10-16 复阅实测出来的假绿形态：favicon 由**边缘缓存**
+// 服务 7 天（_headers 的 max-age=604800），它的 pass **不是 Worker 活着的证据**。
+// 线上曾出现「Worker 全部探针 fetch failed，只剩 favicon 与口令预检活着」的
+// 情形，脚本却打出 `结论：线上是新代码（2 项通过）` + exit 0 + 零 annotation。
+//
+// ⚠️ 所以这里要的是**另一个**假服务器：只有边缘缓存那一层能应答，Worker
+//   相关的路由全部挂死。上面那个 site 做不到这点 —— 它太健康了，对着它跑只会
+//   得到「健康站点上不该触发该守卫」这种永远在响的负向断言，什么也钉不住。
+//   （变异 M15 实测：那条负向版本对取消 Worker-only 判据的变异**全绿**。）
+// ────────────────────────────────────────────────────────────────────────────
+
+describe('绿灯不许建立在未验证之上', () => {
+  let cached;
+
+  beforeEach(async () => { cached = await startCacheOnlySite(); });
+  afterEach(async () => { await cached.close(); });
+
+  test('B6｜只剩边缘缓存可应答 → 不许发放绿灯', async () => {
+    const run = await runVerifyDeploy({
+      url: cached.url,
+      token: 'correct-token',
+      githubActions: 'true',
+      strict: true,
+    });
+
+    // 前提：确实「有通过项」（正是这一点让它曾经拿到绿灯），而且通过项
+    // 全部来自边缘缓存那一层 —— Worker 没被任何一条探针碰到过。
+    const probes = parseProbes(run.stdout);
+    expect(probes.filter((p) => p.status === 'pass').length).toBeGreaterThan(0);
+
+    // ★ 核心：这种组合下**绝不能**说「线上是新代码」，也不能放绿灯。
+    //   报的是「验不到」而不是「代码不对」—— 处置方向完全不同。
+    expect(run.stdout).not.toContain('结论：线上是**新代码**');
+    expect(run.stdout).not.toContain('结论：线上仍是**旧代码**');
+    expect(run.stdout).toContain('没有一条**只有 Worker 才能应答**的探针跑成');
+    expect(run.code).toBe(1);
+
+    // CI 上光看 exit code 没意义（本仓库 `/actions/jobs/<id>/logs` 要 admin），
+    // 所以必须有一条说清「不许拿绿」的 annotation。
+    const notes = parseAnnotations(run.stdout);
+    expect(notes).toHaveLength(1);
+    expect(notes[0].title).toBe('探针未真正验证 Worker（不许拿绿）');
+  });
+
+  test('B7｜写探针中途异常也必须清场（cleanup 在 finally，不在 happy path）', async () => {
+    // 让 LOCK 挂死（接受连接不回字节）→ probeUnlockNoToken 在
+    // PUT 成功后于 LOCK 处超时抛异常 → 旧实现（cleanup 在 happy path 末尾）
+    // 会把 _lock.epub 永久留在站点上（下一轮探针用新 stamp，永远扫不到）。
+    //
+    // ⚠️ 这个测试**必然要等满脚本自己的写超时**（`WRITE_TIMEOUT_MS = 20_000`，
+    //   见 scripts/verify-deploy.mjs）—— 故障是我故意造的就得照它的价付钱。
+    //   超时值给 90s：脚本有 60s 看门狗兜底，这里留足余量而**不放宽**断言
+    //   （不改成 10s 之类去迁就测试 —— 那等于让测试替实现改配置）。
+    await site.close();
+    const log = [];
+    const objects = new Set();
+    // ⚠️ GET/HEAD 一律 200 是**故意**的：它们只用来让前面的读探针跑完
+    //   （预检/favicon 等），把局面稳定在「能跑到写探针这一步」。
+    //   真正要制造的故障只有一处 —— LOCK 永不回字节。
+    const hung = createServer((req, res) => {
+      const path = (req.url || '/').split('?')[0];
+      const method = req.method || 'GET';
+      log.push({ method, path });
+      if (method === 'LOCK') return; // 永不响应：写超时（20s）触发
+      // ⚠️ DELETE 不存在的叶子必须回 **404**（口令有效时的正确语义），不是 204。
+      //   回 204 会让写口令预检落到 unknown，三条写探针全被跳过 ——
+      //   那 B7 什么都不写就通过了，等于空集恒真。
+      if (method === 'DELETE') {
+        const name = decodeURIComponent(path.slice(DAV_PREFIX.length));
+        if (!objects.has(name)) { res.writeHead(404); res.end('Not Found'); return; }
+        objects.delete(name); res.writeHead(204); res.end(); return;
+      }
+      if (method === 'UNLOCK') { res.writeHead(204); res.end(); return; }
+      if (method === 'PUT') {
+        objects.add(decodeURIComponent(path.slice(DAV_PREFIX.length)));
+        res.writeHead(201); res.end(); return;
+      }
+      if (method === 'COPY') { res.writeHead(415); res.end(); return; }
+      if (method === 'HEAD' || method === 'GET') {
+        res.writeHead(200, { 'content-type': 'text/plain' }); res.end('x'); return;
+      }
+      res.writeHead(404); res.end();
+    });
+    await new Promise((r) => hung.listen(0, '127.0.0.1', r));
+    const hungPort = hung.address().port;
+
+    const run = await runVerifyDeploy({
+      url: `http://127.0.0.1:${hungPort}`,
+      token: 'correct-token',
+      strict: true,
+    });
+    hung.closeAllConnections();
+    await new Promise((r) => hung.close(r));
+
+    // 脚本必须自己收场（写超时 20s 后），不许挂到 60s 看门狗
+    expect(run.code).toBe(1);
+
+    // ★ 核心不变量：被 PUT 过的路径都必须被 DELETE。旧实现（cleanup 在
+    //   happy path 末尾）在 LOCK 抛异常后一行 cleanup 都不执行 —— 这条会红。
+    //   LOCK 那次挂死本身也必须被清掉（objects 里还留着它没 DELETE 的痕迹），
+    //   所以下面按「PUT 过的东西」逐条比，而不是只比总数。
+    const dav = (m) => log.filter((e) => e.method === m && e.path.startsWith(DAV_PREFIX))
+      .map((e) => decodeURIComponent(e.path.slice(DAV_PREFIX.length)));
+    const putNames = dav('PUT');
+    const deleteNames = dav('DELETE');
+    expect(putNames.length, '前提：真的 PUT 过东西').toBeGreaterThan(0);
+    expect(putNames.some((n) => n.endsWith('_lock.epub')), '前提：挂死的正是 LOCK 探针那个对象')
+      .toBe(true);
+    const leftovers = putNames.filter((n) => !deleteNames.includes(n));
+    expect(leftovers, `残留垃圾：${leftovers.join(', ')}`).toEqual([]);
+  }, 90_000);
 });
