@@ -192,7 +192,11 @@ jobs:
             exit 0
           fi
           if [ -z "$WRITE_TOKEN" ]; then
-            echo "::warning::未设置 secret WRITE_TOKEN，三条写探针将被跳过（静态层探针仍会跑）"
+            echo "::error title=未配置 WRITE_TOKEN secret::三条写探针将被跳过 —— 静态层探针照跑，但**写路径（COPY 白名单 / UNLOCK / Overwrite 412）本轮零验证**，而那三条恰恰是唯一能区分新老代码的部分。红线是刻意的：run #62 曾在探针全跳过的情况下拿绿，被读成「线上已验证通过」，实际什么都没验。配法：npx wrangler secret put WRITE_TOKEN（与仓库 secret 同值；它不是 ADMIN_TOKEN）"
+            # ⚠️ 这不是失误后的退出 —— 这是门卫拒绝在「半盲」状态下盖章。
+            #    静态层探针再绿也只覆盖一半面；红是「验证未完成」的如实计量。
+            #    本地手动跑不受影响（那台 shell 里没有这个 env 是常态）。
+            exit 1
           fi
           # `--strict` 不可省：不加它时探针即使报 ❌ 也退出 0，
           # 这个 job 就永远不会红 —— 一个不会失败的门卫比没有门卫更糟，

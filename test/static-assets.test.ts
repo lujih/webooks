@@ -510,8 +510,14 @@ describe('线上验证探针：不许再报假阴性、不许再留垃圾', () =
     expect(workflow, 'CI 没把 WRITE_TOKEN 传给探针 —— 三条写探针会静默跳过').toMatch(
       /WRITE_TOKEN:\s*\$\{\{\s*secrets\.WRITE_TOKEN\s*\}\}/,
     );
-    // 且缺口令时要发出警告（GitHub 的 ::warning:: 注解），别让它静默。
-    expect(workflow, '缺 WRITE_TOKEN 时没有告警').toContain('::warning::');
+    // 且缺 WRITE_TOKEN 时必须**让 job 变红**（::error:: + exit 1），不能只告警。
+    // 实测踩过：run #62 三条写探针全跳过却拿绿 —— 写路径（COPY 白名单 /
+    // UNLOCK / Overwrite 412）恰好是唯一能区分新老代码的部分，「半盲绿」
+    // 会被读成「线上已验证通过」。这里先有错误级注解，再断言退出。
+    expect(workflow, '缺 WRITE_TOKEN 时没有发错误级注解').toContain('::error title=未配置 WRITE_TOKEN secret::');
+    expect(workflow, '缺 WRITE_TOKEN 时没有让 job 变红').toMatch(
+      /未配置 WRITE_TOKEN[\s\S]{0,600}?exit 1/,
+    );
   });
 
   it('CI 必须用 --strict 调探针（否则这个 job 永远不会红）', () => {
