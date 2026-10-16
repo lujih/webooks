@@ -255,3 +255,75 @@ describe('线上探针：口令配错不许伪装成「线上是旧代码」', (
       .toMatch(/let writeTokenState = TOKEN\.length > 0 \? 'unverified' : 'absent';/);
   });
 });
+
+describe('线上探针：地址不可达不许伪装成「没什么可验的」', () => {
+  // 这是第五个真实缺陷，而且正是它让上面第四个缺陷一直查不清：
+  // CI 的 `vars.WORKER_URL` 指向了 `webooks.lujih.workers.dev`（不存在，
+  // DNS 给通配地址 → 连接超时）。那个地址上所有探针都 fetch failed →
+  // 全 skip → 旧版打印「无法判定（所有探针都被跳过）」。
+  // 一句「无法判定」听起来像「这儿没什么可验」，而真实情况是
+  // **一条探针都没跑起来**。两种情况的处置完全相反：一个是改仓库变量，
+  // 一个是改代码。混在一起就只能靠猜 —— 我照着「无法判定」追了两轮。
+
+  /** 结论区（从汇总循环到文件末尾） */
+  function tailAfterSummary(): string {
+    const start = VERIFY.indexOf('for (const r of results)');
+    expect(start, '找不到结果汇总循环').toBeGreaterThan(0);
+    return VERIFY.slice(start);
+  }
+
+  it('必须能分辨「连不上站点」与「站点可连但没东西可验」', () => {
+    const tail = tailAfterSummary();
+    expect(tail, '结论区没有区分「连不上站点」').toMatch(/const siteDown =/);
+    // 判据必须是「没有任何一条探针拿到过响应」，而不是「跳过数 > 0」——
+    // 后者会把「三条写探针因缺口令而跳过、其余 5 条照常 pass」这种
+    // 完全正常的组合也误判成站点不可达。
+    expect(tail, 'siteDown 的判据必须是「一条都没拿到响应」，不能只看 skip>0')
+      .toMatch(/results\.every\(\(r\) => r\.status !== 'pass' && r\.status !== 'fail'\)/);
+  });
+
+  it('「连不上」必须点明这不是代码问题，并说清改哪个变量', () => {
+    const idx = VERIFY.indexOf('const siteDown =');
+    expect(idx, '找不到 siteDown 判定').toBeGreaterThan(0);
+    const tail = VERIFY.slice(idx);
+    // 用结论文案本身定位，不用 `\nconsole.log('  结论：…` —— 那行前面还有
+    // 两个缩进空格，按「换行紧接 console.log」去切会切不到（我就踩了）。
+    const end = tail.indexOf('结论：无法判定（探针全部跳过');
+    expect(end, '找不到「无法判定」分支').toBeGreaterThan(0);
+    const body = tail.slice(0, end);
+    expect(body, '「连不上」分支必须打印出那个连不上的地址').toContain('${SITE}');
+    expect(body, '没点明这不是代码问题').toContain('不是代码问题');
+    expect(body, '没说该改 WORKER_URL').toContain('WORKER_URL');
+    expect(body, '没告诉读者怎么自己验一下地址通不通').toMatch(/curl -m 20/);
+    expect(body, '没有 GitHub error annotation').toContain('::error');
+  });
+
+  it('「连不上」分支必须排在「新代码」分支之后、且照样 exit 1', () => {
+    // 排序理由：真实 fail 优先（它证明代码问题），凭据次之，
+    // 连不上再次（配置问题），最后才是「连上了、有 pass」。
+    // ⚠️ 绝不能让它 exit 0 —— 那正是这个项目反复在打的假绿。
+    const newCode = VERIFY.indexOf('结论：线上是**新代码**');
+    const siteDown = VERIFY.indexOf('const siteDown =');
+    const fallback = VERIFY.indexOf('结论：无法判定（探针全部跳过');
+    expect(newCode, '找不到「新代码」分支').toBeGreaterThan(0);
+    expect(siteDown, '找不到「连不上」判定').toBeGreaterThan(0);
+    expect(fallback, '找不到「无法判定」兜底分支').toBeGreaterThan(0);
+    expect(siteDown, '「连不上」必须排在「新代码」之后 —— 有 pass 就不是连不上')
+      .toBeGreaterThan(newCode);
+    expect(fallback, '兜底分支必须排在「连不上」判定之后').toBeGreaterThan(siteDown);
+    expect(VERIFY, '「连不上」必须照样 exit 1，不能 exit 0 —— 那就是假绿')
+      .toMatch(/process\.exit\(STRICT \? 1 : 0\);?\s*$/);
+  });
+
+  it('三种「什么都不算 pass」的结局都要有独立的结论文案', () => {
+    // 混在一起的话，读者只会看到同一个词，然后各自去猜是哪一种。
+    for (const text of [
+      '结论：线上仍是**旧代码**',
+      '结论：**凭据配错**',
+      '结论：**连不上',
+      '结论：无法判定（探针全部跳过',
+    ]) {
+      expect(VERIFY, `缺少结论文案：${text}`).toContain(text);
+    }
+  });
+});

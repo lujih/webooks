@@ -665,5 +665,35 @@ if (pass > 0) {
   console.log(`  结论：线上是**新代码**（${pass} 项通过）`);
   process.exit(0);
 }
-console.log('  结论：无法判定（所有探针都被跳过）');
+
+// 到这里：没有 fail（否则上面就退出了）、没有 pass。可能是全部被跳过，
+// 也可能是 skip 混着 pass —— 但 pass 已经在上面处理掉了，所以此刻
+// 一定是一项都没验成。
+//
+// ⚠️ 这里曾经印「无法判定（所有探针都被跳过）」就 exit 1，而那正是
+// **WORKER_URL 配错时的输出**：所有探针都 fetch failed → 全 skip →
+// 一句「无法判定」把「地址根本不通」说成了「没什么可验的」。这两种
+// 情况的处置完全相反（一个要改仓库变量，一个要改代码），不能混。
+//
+// 所以先分辨：是「站点压根没连上」还是「连上了但没东西可验」。
+const siteDown = skip > 0 && results.every((r) => r.status !== 'pass' && r.status !== 'fail');
+if (siteDown) {
+  console.log(`  结论：**连不上 ${SITE}** —— ${skip} 条探针全部没能取到任何响应`);
+  console.log('');
+  console.log('  ⚠️ 这不是代码问题：一条探针都没跑起来，验不到任何东西。');
+  console.log('     最常见的原因是 `--url`（CI 里是仓库变量 WORKER_URL）');
+  console.log('     指向了一个不存在的地址。Worker 的 workers.dev 子域是');
+  console.log('     <worker 名>.<账户子域>.workers.dev，不等于自定义域；');
+  console.log('     域名不存在时 DNS 会给一个通配地址，连接直接超时而不是 404，');
+  console.log('     于是症状是「每条探针 fetch failed」而不是「探针报 fail」。');
+  console.log('     先确认这个地址能打开：curl -m 20 -o /dev/null -w "%{http_code}" <地址>/health');
+  console.log('     订正后重跑本 job。');
+  if (typeof process !== 'undefined' && process.env.GITHUB_ACTIONS === 'true') {
+    console.log('::error title=探针连不上目标站点::'
+      + `${SITE} 无法访问，${skip} 条探针全部未运行，本轮没有验证任何东西。`
+      + '请检查仓库变量 WORKER_URL 是否指向了正确的自定义域。');
+  }
+} else {
+  console.log('  结论：无法判定（探针全部跳过，没有一条跑起来）');
+}
 process.exit(STRICT ? 1 : 0);
