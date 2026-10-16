@@ -25,8 +25,9 @@ webdav.org 的规格清单里被标记为 *obsoleted* 的只有 **RFC 2518**，�
 > Advertising class 3 support in addition to class 1 and 2 means that the server
 > supports all the requirements in this specification.
 
-即宣告 `3` 等于声称「满足本规范全部要求」。本服务有三处有意保留的偏离（见下表），
-宣告 3 会是**不实声明**。宣告 `1, 2` 是准确的：Class 1 + 完整锁支持。
+即宣告 `3` 等于声称「满足本规范全部要求」。本服务有多处有意保留的偏离（见下表），
+宣告 3 会是**不实声明**。宣告 `1, 2` 是准确的：Class 1 + 完整锁支持
+（锁协议本身完整；偏离的是**准入条件**，不是锁语义，见下表「LOCK 需写口令」）。
 
 ## 已实现（逐条对照 RFC 原文）
 
@@ -34,6 +35,7 @@ webdav.org 的规格清单里被标记为 *obsoleted* 的只有 **RFC 2518**，�
 |---|---|---|---|
 | §18.2 | Class 2 = Class 1 + LOCK/UNLOCK | `DAV: 1, 2`，含完整锁（timeout / lock-token / If 刷新） | ✅ |
 | §9.10.1 | LOCK 响应体必须是 `prop` 元素里的 `lockdiscovery` | `<D:prop><D:lockdiscovery>…` | ✅ |
+| §9.10 | LOCK 无需凭据（本服务**额外**要求写口令） | 未配置 `WRITE_TOKEN` 时匿名可用；配置后匿名 → 401 | ⚠️ 见偏离表 |
 | §8.2 | 所有 XML「MUST be, at minimum, well formed」 | 全部响应体经严格良构校验（`test/xml-wellformed.test.ts`） | ✅ |
 
 > ⚠️ 良构性**不等于**合规：`@cloudflare/vitest-pool-workers` 自带的良构检查
@@ -89,22 +91,35 @@ webdav.org 的规格清单里被标记为 *obsoleted* 的只有 **RFC 2518**，�
 | **DELETE 根目录** | 405（不支持） | 根 = 整个书库。实现 §9.6.1 会让一次误操作 / 客户端 bug 造成不可逆的全量丢失。批量清理走管理后台 `/admin` |
 | **MKCOL 无法真正建目录** | 403 + `valid-resourcetype` | 集合由 D1 派生，无法持久化自定义目录。如实告知优于假装成功 |
 | **PROPPATCH 不持久化** | 207 + 403 + `cannot-modify-protected-property` | 属性是派生视图。早前「假装 200 成功」是不实声明，已改为规范要求的前置条件 |
+| **LOCK 需写口令** | 配置了 `WRITE_TOKEN` 时匿名 LOCK → 401（未配置时匿名仍可用，与 PUT/DELETE 同一判据） | RFC 4918 §9.10 本身**不要求**任何凭据。但 LOCK 是「承载写入权威」的操作（§14.15 规定 `locktype` 只有 `write` 一种），**一把集合锁会让整个子树的写全部 423**，爆炸半径大于 DELETE。实测：匿名 `LOCK /dav/按书名/`（`Depth: 1`）→ 200 + `lock-token`，随后匿名 PUT 子成员 → 423；锁 5 个顶层集合即可瘫痪全部 WebDAV 写路径。故与 DELETE/MOVE 同级要求写口令。UNLOCK 刻意不变（§9.11 用锁令牌表达归属，要求口令会让「持有者释放自己的锁」失败） |
 | **未支持** | DeltaV(3253) / ACL(3744) / SEARCH(5323) / BIND(5842) | 公共书库无鉴权、无版本控制；用 PROPFIND 列举替代 SEARCH |
+| **PUT 扩展名白名单** | 白名单外的扩展名 → 415（`ALLOWED_UPLOAD_FORMATS`） | 公共书库只收电子书/漫画格式；任意扩展名会让桶变成通用文件托管（存储成本 + 滥用面）。RFC 9110 §8.3 允许服务端基于媒体类型拒绝，但**严格客户端可能不预期** —— 标准 litmus 套件的 fixture 多为 `.txt`/`.xml`，会被一并 415。属本地取舍，非协议违背 |
 
 ## 自测基线
 
 ```bash
-# 协议语义（14 项）
+# 协议语义（21 项）——⚠️ 必须带 --token：LOCK 现在需要写口令，不带会把 401 误报成不合规
 node scripts/rfc-probe.mjs --url https://<host>/dav/ --token "$WRITE_TOKEN"
 
-# 完整挂载握手（16 步）
+# 完整挂载握手（16 步）——同样必须带 --token，否则第 6~8 步的锁流程无法验证
 node scripts/webdav-litmus.mjs --url https://<host>/dav/ --token "$WRITE_TOKEN"
 
 # XML 良构性（含线上曾经出过的真实坏样本）
 npx vitest run test/xml-wellformed.test.ts
 ```
 
-当前实测：`rfc-probe` 14/14、`webdav-litmus` 16/16、XML 良构全部通过。
+当前实测（2026-10-17，本地 `wrangler dev` 全量跑）：`rfc-probe` **21/21**（带 `--token`）；
+不带 `--token` 时为 **16 项（15 ✅ + 1 ⚠️）** —— 其中 6 条锁协议检查被**一行显式说明替代**
+（「未提供 --token，跳过锁协议检查，401 属预期」），`If-Match` 那 1 项因无凭据记 ⚠️。
+`webdav-litmus` **16/16**（带 `--token`）；XML 良构全部通过。
+（原文档写的 `14/14` 在本次改动前就已是陈旧数字 —— 脚本里的检查项早已增加到 21 条。）
+
+> ⚠️ **不带 `--token` 时这两个探针的行为**（都已实测）：
+> `LOCK` 会返回 **401**（本站有意要求写口令，见偏离表），这不是协议退化。
+> 两个探针都会**显式打印一条说明**（`rfc-probe` 记一行「跳过锁检查，401 属预期」；
+> `webdav-litmus` 记一行「未提供 --token，LOCK → 401 属预期」并跳过刷新/释放两步），
+> 而不是静默跳过或记成失败 —— 前者会让「锁协议真的坏掉」和「只是没带口令」
+> 在输出里长得一模一样。
 
 > 💡 **为什么必须有 XML 良构性测试**：LOCK 响应曾输出
 > `<D:locktoken><D:locktoken><D:href>…` —— 标签开了两次只关一次。

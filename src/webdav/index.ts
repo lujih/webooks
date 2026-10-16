@@ -133,7 +133,25 @@ export async function handleDav(
       // 这里**不**无条件要口令：往新路径复制一本该操作是合理的匿名行为。
       return handleMoveCopy(request, env, cfg, node, davPath, false);
     case 'LOCK':
-      return handleLock(request, env, lockKey);
+      // LOCK 是「承载写入权威」的操作：§14.15 规定 locktype 只有 write 一种，
+      // 拿下一把锁就等于拿下该资源的写权限裁决权。它的影响面比 DELETE 更大 ——
+      // DELETE 只动一个资源，而一把集合锁（Depth: 1/infinity）能让整棵子树
+      // 的写入全部 423。
+      //
+      // 旧实现这里**没有任何凭据检查**（LOCK 是唯一一个既不要求口令、
+      // 又能改变其他请求命运的方法）。实测后果（Lead 线上复现）：
+      //   匿名 LOCK /dav/按书名/ (Depth: 1)        → 200 + lock-token
+      //   此后匿名 PUT 子路径                        → 423
+      //   一条脚本给 5 个顶层集合各加一把锁          → 全库 WebDAV 写入瘫痪
+      // 写口令**挡不住**它：liveLockForResource() 只按资源路径找活锁、不看
+      // owner，handleLockedWrite() 比的是 If: 里的锁令牌 —— 与写口令是两套
+      // 凭据。所以闸门必须加在**建锁**这一步。
+      //
+      // 本库既有规则是「破坏性操作需口令」（见上面 DELETE/MOVE 两处），
+      // LOCK 必须同等对待：anonymous 只能新增（PUT 到新路径）与读取，
+      // 不能替别人决定「现在谁可以写」。
+      if (!hasWriteToken(request, cfg.writeToken)) return unauthorizedResponse();
+      return handleLock(request, env, cfg, lockKey);
     case 'UNLOCK':
       return handleUnlock(request, env, lockKey);
     case 'PROPPATCH':
@@ -196,9 +214,24 @@ function lockConflictResponse(lock: { token: string; resource: string; owner: st
   );
 }
 
-async function handleLock(request: Request, env: Env, davPath: string): Promise<Response> {
+async function handleLock(
+  request: Request,
+  env: Env,
+  cfg: Settings,
+  davPath: string,
+): Promise<Response> {
   // RFC 4918 §9.10
-  // 顺带清理过期锁：匿名端点任何人都能建锁，不清理表会无声膨胀。
+  //
+  // ── 写节流（纵深防御）──────────────────────────────────────────────
+  // 分发处已经要求写口令了，这一层是给「口令泄漏/被共享」时的减速带，
+  // 也是 docs/security-audit.md 早就记下的那条既有风险（匿名 LOCK →
+  // 锁表膨胀）的正面处置：每次 LOCK 都会往 D1 的 locks 表插一行。
+  // 与 handlePut / handleMoveCopy 用同一判据、同一 ALLOW 头，新增写入口
+  // 时漏不掉（见 lib/throttle.ts 顶部注释）。
+  const blocked = await guardWrite(env, request, cfg.dailyWriteQuota, { allow: ALLOW });
+  if (blocked) return blocked;
+
+  // 顺带清理过期锁：不清理的话 locks 表会随建锁次数无声膨胀。
   await sweepExpiredLocks(env.DB).catch(() => 0);
   // 解析请求体的 locktype / lockscope / depth
   const { text: body } = await readDavBody(request);

@@ -7,7 +7,10 @@
  *   · WebDAV PUT 大小上限（防存储配额耗尽）
  *   · 上传完成接口的文件名清洗（与 WebDAV 一致）
  *   · 过期锁清扫（防 D1 表无限膨胀）
+ *   · 匿名 LOCK 阻断写入（可用性 DoS）
  */
+
+/// <reference types="vite/client" />
 
 import { SELF } from 'cloudflare:test';
 import { beforeEach, describe, expect, it } from 'vitest';
@@ -21,6 +24,30 @@ import { parsePropfindBody } from '../src/webdav/propfind';
 import { resetLibrary, testEnv } from './setup';
 
 const ORIGIN = 'https://webooks.test';
+
+/**
+ * 源码快照（`?raw` 导入）。
+ *
+ * workerd 的 node:fs 是空壳（任何路径 ENOENT），而 `TEST_STATIC_ASSETS`
+ * binding 那条通道只为 public/ 与 scripts/ 开 —— 读源码本身用 Vite 的
+ * `?raw` 更直接，vitest-pool-workers 里可用且零配置改动。
+ * 与 test/download-direct.test.ts 同一写法。
+ */
+const SRC = import.meta.glob('../src/**/*.ts', {
+  query: '?raw',
+  import: 'default',
+  eager: true,
+}) as Record<string, string>;
+
+function loadSrc(relFromTest: string): string {
+  // 调用方按仓库根写路径（'src/webdav/index.ts'），glob 的键是相对本文件的
+  const key = `../${relFromTest}`;
+  const src = SRC[key];
+  if (!src) {
+    throw new Error(`源码快照里没有 ${key}；现有键：${Object.keys(SRC).slice(0, 5).join(', ')}…`);
+  }
+  return src;
+}
 
 beforeEach(async () => {
   await resetLibrary();
@@ -285,6 +312,111 @@ describe('破坏性操作的写口令保护', () => {
     expect(head.status).toBe(200);
     expect(head.headers.get('accept-ranges')).toBe('bytes');
   });
+
+  // ── LOCK 也属于「破坏性操作」（修复：匿名锁 DoS）─────────────────────
+  //
+  // 修复前 `case 'LOCK'` 是**唯一**既不要求口令、又能改变其他请求命运的
+  // 方法。线上实测（Lead 复现）：
+  //
+  //   匿名 LOCK /dav/按书名/ (Timeout: Second-300, Depth: 1)  → 200 + lock-token
+  //   此后匿名 PUT 子路径                                      → 423
+  //   一条脚本给 5 个顶层集合各加一把锁                        → 全库 WebDAV 写入瘫痪
+  //
+  // 写口令挡不住它：`liveLockForResource()` 只按资源路径找活锁、不看 owner，
+  // `handleLockedWrite()` 比的是 `If:` 里的锁令牌 —— 与写口令是两套凭据。
+  // 所以闸门只有加在**建锁**这一步才有效。
+  const LOCK_INFO =
+    '<D:lockinfo xmlns:D="DAV:">'
+    + '<D:lockscope><D:exclusive/></D:lockscope>'
+    + '<D:locktype><D:write/></D:locktype>'
+    + '<D:owner>tester</D:owner>'
+    + '</D:lockinfo>';
+
+  const lockInit = (extra: Record<string, string> = {}): RequestInit => ({
+    method: 'LOCK',
+    headers: { 'content-type': 'application/xml', timeout: 'Second-300', depth: '1', ...extra },
+    body: LOCK_INFO,
+  });
+
+  it('加锁（LOCK）：无口令 → 401，且**真的没有建出锁**', async () => {
+    const res = await anon('/dav/recent/', lockInit());
+    expect(res.status).toBe(401);
+    // 错误响应不该泄漏一把锁令牌
+    expect(res.headers.get('lock-token')).toBeNull();
+    // 客户端要知道怎么补凭据（与其他破坏性操作一致）
+    expect(res.headers.get('www-authenticate')).toBeTruthy();
+
+    // ⚠️ 状态码只是**一半**的断言。必须证明 D1 的 locks 表里真的没有行 ——
+    //    「回 401 但顺手把锁建了」这种写法能满足状态码断言却毫无防护。
+    const rows = await testEnv.DB.prepare('SELECT token, resource FROM locks').all<{
+      token: string; resource: string;
+    }>();
+    expect(rows.results ?? [], '匿名 LOCK 不该在锁表里留下任何行').toEqual([]);
+
+    // 还要证明资源**没被锁住**：匿名 PUT 新书仍然可写
+    const after = await anon('/dav/recent/after-anon-lock.epub', put());
+    expect([201, 204]).toContain(after.status);
+  });
+
+  it('加锁（LOCK）：带口令 → 200 + Lock-Token（合法客户端没被连带打死）', async () => {
+    const res = await auth('/dav/recent/', lockInit());
+    expect(res.status, '口令正确时 LOCK 必须照常工作').toBe(200);
+    const token = res.headers.get('lock-token');
+    expect(token, '§9.10.1 必须回 Lock-Token').toBeTruthy();
+    expect(token!).toMatch(/^<urn:uuid:/);
+
+    // 锁确实生效了：子路径匿名 PUT 被 423 挡住
+    // （锁的**语义**没变，变的只是「谁能建锁」）
+    const blocked = await anon('/dav/recent/while-locked.epub', put());
+    expect(blocked.status).toBe(423);
+
+    // UNLOCK **刻意不要求口令**：没有 LOCK 就建不出锁，攻击面已消失；
+    // 强加口令会破坏「持锁者释放自己的锁」语义（§9.11 用 token 表达所有权）。
+    const unlock = await anon('/dav/recent/', { method: 'UNLOCK', headers: { 'lock-token': token! } });
+    expect(unlock.status).toBe(204);
+
+    // 锁释放后写入恢复，且锁表清空（不留残留影响后面的测试）
+    const released = await anon('/dav/recent/after-unlock.epub', put());
+    expect([201, 204]).toContain(released.status);
+    const rows = await testEnv.DB.prepare('SELECT token FROM locks').all();
+    expect(rows.results ?? []).toEqual([]);
+  });
+
+  it('匿名 LOCK 不影响读路径（PROPFIND 仍 207，锁未泄漏出去）', async () => {
+    await anon('/dav/recent/', lockInit());
+    const pf = await anon('/dav/recent/', { method: 'PROPFIND', headers: { depth: '0' } });
+    expect(pf.status).toBe(207);
+    // 修复前匿名 LOCK 成功后，Depth:0 的 PROPFIND 会把 locktoken 公开读出来
+    // （拿它带 `If:` 就能绕过 423）—— 现在连锁都建不出来，自然读不到。
+    const xml = await pf.text();
+    expect(xml).not.toContain('locktoken');
+    expect(xml).not.toContain('activelock');
+  });
+
+  /**
+   * 源码守卫：上面三条是**行为**断言，这条钉住**结构**。
+   *
+   * 为什么两条都要：行为测试可以用任何方式绕过（比如在别处加一个
+   * `if (isLockPath(...))` 的特例），而源码守卫能保证「口令检查就在
+   * 建锁的那个分支里」。反过来，源码守卫能防止有人把 LOCK 从
+   * `case` 里挪走。
+   */
+  it('源码守卫：case LOCK 分支必须检查 hasWriteToken，且建锁路径走 guardWrite', async () => {
+    const source = await loadSrc('src/webdav/index.ts');
+    const start = source.indexOf("case 'LOCK'");
+    expect(start, "src/webdav/index.ts 里找不到 case 'LOCK' 分支").toBeGreaterThan(-1);
+    const end = source.indexOf("case 'UNLOCK'", start);
+    expect(end, "case 'LOCK' 后面应当紧跟着 case 'UNLOCK'").toBeGreaterThan(start);
+    const lockCase = source.slice(start, end);
+    expect(lockCase, 'LOCK 分支必须先校验写口令').toContain('hasWriteToken');
+    expect(lockCase, '未授权要走统一的 401 响应').toContain('unauthorizedResponse');
+
+    // 纵深防御：handleLock 内部还要过 guardWrite（防口令泄漏后的锁表膨胀）
+    const fnStart = source.indexOf('async function handleLock(');
+    expect(fnStart).toBeGreaterThan(-1);
+    const handleLockBody = source.slice(fnStart, source.indexOf('async function handleUnlock(', fnStart));
+    expect(handleLockBody, 'handleLock 必须过写节流').toContain('guardWrite');
+  });
 });
 
 describe('管理后台 API', () => {
@@ -390,7 +522,11 @@ describe('过期锁清扫', () => {  it('sweepExpiredLocks 删除过期行、保
 
     await SELF.fetch(`${ORIGIN}/dav/recent/x.epub`, {
       method: 'LOCK',
-      headers: { 'content-type': 'application/xml' },
+      // LOCK 现在要求写口令（见 src/webdav/index.ts 分发处的 case 'LOCK'）：
+      // 匿名锁能让整棵子树不可写。这条测试验的是「LOCK 顺带清扫过期锁」，
+      // 不是「匿名 LOCK 被拒」—— 后者在下面 describe('LOCK 需要写口令') 里。
+      // 所以这里只给请求侧补口令头，断言一个字都没放宽。
+      headers: { 'content-type': 'application/xml', authorization: 'Bearer test-write-token' },
       body: '<D:lockinfo xmlns:D="DAV:"><D:locktype><D:write/></D:locktype></D:lockinfo>',
     });
 

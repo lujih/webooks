@@ -407,8 +407,14 @@ async function probeCopyWhitelist() {
 /**
  * 探针 2：UNLOCK 不带 Lock-Token 头 → 必须是 400
  *
- * 修复前会「顺手释放该路径上的锁」并回 204。匿名 LOCK 端点 +
- * 无 token UNLOCK = 任何人都能释放别人的锁。
+ * 修复前会「顺手释放该路径上的锁」并回 204 —— 等于「不带凭据也能解锁」。
+ *
+ * ⚠️ 这里原先写着「匿名 LOCK 端点 + 无 token UNLOCK = 任何人都能释放
+ * 别人的锁」，那是**修复前**的描述，已随 2026-10-17 的匿名锁 DoS 修复
+ * 过期：`case 'LOCK'` 现在要求写口令（`hasWriteToken`），「匿名就能建锁」
+ * 这个前提不再成立。UNLOCK 仍然**刻意**不要求口令（§9.11 用锁令牌表达
+ * 归属），所以「拿得到令牌就能解锁」依然为真 —— 但令牌现在只有已过写口令
+ * 的持锁者能拿到，攻击面从「任何匿名者」缩到「口令持有者」。
  */
 async function probeUnlockNoToken() {
   const NAME = 'UNLOCK 缺 Lock-Token（RFC §9.11.1）';

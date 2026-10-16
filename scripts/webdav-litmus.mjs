@@ -153,9 +153,15 @@ async function main() {
   }
 
   // 6) LOCK 根
+  //    LOCK 是「承载写入权威」的操作：§14.15 规定 locktype 只有 write 一种，
+  //    而一把集合锁会让整个子树的写全部 423 —— 爆炸半径大于 DELETE，所以和
+  //    DELETE/MOVE 一样需要写口令（有意偏离，见 docs/rfc-compliance.md 偏离表）。
+  //    没带 --token 时 401 是**预期**，如实记一条通过并说明，而不是记成失败：
+  //    既不能把「按设计拒绝」算作协议退化，也不能悄悄跳过（那会让「锁协议真的
+  //    坏掉」和「只是没带口令」在输出里长得一模一样）。
   let lockToken = null;
   {
-    const { res, body } = await req('/', {
+    const { res, body } = await reqAuth('/', {
       method: 'LOCK',
       headers: { 'content-type': 'application/xml', timeout: 'Second-300' },
       body: '<?xml version="1.0"?><D:lockinfo xmlns:D="DAV:"><D:locktype><D:write/></D:locktype><D:lockscope><D:exclusive/></D:lockscope><D:depth>infinity</D:depth></D:lockinfo>',
@@ -167,19 +173,26 @@ async function main() {
       const m = body.match(/<urn:uuid:[0-9a-f-]+/);
       if (m) { lockToken = m[0]; ok = true; }
     }
-    record(ok, 'LOCK 根（Depth:infinity）→ 200 + Lock-Token',
-      `status=${res.status} token=${lockToken ?? '(无)'}`, 'RFC 4918 §9.10');
+    if (!TOKEN && res.status === 401) {
+      record(true, '未提供 --token：LOCK → 401（本站要求写口令，属预期不是退化）',
+        `status=${res.status}，带 --token 重跑可完整验证锁流程`, 'rfc-compliance.md 偏离表');
+    } else {
+      record(ok, 'LOCK 根（Depth:infinity）→ 200 + Lock-Token',
+        `status=${res.status} token=${lockToken ?? '(无)'}`, 'RFC 4918 §9.10');
+    }
   }
 
   // 7) LOCK 刷新
   if (lockToken) {
-    const { res } = await req('/', {
+    const { res } = await reqAuth('/', {
       method: 'LOCK',
       headers: { 'content-type': 'application/xml', if: `(${lockToken})`, timeout: 'Second-300' },
       body: '<D:lockinfo xmlns:D="DAV:"><D:locktype><D:write/></D:locktype></D:lockinfo>',
     });
     record(res.status === 200, 'LOCK 刷新（If: <token>）→ 200',
       `status=${res.status}`, 'RFC 4918 §9.10.2');
+  } else {
+    console.log(`      ${C.dim}（无锁令牌，跳过刷新 —— 未提供 --token 时锁流程无法验证）${C.r}`);
   }
 
   // 8) UNLOCK —— 必须释放，否则 Depth:infinity 根锁会挡死后续所有写操作

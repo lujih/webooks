@@ -165,6 +165,35 @@ GET https://books.<域名>/books/<id>
 **修复后**：新增 `sweepExpiredLocks()`，每次 LOCK 请求顺带清理过期行（LOCK 频率极低）。
 免费层没有 Cron 绑定也能生效。
 
+### 4.4b 匿名锁阻断全部写入（可用性 DoS）
+**修复前**：`LOCK` 分支**没有任何凭据检查** —— 任何人都能对任意路径加锁，且
+`liveLockForResource()` 只按资源路径匹配（不看锁的 owner），`handleLockedWrite()`
+比的是 `If:` 里的锁令牌 —— 是两套互不相干的凭据体系。写口令因此**挡不住**这条路径。
+
+线上实测（匿名、不带任何凭据）：
+
+| 请求 | 结果 |
+|---|---|
+| `LOCK /dav/按书名/`（`Timeout: Second-300`, `Depth: 1`） | 200 + `lock-token` |
+| 紧接着匿名 `PUT` 该集合下的子成员 | 423 Locked |
+| `LOCK` + `If: <token>` + `Timeout: Infinite` | 200，回显 `<D:timeout>Second-3600</D:timeout>`（**可无限续期**） |
+| 并发 `PROPFIND` 读路径 | 207，不受影响 |
+
+即：**一个脚本锁住 5 个顶层集合，就能让全部 WebDAV 写路径瘫痪**
+（`/api/upload/*` 不受影响）。锁的归属只看 `If:` 令牌，而 `PROPFIND Depth: 0`
+会公开回显 `locktoken`，所以攻击者本人（以及任何读到 XML 的人）可以自解 ——
+因此这是对**朴素客户端**的可用性攻击，不是硬性锁死；但默认状态即 DoS。
+
+**修复后**：
+1. `case 'LOCK'` 与 `DELETE`/`MOVE` 同级要求写口令（`hasWriteToken`）——不再有任何人
+   能替书库决定「谁可以写」。注释里写明爆炸半径大于 DELETE 的原因。
+2. LOCK 与 PUT/COPY 一样走 `guardWrite()` 每日写入节流（纵深防御：即使口令泄漏，
+   也不能无限建锁）。
+3. `UNLOCK` 刻意**不**要求口令：§9.11 用锁令牌表达归属，要求口令会让
+   「持有者释放自己的锁」失败；加锁被拦住之后它也不再是攻击面。
+4. 回归测试同时断言 status 401 **和** `locks` 表里真的没有建出锁
+   （只断言状态码，一个「回 401 但仍然建锁」的实现也能通过）。
+
 ### 4.5 上传完成接口的文件名未清洗
 **修复前**：`handleUploadComplete` 只替换 `/` 和 `\`，控制字符、`<>:"|?*` 与超长名字
 都能进 D1（虽然后续渲染都有转义，但入库前就该干净）。
@@ -473,7 +502,8 @@ WebDAV litmus      16/16 步通过
 ```
 src/lib/epub.ts        封面类型嗅探 + 白名单（HIGH-1）
 src/lib/metadata.ts    safeContentTypeFor + html/svg 类型收紧（HIGH-2）
-src/webdav/index.ts    内容类型强制、大小上限、节流、内存炸弹、锁清扫
+src/webdav/index.ts    内容类型强制、大小上限、节流、内存炸弹、锁清扫、
+                       LOCK 写口令门禁 + 建锁走 guardWrite 节流（4.4b）
 src/api/upload.ts      内容类型强制、文件名清洗、预签名类型收紧
 src/api/admin.ts      reindex 使用安全类型
 src/lib/http.ts        安全响应头
@@ -484,6 +514,8 @@ src/config.ts          maxUploadBytes / dailyWriteQuota（含 clamp 与默认值
 wrangler.jsonc         仅 R2_PUBLIC_BASE（其余参数走 config.ts 默认值，
                        仍可用 `wrangler deploy --var KEY=VALUE` 临时覆盖）
 scripts/security-probe.mjs  新增：34 项安全自查
-test/security.test.ts       新增：12 例安全回归
+scripts/webdav-litmus.mjs   LOCK 步骤改走带口令的 reqAuth；无 --token 时如实报告 401
+scripts/rfc-probe.mjs       无 --token 时显式说明「锁检查跳过，401 属预期」
+test/security.test.ts       新增：12 例安全回归 + 匿名 LOCK 门禁 4 例（4.4b）
 test/epub.test.ts           +6 例封面类型回归
 ```

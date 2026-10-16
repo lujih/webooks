@@ -180,7 +180,14 @@ console.log('='.repeat(72));
 }
 
 // ── LOCK 应宣告 Class 2 并返回 200 + Lock-Token ──
-{
+// ⚠️ LOCK 需要写口令（有意偏离，见 docs/rfc-compliance.md 偏离表）：一把集合锁
+//    会让整个子树的写全部 423，爆炸半径大于 DELETE。没有 --token 时服务端回
+//    401 是**预期**，不能把「没带口令」报成「RFC 不合规」；但也不能静默跳过、
+//    还让输出看起来像「全部通过」—— 所以显式记一行说明。
+if (!TOKEN) {
+  check('LOCK 需写口令：未提供 --token，跳过锁协议检查（401 属预期，非不合规）', true,
+    '带 --token "$WRITE_TOKEN" 重跑可完整验证 LOCK / 刷新 / UNLOCK', 'rfc-compliance.md 偏离表');
+} else {
   const { res, body } = await req('/recent/' + tmp, {
     method: 'LOCK',
     body: '<?xml version="1.0"?><D:lockinfo xmlns:D="DAV:"><D:locktype><D:write/></D:locktype><D:lockscope><D:exclusive/></D:lockscope></D:lockinfo>',
