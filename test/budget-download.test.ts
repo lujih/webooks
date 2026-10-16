@@ -129,16 +129,129 @@ describe('线上探针：书卡直链回归要能被发现', () => {
     const tail = VERIFY.slice(idx);
     const end = tail.indexOf('\n}\n');
     const body = tail.slice(0, end > 0 ? end : 2000);
-    expect(body, 'probeOverwrite 又没有 CAN_WRITE 守卫了').toMatch(/if \(!CAN_WRITE\)/);
+    expect(body, 'probeOverwrite 又没有写口令守卫了').toMatch(/if \(!canWrite\(\)\)/);
     // 守卫必须**早退**，不能只是记个变量继续往下写文件
-    const guardPos = body.indexOf('if (!CAN_WRITE)');
+    const guardPos = body.indexOf('if (!canWrite())');
     const putPos = body.indexOf("call('PUT'");
-    expect(guardPos, '找不到 CAN_WRITE 守卫').toBeGreaterThan(0);
+    expect(guardPos, '找不到写口令守卫').toBeGreaterThan(0);
     if (putPos > 0) {
-      expect(guardPos, 'CAN_WRITE 守卫必须在任何落盘操作之前').toBeLessThan(putPos);
+      expect(guardPos, '写口令守卫必须在任何落盘操作之前').toBeLessThan(putPos);
     }
     // 函数体里必须写明「无口令时 401 是规范行为」，否则下一个人还会把它改回 fail
     const lead = VERIFY.slice(Math.max(0, idx - 1200), idx);
     expect(lead + body).toMatch(/RFC 4918 §10\.6|§10\.6/);
+  });
+});
+
+describe('线上探针：口令配错不许伪装成「线上是旧代码」', () => {
+  // 这是第四个真实缺陷。CI 的 WRITE_TOKEN secret 是个无效值（实测把
+  // ADMIN_TOKEN 当写口令用），而探针只看「传没传」（TOKEN.length > 0），
+  // 于是稳定打印 `❌ 实际 401` + `结论：线上仍是**旧代码**`。我照这个结论
+  // 去线上追了两轮，而线上其实早就是新代码 ——
+  // 判据：修复前 COPY 撞已有目标必然 201 并破坏目标，不可能返回 401。
+
+  /** 取某个顶层函数的函数体（到下一个 `}` 后换行止） */
+  function bodyOf(name: string): string {
+    const idx = VERIFY.indexOf(`function ${name}(`);
+    expect(idx, `找不到 ${name}`).toBeGreaterThan(0);
+    const tail = VERIFY.slice(idx);
+    const end = tail.indexOf('\n}\n');
+    return tail.slice(0, end > 0 ? end : 3000);
+  }
+
+  it('必须有口令预检，并且排在三条写探针之前', () => {
+    expect(VERIFY, '口令预检函数没了').toMatch(/async function probeWriteToken\(/);
+    const callPos = VERIFY.indexOf('await probeWriteToken();');
+    expect(callPos, '预检定义了却没被调用').toBeGreaterThan(0);
+    for (const probe of ['await probeCopyWhitelist();', 'await probeUnlockNoToken();', 'await probeOverwrite();']) {
+      const pos = VERIFY.indexOf(probe);
+      expect(pos, `找不到 ${probe}`).toBeGreaterThan(0);
+      expect(callPos, `预检必须排在 ${probe} 之前`).toBeLessThan(pos);
+    }
+  });
+
+  it('预检必须用「DELETE 一个不存在的叶子」判定口令可用性', () => {
+    const body = bodyOf('probeWriteToken');
+    // 口令有效 → handleDelete 的 findBookByLeaf 拿 null → 404
+    // 口令无效 → 分发层的 hasWriteToken 先拦成 401
+    expect(body, '预检必须用 DELETE（GET 是匿名的，验不出写口令）').toMatch(/call\('DELETE'/);
+    expect(body, '预检没判 404 —— 口令有效时就是 404').toContain('404');
+    expect(body, '预检没判 401/403').toMatch(/401/);
+  });
+
+  it('预检路径必须落在叶子上，绝不能是集合（否则会删掉整个集合）', () => {
+    // ⚠️ 最危险的一条：`/dav/<集合>/` 的 DELETE 等价于 Depth: infinity，
+    // 会把整个集合连成员一起删掉。预检路径必须带叶子名。
+    const body = bodyOf('probeWriteToken');
+    const m = body.match(/call\('DELETE',\s*([^\n]+?)\)/);
+    expect(m, '找不到预检的 DELETE 调用').not.toBeNull();
+    const arg = m![1]!;
+    expect(arg, '预检路径必须带叶子名（`${TMP}_tokencheck.txt` 之类），'
+      + '不能只是一个集合路径 —— 那会走 Depth: infinity 分支删掉整个集合').not.toMatch(/^`\$\{DAV\}\/`$/);
+    expect(arg, '预检的文件名必须是本次运行唯一的（含 TMP，即 base36 时间戳），'
+      + '否则可能与真书重名').toContain('${TMP}');
+  });
+
+  it('口令被拒时要单独计类，不能算进「线上是旧代码」', () => {
+    // 分开计类的意义：credential 类 fail 证明不了线上代码是新的，
+    // 但也**证伪不了** —— 混在一起就会得出错误结论。
+    expect(VERIFY, '预检结果没打 credential 标记').toContain("kind: 'credential'");
+    expect(VERIFY, '结论区没有 credentialFail 分支').toMatch(/if \(credentialFail > 0\)/);
+    // ⚠️ 变异验证抓到过：只断言「有 kind 标记」和「有 credentialFail 分支」
+    // 是不够的 —— 汇总循环里若直接把 `fail++`（丢掉 `r.kind === 'credential'`
+    // 的分流），凭据 fail 就又混回「旧代码」去了，而**所有断言照样绿**。
+    // 这里必须钉住「汇总循环里真的分流了」。
+    const loopStart = VERIFY.indexOf('for (const r of results)');
+    const loopEnd = VERIFY.indexOf('console.log(`  结论：线上仍是**旧代码**');
+    expect(loopStart, '找不到结果汇总循环').toBeGreaterThan(0);
+    expect(loopEnd, '找不到结论区').toBeGreaterThan(loopStart);
+    const loop = VERIFY.slice(loopStart, loopEnd);
+    expect(loop, '汇总循环没有把 credential 类分流出去 —— 凭据问题会被读成「线上是旧代码」')
+      .toMatch(/r\.kind === 'credential'/);
+    expect(loop, 'credentialFail 没有被累加').toMatch(/credentialFail\+\+/);
+    // 凭据分支必须排在「旧代码」分支**之后**（真 fail 优先报出来），
+    // 但排在「新代码」分支**之前**（否则凭据错误会被 5 项 pass 掩盖成通过）
+    const oldCode = VERIFY.indexOf('结论：线上仍是**旧代码**');
+    const cred = VERIFY.indexOf('if (credentialFail > 0)');
+    const newCode = VERIFY.indexOf('结论：线上是**新代码**');
+    expect(oldCode, '找不到「旧代码」分支').toBeGreaterThan(0);
+    expect(cred, '找不到凭据分支').toBeGreaterThan(0);
+    expect(newCode, '找不到「新代码」分支').toBeGreaterThan(0);
+    expect(cred, '凭据分支必须排在「旧代码」分支之后').toBeGreaterThan(oldCode);
+    expect(cred, '凭据分支必须排在「新代码」分支之前 —— 否则凭据配错会被读成通过').toBeLessThan(newCode);
+  });
+
+  it('凭据分支的文案必须点明「不是代码问题」并说清怎么修', () => {
+    const idx = VERIFY.indexOf('if (credentialFail > 0)');
+    // 切到下一个顶层 `}` 为止，别用固定长度 —— 固定长度会切到后面
+    // `if (pass > 0)` 那支里的 `process.exit(0)`，断言就变成在测别人的代码。
+    const tail = VERIFY.slice(idx);
+    const end = tail.indexOf('\n}\n');
+    const body = tail.slice(0, end > 0 ? end : 1600);
+    expect(body, '没点明这不是代码问题').toContain('不是代码问题');
+    expect(body, '没说 ADMIN_TOKEN 不能当写口令用').toContain('ADMIN_TOKEN');
+    expect(body, '没给出修复命令').toMatch(/wrangler secret put WRITE_TOKEN/);
+    // 打 error annotation：Actions 页面上要一眼看到，不必翻日志
+    expect(body, '没有 GitHub error annotation').toContain('::error');
+    // 且必须是「如实报未验完」的语义 —— 绿灯比红灯危险：这个项目反复在打
+    // 假绿（探针没跑却说「已验证通过」）。三条写探针没跑就是没验到。
+    expect(body, '凭据分支必须照样 exit（--strict 下 exit 1），不能 exit 0 —— 那就是假绿')
+      .toMatch(/process\.exit\(STRICT \? 1 : 0\)/);
+    expect(body, '不能硬编码 exit 0').not.toMatch(/process\.exit\(0\)/);
+  });
+
+  it('canWrite() 必须真的取决于预检结果，不能恒真', () => {
+    // 与 CAN_WRITE 那次同一个坑：只断言「存在一个叫 canWrite 的函数」不够，
+    // 必须断言它真的绑在状态机上 —— 否则把 body 改成 `return true;` 也能绿。
+    const body = bodyOf('canWrite');
+    expect(body, 'canWrite 必须判 writeTokenState').toContain('writeTokenState');
+    expect(body, "canWrite 必须要求 'ok'（预检通过），光传了口令不算")
+      .toContain("'ok'");
+    expect(body, 'canWrite 不能恒真').not.toMatch(/return\s+true\s*;/);
+    // 状态机初值必须是 unverified/absent，不能直接是 ok
+    expect(VERIFY, "writeTokenState 初值不能是 'ok' —— 那就等于没预检")
+      .not.toMatch(/let writeTokenState = 'ok'/);
+    expect(VERIFY, '状态机初值必须区分「没传」与「传了但没验」')
+      .toMatch(/let writeTokenState = TOKEN\.length > 0 \? 'unverified' : 'absent';/);
   });
 });

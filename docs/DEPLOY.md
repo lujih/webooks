@@ -125,7 +125,7 @@ Dashboard → My Profile → API Tokens → Create Token
   Secrets:
     CLOUDFLARE_API_TOKEN  = 上一步的 token
     CLOUDFLARE_ACCOUNT_ID = Dashboard 右侧栏的 Account ID
-    WRITE_TOKEN           = 站点的 WebDAV 写口令（可选，但强烈建议配）
+    WRITE_TOKEN           = 站点的 WebDAV 写口令（强烈建议配；≠ ADMIN_TOKEN）
   Variables（可选，但强烈建议）:
     WORKER_URL            = https://webooks.<你的子域>.workers.dev
 ```
@@ -134,16 +134,29 @@ Dashboard → My Profile → API Tokens → Create Token
 `scripts/verify-deploy.mjs`（行为探针 —— 它比对「修复前/后的返回码」，所以能
 真正回答「线上跑的到底是不是新代码」）。
 
-**`WRITE_TOKEN` 不配不会让 CI 变红，但会让最后三条探针静默跳过**，而那三条
-才是版本判定的真正判据。之前的配置就是这样，结果探针拿一个匿名请求去测一条
-「无口令必须 401」的用例（RFC 4918 §8.1 要求先拒授权），稳定打印
+**`WRITE_TOKEN` 必须与 Worker 上的值一致**（`npx wrangler secret put WRITE_TOKEN`
+设进去的那个）。它**不是** `ADMIN_TOKEN` —— 两者是各自独立的密钥，拿管理口令
+去发 DELETE 一样是 401，因为 `src/webdav/index.ts:121` 在分发层就拦掉了。
+
+探针会先做一次**口令预检**（拿一个必然不存在的叶子做 DELETE）：
+
+| 预检结果 | 含义 | 后续 |
+|---|---|---|
+| `404` | 口令有效 | 三条写探针照跑 |
+| `401` / `403` | 口令被拒 | 三条全部跳过，报「**凭据配错**」 |
+
+为什么需要这一步：之前只看「传没传口令」，于是**传错口令**和**没传口令**
+在输出上完全一样（都表现为写探针失败）。这个仓库的 CI secret 填错过一次
+（填成了 admin 口令），探针因此稳定打印
 
 ```
-❌ Overwrite: F 撞已有目标（RFC §9.8.3）   期望 412（新代码），实际 401
+❌ Overwrite: F 撞已有目标（RFC §10.6）   期望 412（新代码），实际 401
 结论：线上仍是旧代码（1 项不符预期）
 ```
 
-—— 一次完全正确的部署被自己的门卫判成失败，让人去追一个不存在的问题。
+—— 一次完全正确的部署被自己的门卫判成失败，让人去追一个不存在的问题
+（判据：修复前 COPY 撞已有目标必然 201 并破坏目标，**根本不可能返回 401**，
+所以能返 401 恰恰证明口令检查已上线）。现在这类失败会明确报成凭据问题。
 
 另外，缺口令时那三条探针还会**往真实书库写临时文件而删不掉**（本站设计上
 PUT 匿名可写、DELETE 需要口令），实测一条命令就把书库从 4 本变 8 本、多出来的

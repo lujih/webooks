@@ -22,7 +22,8 @@
  *    「The server MUST do authorization checks before checking this or any
  *    conditional header」，§8.1 更要求授权错误优先于其它错误（否则匿名者
  *    可以用「412 还是 201」探测目标位置有没有东西）。所以拿到 401 是
- *    规范行为 —— 缺口令时那条报 skip「无法判定」。详见 CAN_WRITE 处的说明。
+ *    规范行为 —— 缺口令时那条报 skip「无法判定」。
+ *    详见下面 writeTokenState 处的说明（含「传错口令 ≠ 没传口令」那个坑）。
  *
  * 任一条返回「修复后的值」，就证明线上是新代码；返回「修复前的值」则说明
  * 部署没生效（或部署到了别的域名/别的 Worker）。
@@ -34,15 +35,19 @@
  *
  * `--strict` 时有任何一条不符合预期就 exit 1（供 CI 用）。
  *
- * ⚠️ 写探针会**往书库里写临时文件**。而没有 WRITE_TOKEN 时它们会全部跳过，
+ * ⚠️ 写探针会**往书库里写临时文件**。而口令不可用时它们会全部跳过，
  *   原因是本库的设计不对称：PUT（新增）匿名可写，DELETE（删除）需要口令。
- *   于是缺口令的探针能造垃圾、却清不掉垃圾（实测：一条命令让书库从 4 本
+ *   于是那时的探针能造垃圾、却清不掉垃圾（实测：一条命令让书库从 4 本
  *   变 8 本，多出来的 `__deploycheck_*` 只能手工清）。
  *   所以现在的规矩是「跑了不能收场就不跑」—— 报「无法判定」而不是留垃圾。
- *   配置 CI 时请把 WRITE_TOKEN 传进来，否则这三条探针永远拿不到结论。
  *
  * 需要的环境变量：
- *   WRITE_TOKEN  写口令。缺失时三条写探针跳过（其余两条静态层探针照跑）。
+ *   WRITE_TOKEN  写口令。**必须与 Worker 上的 WRITE_TOKEN 一致**
+ *                 （`npx wrangler secret put WRITE_TOKEN` 设的那个），
+ *                 而且**不等于 ADMIN_TOKEN** —— 那是另一个密钥，拿它发
+ *                 DELETE 一样是 401。缺失或被拒时三条写探针跳过，
+ *                 其余探针照跑；被拒时会明确报「凭据配错」而不是
+ *                 「线上是旧代码」（详见 writeTokenState 处）。
  */
 
 /**
@@ -94,11 +99,20 @@ async function cleanup(name) {
 }
 
 /**
- * ⚠️ 没有口令时**根本不能跑写探针** —— 它们会往真实书库里留下删不掉的垃圾。
+ * 写口令的**可用性**（不是「有没有传」）。
  *
- * 这是实测出来的，不是假想：在本地带真实 D1 的 `wrangler dev` 上跑一次
- * 不带 WRITE_TOKEN 的探针，书库从 4 本变成 8 本，多出来的全是
- * `__deploycheck_*` 文件，而且**删不掉**。
+ *   'absent'     —— 没传口令
+ *   'unverified' —— 传了，还没预检
+ *   'ok'         —— 预检通过，三条写探针可以跑
+ *   'rejected'   —— 传了但服务端说不对
+ *   'unknown'    —— 预检本身没跑成（网络/意外状态码）
+ *
+ * ## 判据不是「跑不跑得动」，而是「跑了能不能收场」
+ *
+ * ⚠️ 没有可用口令时**根本不能跑写探针** —— 它们会往真实书库里留下删不掉的
+ * 垃圾。这是实测出来的，不是假想：在本地带真实 D1 的 `wrangler dev` 上跑一次
+ * 缺口令的探针，书库从 4 本变成 8 本，多出来的全是 `__deploycheck_*`，
+ * 而且**删不掉**。
  *
  * 成因是本库一个有意的设计不对称：
  *   · PUT（新增）匿名即可 —— 这是产品的核心诉求，不能为了探针让步
@@ -106,16 +120,97 @@ async function cleanup(name) {
  * 于是探针能造垃圾、却清不掉垃圾。cleanup() 里 DELETE 拿到 401 被
  * 静默吞掉（`catch {}` 是故意的「尽力而为」），垃圾就此留在库里。
  *
- * 所以这里改成**直接不写**：判据不是「跑不跑得动」，而是「跑了能不能收场」。
- * 三条写探针都需要口令，缺口令时统一报「无法判定」并把原因说清楚 ——
- * 报 skip 是诚实的（真的没测），比造一堆垃圾去换一个结论好得多。
+ * ## 为什么是状态机而不是一个布尔量
+ *
+ * 原来只有 `const CAN_WRITE = TOKEN.length > 0`，于是**传错口令**与**没传口令**
+ * 在输出上完全无法区分（都表现为写探针失败）。这是真实踩出来的第四个缺陷：
+ * CI 的 WRITE_TOKEN secret 是个无效值（填成了 ADMIN_TOKEN），探针因此稳定打印
+ *     ❌ Overwrite: F 撞已有目标  期望 412（新代码），实际 401
+ *     结论：线上仍是**旧代码**（1 项不符预期）
+ * 于是「凭据配错了」被读成「代码没部署」，我去追了两轮才发现线上其实是
+ * 新代码 —— 判据：修复前 COPY 撞已有目标必然 201 并破坏目标，根本不可能
+ * 返回 401，能返 401 恰恰证明口令检查已上线。
+ *
+ * 教训：**报 skip 是诚实的，报 fail 是错的**。
+ * 「拿这个口令什么都没验成」不等于「线上代码不对」。
  */
-const CAN_WRITE = TOKEN.length > 0;
+let writeTokenState = TOKEN.length > 0 ? 'unverified' : 'absent';
 
-/** 写探针的守卫：无口令时直接记 skip，绝不落盘 */
+/** 写探针的守卫：口令不可用时直接记 skip，绝不落盘 */
 function skipWriteProbe(name, detail) {
   results.push({ name, status: 'skip', detail });
   return false;
+}
+
+/** 三条写探针能不能跑 —— 必须**预检通过**，光「传了」不算 */
+function canWrite() {
+  return writeTokenState === 'ok';
+}
+
+/** skip 时要说清原因：读日志的人必须一眼分清凭据问题与代码问题 */
+function writeGuardDetail() {
+  if (writeTokenState === 'rejected') {
+    return 'WRITE_TOKEN 被服务端拒绝（**凭据问题，不是代码问题**）—— 落盘后删不掉，跳过';
+  }
+  if (writeTokenState === 'unknown') {
+    return '写口令预检没跑成，无法判定 —— 落盘后删不掉，跳过';
+  }
+  return '未提供 WRITE_TOKEN —— 落盘后删不掉，不留垃圾（见 writeTokenState 处说明）';
+}
+
+/**
+ * 探针 0（预检）：**这个口令到底能不能用**
+ *
+ * 做法：拿一个**必然不存在**的叶子做 DELETE。
+ *   口令有效 → 走到 handleDelete 的 findBookByLeaf 拿 null → 404
+ *   口令无效 → 分发层的 hasWriteToken 先拦成 401
+ *              （src/webdav/index.ts:121）
+ * 这条请求不写任何东西，是最便宜也最安全的写口令探针。
+ *
+ * ⚠️ 路径必须落在**叶子上**（`/dav/<集合>/<名字>`，两段），不能是
+ *    `/dav/<集合>/` —— 那会走「集合 DELETE 等价于 Depth: infinity」的
+ *    分支，把整个集合连成员一起删掉。
+ *
+ * 结果不参与「线上是不是新代码」的判定（它验的是凭据不是代码），
+ * 但它决定另外三条写探针是跑还是跳。
+ */
+async function probeWriteToken() {
+  if (writeTokenState === 'absent') return;
+  try {
+    const res = await call('DELETE', `${TMP}_tokencheck.txt`);
+    await res.text();
+    if (res.status === 404) {
+      writeTokenState = 'ok';
+      return;
+    }
+    if (res.status === 401 || res.status === 403) {
+      writeTokenState = 'rejected';
+      results.push({
+        name: '写口令预检（DELETE 不存在的叶子）',
+        status: 'fail',
+        // 打上标记：这个 fail 是**凭据问题**，不该被算进「线上是不是新代码」
+        // 的判定里（见结论区 credentialFail 分支）。
+        kind: 'credential',
+        detail: `${res.status} —— WRITE_TOKEN 被服务端拒绝。**这是凭据问题，不是代码问题**：`
+          + 'CI 的 secret 与 Worker 上的 WRITE_TOKEN 不是同一个值'
+          + '（顺带提醒：ADMIN_TOKEN 不能当写口令用，两者是独立的密钥）',
+      });
+      return;
+    }
+    writeTokenState = 'unknown';
+    results.push({
+      name: '写口令预检（DELETE 不存在的叶子）',
+      status: 'skip',
+      detail: `期望 404 或 401，实际 ${res.status} —— 无法判定口令是否可用`,
+    });
+  } catch (err) {
+    writeTokenState = 'unknown';
+    results.push({
+      name: '写口令预检（DELETE 不存在的叶子）',
+      status: 'skip',
+      detail: String(err.message || err),
+    });
+  }
 }
 
 /**
@@ -125,8 +220,8 @@ function skipWriteProbe(name, detail) {
  */
 async function probeCopyWhitelist() {
   const NAME = 'COPY 扩展名白名单（.exe）';
-  if (!CAN_WRITE) {
-    skipWriteProbe(NAME, '未提供 WRITE_TOKEN —— 落盘后删不掉，不留垃圾（见 CAN_WRITE 处说明）');
+  if (!canWrite()) {
+    skipWriteProbe(NAME, writeGuardDetail());
     return;
   }
   const src = `${TMP}_src.txt`;
@@ -164,8 +259,8 @@ async function probeCopyWhitelist() {
  */
 async function probeUnlockNoToken() {
   const NAME = 'UNLOCK 缺 Lock-Token（RFC §9.11.1）';
-  if (!CAN_WRITE) {
-    skipWriteProbe(NAME, '未提供 WRITE_TOKEN —— 落盘后删不掉，不留垃圾（见 CAN_WRITE 处说明）');
+  if (!canWrite()) {
+    skipWriteProbe(NAME, writeGuardDetail());
     return;
   }
   const name = `${TMP}_lock.epub`;
@@ -215,13 +310,16 @@ async function probeUnlockNoToken() {
  *
  * 修复前 handleMoveCopy 完全不读 Overwrite 头，所以必然 201 并破坏目标。
  *
- * ⚠️ 必须带口令才跑，两个理由：
+ * ⚠️ 必须有**可用**口令才跑，两个理由：
  *
- * ① 不带口令时**无法判定**，且报 fail 是错的 —— 这是线上踩出来的：
- *    CI 的 verify-live job 只传 `--url` 不传 WRITE_TOKEN（见 deploy.yml），
- *    于是它在**代码完全正确**的部署上稳定打印
+ * ① 缺口令时**无法判定**，且报 fail 是错的 —— 这是线上踩出来的：
+ *    CI 的 verify-live job 一开始在**代码完全正确**的部署上稳定打印
  *    `❌ 实际 401` + `结论：线上仍是旧代码`，一次交付被自己的门卫判成
- *    假阴性，差点让我去追一个不存在的 bug。
+ *    假阴性，差点让我去追一个不存在的 bug。当时的原因有两层：
+ *      · 第一版：CI 根本没传 WRITE_TOKEN
+ *      · 第二版：CI 传了，但填的是 ADMIN_TOKEN（无效值）—— 于是
+ *        「传错口令」和「没传口令」在输出上无法区分，两版都栽在这里。
+ *    现在由探针 0（口令预检）把这两件事分开。
  *
  *    401 在这里是**规范要求**，不是缺陷。RFC 4918 §10.6：
  *      「The server MUST do authorization checks before checking this or
@@ -231,15 +329,12 @@ async function probeUnlockNoToken() {
  *    向匿名者泄露「目标位置是否已有资源」。所以覆盖已存在目标时，
  *    无口令必须 401，有口令才轮到 412 出场。
  *
- * ② 它会落盘（PUT src + dst），而无口令时删不掉 —— 见 CAN_WRITE 处的说明。
+ * ② 它会落盘（PUT src + dst），而口令不可用时删不掉 —— 见 writeTokenState 处。
  */
 async function probeOverwrite() {
   const NAME = 'Overwrite: F 撞已有目标（RFC §10.6）';
-  if (!CAN_WRITE) {
-    skipWriteProbe(
-      NAME,
-      '未提供 WRITE_TOKEN —— 无口令时服务端按 RFC 4918 §8.1 先拒授权，且落盘后删不掉',
-    );
+  if (!canWrite()) {
+    skipWriteProbe(NAME, writeGuardDetail());
     return;
   }
   const src = `${TMP}_ov_src.txt`;
@@ -495,7 +590,7 @@ async function probeBookCardsLinkDirectToR2() {
 const ICON = { pass: '✅', fail: '❌', skip: '➖' };
 
 console.log(`线上版本验证：${SITE}`);
-if (!CAN_WRITE) {
+if (writeTokenState === 'absent') {
   console.log('  ⚠️ 未设置 WRITE_TOKEN 环境变量');
   console.log('     三条写探针会跳过：本库 PUT 匿名可写、DELETE 需要口令，');
   console.log('     所以缺口令时探针能造垃圾却清不掉 —— 宁可不测，也不留垃圾。');
@@ -503,6 +598,9 @@ if (!CAN_WRITE) {
 }
 console.log('');
 
+// 先预检口令：不可用就别让三条写探针各自报一次「期望 412 实际 401」，
+// 那种输出会被读成「代码没部署」，而真实原因是凭据配错了。
+await probeWriteToken();
 await probeCopyWhitelist();
 await probeUnlockNoToken();
 await probeOverwrite();
@@ -516,11 +614,16 @@ await probeBookCardsLinkDirectToR2();
 let fail = 0;
 let pass = 0;
 let skip = 0;
+// 凭据类失败单独计：它证明不了线上代码是新的，但也**证伪不了** ——
+// 分不清这两件事正是第四个缺陷的根源（见 writeTokenState 处说明）。
+let credentialFail = 0;
 for (const r of results) {
   console.log(`  ${ICON[r.status]} ${r.name.padEnd(42)} ${r.detail}`);
   if (r.status === 'pass') pass++;
-  else if (r.status === 'fail') fail++;
-  else skip++;
+  else if (r.status === 'fail') {
+    if (r.kind === 'credential') credentialFail++;
+    else fail++;
+  } else skip++;
 }
 
 console.log('');
@@ -532,6 +635,30 @@ if (fail > 0) {
   console.log('    · 部署到了另一个 Worker / 另一个域名');
   console.log('    · 部署失败但 CI 没把它标红（看 Actions 页面的日志）');
   console.log('    · 边缘缓存还没更新（等几十秒重跑本脚本）');
+  process.exit(STRICT ? 1 : 0);
+}
+if (credentialFail > 0) {
+  // ① 故意不打印「线上仍是旧代码」：那是错的结论，而且会把人引向不存在的问题。
+  // ② 但**照样 exit 1**（--strict 下）：红在这里表示「本轮验证没做完」，
+  //    不是「部署坏了」。绿灯才危险 —— 探针里有一条不跑却说「已验证通过」，
+  //    正是这个项目反复在打的假绿（见 deploy.yml 里那句「一个不会失败的
+  //    门卫比没有门卫更糟」）。三条写探针没跑就是没验到，如实报出来。
+  //    deploy job 在 `needs.deploy.result == 'success'` 里独立判过部署，
+  //    这里的红只针对「验证未完成」。
+  console.log(`  结论：**凭据配错**，写探针一条都没验成（${credentialFail} 项）`);
+  console.log('');
+  console.log('  ⚠️ 这不是代码问题 —— 部署本身可能是好的，只是本轮验证没做完。');
+  console.log('     CI 的 WRITE_TOKEN secret 必须与 Worker 上的 WRITE_TOKEN 一致：');
+  console.log('       npx wrangler secret put WRITE_TOKEN');
+  console.log('     ⚠️ ADMIN_TOKEN 不能当写口令用 —— 两者是各自独立的密钥，');
+  console.log('        拿管理口令发 DELETE 一样是 401。');
+  console.log('     订正 secret 后重跑：GitHub → Settings → Secrets → Actions。');
+  // 打 error annotation：Actions 页面上一眼能看到，不必翻日志才知道是配置问题。
+  if (typeof process !== 'undefined' && process.env.GITHUB_ACTIONS === 'true') {
+    console.log('::error title=写口令预检失败（凭据问题，不是代码问题）::'
+      + 'WRITE_TOKEN 与 Worker 上的值不一致，或误填了 ADMIN_TOKEN。'
+      + '三条写探针本轮未运行，其余探针的结论仍然有效。订正后重跑本 job。');
+  }
   process.exit(STRICT ? 1 : 0);
 }
 if (pass > 0) {

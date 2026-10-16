@@ -465,16 +465,15 @@ describe('线上验证探针：不许再报假阴性、不许再留垃圾', () =
 
   it('必须有「能不能收场」的判定，且它挡在三个写探针之前', () => {
     // 判定的名字本身就把结论说清楚了：不是「有没有权限」，是「跑了能不能收场」。
-    expect(src, 'CAN_WRITE 判定不见了').toMatch(/const CAN_WRITE\s*=/);
-    // 且它必须真的**取决于口令**。只断言「存在一个叫 CAN_WRITE 的常量」不够 ——
-    // 变异验证抓到过：把它改成 `const CAN_WRITE = true` 后所有断言照样绿，
-    // 而那正是最坏的形态（守卫看着在、实则永远放行）。
-    expect(src, 'CAN_WRITE 不再取决于口令 —— 守卫被架空了').toMatch(
-      /const CAN_WRITE = TOKEN\.length > 0;/,
-    );
+    //
+    // 它现在是一台**状态机**（writeTokenState）而不是一个常量（CAN_WRITE）：
+    // 「传了口令」不等于「口令有效」，把这两件事压成一个布尔量就会让
+    // 「传错口令」伪装成「线上代码旧」—— 那是线上真踩过的第四个缺陷。
+    expect(src, '写口令状态机不见了').toMatch(/let writeTokenState\s*=/);
+    expect(src, 'canWrite() 判定不见了').toMatch(/function canWrite\(\)/);
 
-    const guardIdx = src.indexOf('const CAN_WRITE');
-    expect(guardIdx, 'CAN_WRITE 不见了').toBeGreaterThan(-1);
+    const guardIdx = src.indexOf('let writeTokenState');
+    expect(guardIdx, 'writeTokenState 不见了').toBeGreaterThan(-1);
 
     // 三个写探针的**函数定义**都必须在判定之后出现。
     // 用函数定义而不是调用点：调用点在后，那是执行顺序；这里要钉的是
@@ -482,12 +481,12 @@ describe('线上验证探针：不许再报假阴性、不许再留垃圾', () =
     for (const fn of ['async function probeCopyWhitelist', 'async function probeUnlockNoToken', 'async function probeOverwrite']) {
       const fnIdx = src.indexOf(fn);
       expect(fnIdx, `${fn} 不见了`).toBeGreaterThan(-1);
-      expect(fnIdx, `${fn} 排在 CAN_WRITE 之前 —— 写这段时看不到「能不能收场」`).toBeGreaterThan(guardIdx);
+      expect(fnIdx, `${fn} 排在口令判定之前 —— 写这段时看不到「能不能收场」`).toBeGreaterThan(guardIdx);
     }
   });
 
-  it('写探针必须被 CAN_WRITE 挡住（缺口令时一个字节都不许写）', () => {
-    // 三个写探针各自的第一句都必须是「没有口令就跳过」的早退。
+  it('写探针必须被口令判定挡住（口令不可用时一个字节都不许写）', () => {
+    // 三个写探针各自的第一句都必须是「口令不可用就跳过」的早退。
     // 这条断言防的是「只在注释里写了要检查、代码却没做」——
     // 那正是上一版的形态：注释说「需要写口令才能跑」，代码照跑。
     const skipCalls = src.match(/skipWriteProbe\(/g) ?? [];
@@ -495,10 +494,10 @@ describe('线上验证探针：不许再报假阴性、不许再留垃圾', () =
     expect(skipCalls.length, `skipWriteProbe 应被 3 个写探针调用，实际出现 ${skipCalls.length} 次`).toBe(4);
   });
 
-  it('Overwrite 探针不许在缺口令时判 fail（401 是规范要求，不是缺陷）', () => {
+  it('Overwrite 探针不许在口令不可用时判 fail（401 是规范要求，不是缺陷）', () => {
     // 曾经的写法直接把任何非 412 判成 fail，于是匿名请求稳定拿到一个 ❌。
-    // 现在它必须在缺口令时走 skip 分支。
-    expect(src, 'Overwrite 探针又变成无条件 fail 了').toMatch(/if \(!CAN_WRITE\) \{[\s\S]{0,200}?skipWriteProbe/);
+    // 现在它必须在口令不可用时走 skip 分支。
+    expect(src, 'Overwrite 探针又变成无条件 fail 了').toMatch(/if \(!canWrite\(\)\) \{[\s\S]{0,200}?skipWriteProbe/);
     // 且论证必须留在源码里 —— 下一个改这里的人要知道 401 是有意为之。
     expect(src, 'RFC 4918 §10.6 的授权优先论证被删了').toContain('10.6');
     expect(src, '§8.1「授权错误优先」的论证被删了').toContain('8.1');
