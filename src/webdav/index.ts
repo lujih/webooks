@@ -40,6 +40,9 @@ import {
   liveLockForResource,
   parseTimeoutHeader,
   releaseLock,
+  releaseLocksForResource,
+  releaseLocksForLeafNames,
+  resourceMatchesLeafName,
   stripBrackets,
   sweepExpiredLocks,
   toCodedUrl,
@@ -178,16 +181,32 @@ async function handleLockedWrite(
   const lock = await liveLockForResource(env.DB, davPath);
   if (lock) {
     // 提取 If 头里的 lock-token；与活锁 token 匹配 → 持锁者，放行。
-    // 两侧都做 stripBrackets 归一：客户端按 §10.5 发来的是 Coded-URL（带括号），
-    // 库里可能还有旧代码存的带括号存量行 —— 任一形态都要能对上。
-    const ifHeader = request.headers.get('if');
-    const ifTokens = ifHeader ? extractLockTokens(ifHeader) : [];
-    if (ifTokens.includes(stripBrackets(lock.token))) {
+    if (ifTokenAuthorizes(request, lock)) {
       return run();
     }
     return lockConflictResponse(lock, davPath);
   }
   return run();
+}
+
+/**
+ * 请求的 `If:` 头里是否提交了这把锁的令牌（RFC 4918 §7.5 / §10.5）。
+ *
+ * 这是「持锁者放行」的**唯一**判据，PUT/DELETE 与 MOVE/COPY 共用一份 ——
+ * 修复前 MOVE/COPY 的锁检查是裸的 `liveLockForResource` 循环、完全不看 If 头，
+ * 于是**持锁者自己也被 423 挡住**（实测：LOCK 叶子 → `MOVE` 带 `If: (<token>)`
+ * → 423，而 RFC 4918 §9.9.1 要求提交正确令牌的请求被授权）。
+ *
+ * 两侧都做 `stripBrackets` 归一：客户端按 §10.5 发来的是 Coded-URL（带括号），
+ * 库里可能还有旧代码存的带括号存量行 —— 任一形态都要能对上。
+ */
+function ifTokenAuthorizes(
+  request: Request,
+  lock: { token: string },
+): boolean {
+  const ifHeader = request.headers.get('if');
+  if (!ifHeader) return false;
+  return extractLockTokens(ifHeader).includes(stripBrackets(lock.token));
 }
 
 function lockConflictResponse(lock: { token: string; resource: string; owner: string | null; type: string; depth: string; timeoutSec: number }, davPath: string): Response {
@@ -537,9 +556,16 @@ async function handleMoveCopy(
   }
 
   // 锁检查：源和目标都不能被锁住（同样用规范路径，与 LOCK/PUT 保持一致）
+  //
+  // ⚠️ 必须认 `If:` 令牌，否则**持锁者自己也被挡**：修复前这里是裸的
+  // `liveLockForResource` 循环，实测 LOCK 叶子后 `MOVE` 带 `If: (<token>)`
+  // 仍然 423 —— 而 §9.9.1 要求提交正确令牌的请求被授权，且 §7.5 明确
+  // If 头的用途就是「让持锁者的请求通过」。判据与 PUT/DELETE 共用
+  // ifTokenAuthorizes()，避免两处逻辑漂移（本任务只做 MOVE/COPY 这一处，
+  // 不实现完整的 If 求值器 —— 那是 docs/webdav-rfc-audit-2026-10-14.md 的 🟠-1）。
   for (const p of [canonicalDavPath(davPath), canonicalDavPath(targetDavPath)]) {
     const lock = await liveLockForResource(env.DB, p);
-    if (lock) return lockConflictResponse(lock, p);
+    if (lock && !ifTokenAuthorizes(request, lock)) return lockConflictResponse(lock, p);
   }
 
   // MOVE：先 COPY 再 DELETE；COPY：复制字节 + D1 新行
@@ -673,7 +699,18 @@ async function handleMoveCopy(
       await env.BUCKET.delete(sourceBook.r2_key);
       await deleteBook(env.DB, sourceBook.id);
     }
-    await releaseLock(env.DB, davPath);
+    // §9.6 的 MUST destroy 同样适用于 MOVE 的源：源路径的资源已经不存在了
+    // （§9.9.1：MOVE 等价于先 COPY 再 DELETE），锁不能残留 —— 否则 TTL 内
+    // 同一路径无法被重新创建，删除者（或搬运者）把自己挡在门外。
+    //
+    // ⚠️ 修复前这里是 `releaseLock(env.DB, davPath)` —— **把资源路径当 token 传**，
+    //   而 releaseLock 的实现是 `DELETE FROM locks WHERE token = ?`，于是匹配零行、
+    //   静默什么都不删。这个错法在 `0b8e38b`（handleUnlock）已经修过一次，`9071c1b`
+    //   又复发了一遍，根因就是两个参数位置相邻且类型都是 string。
+    //   现在的 helper 参数名叫 resourcePath，误用在类型上仍然挡不住，
+    //   但一眼可辨。（本语句原先只有竞态可达 —— 上面的锁检查会先 423；
+    //   缺陷 3 修好后，持锁者带 If 令牌就能走到这里，可达性反而提高了。）
+    await releaseLocksForResource(env.DB, davPath);
   }
 
   await rebuildBuckets(env.DB);
@@ -1098,6 +1135,19 @@ async function handleDelete(env: Env, node: DavNode, davPath: string): Promise<R
     // 榜单缓存失效：书没了，首页的 /api/credits 也要更新（它缓存 1 小时）
     await purgeCreditCache();
 
+    // §9.6 MUST destroy：资源已经不存在了，锁不能残留 —— 否则 TTL（最长 3600s）
+    // 内同一路径**无法被重新创建**，删除者把自己挡在门外（实测：DELETE 带 If
+    // 令牌成功 204 之后，同路径再 PUT 得 423）。
+    //
+    // 两路都清，各覆盖一半：
+    //   · releaseLocksForLeafNames —— 一本书有多个别名路径（按书名/按作者/按格式/
+    //     最近收录…），§9.6 要求把这些路径上的锁一起销毁，否则删了书、另一条
+    //     路径上的锁还在挡同名文件被重新上传；
+    //   · releaseLocksForResource(davPath) —— 精确命中本次请求的那条路径，
+    //     兜住「锁行的末段与 leaf_name 不等」的历史/编码形态。
+    await releaseLocksForLeafNames(env.DB, [book.leaf_name]);
+    await releaseLocksForResource(env.DB, davPath);
+
     return new Response(null, { status: 204 });
   }
 
@@ -1139,8 +1189,10 @@ async function handleDelete(env: Env, node: DavNode, davPath: string): Promise<R
     const candidates = await listBooksInBucket(env.DB, collection, bucket);
     const liveLocks = await allLiveLocks(env.DB);
     for (const [resource, lock] of liveLocks) {
-      const lockedLeaf = decodeURIComponent(resource.slice(resource.lastIndexOf('/') + 1));
-      if (candidates.some((b) => b.leaf_name === lockedLeaf)) {
+      // 用 resourceMatchesLeafName 而不是「把末段解码一次再比」：库里的 resource 与
+      // books.leaf_name 都是 canonicalDavPath() 解过一次的规范形态，再解一次会把
+      // `100%41.epub` 变成 `100A.epub` 而静默失配（见 src/lib/locks.ts 的注释）。
+      if (candidates.some((b) => resourceMatchesLeafName(resource, b.leaf_name))) {
         return lockConflictResponse(lock, resource);
       }
     }
@@ -1151,6 +1203,19 @@ async function handleDelete(env: Env, node: DavNode, davPath: string): Promise<R
       if (b.cover_key) await env.BUCKET.delete(b.cover_key);
     }
     await rebuildBuckets(env.DB);
+
+    // §9.6 MUST destroy：集合与它的成员资源都已经不存在了，锁不能残留。
+    //
+    // 遍历 members 的 leaf_name（而不是只删 `resource = davPath`）：一本书可能同时
+    // 出现在别的集合路径下，而 §9.6 针对的是**资源**，不是「这次请求用的那条路径」。
+    //
+    // 集合**自身**的锁走 releaseLocksForResource（尾斜杠两种形态 + 子树前缀）：
+    // 它的资源路径是 `/最近收录/`，与成员锁（`/最近收录/x.epub`）互不冲突，
+    // 但两行都得删 —— 成员锁在删除前已被上面的 423 检查拦住，集合自身的锁则是
+    // 经 If 令牌放行后才走到这里，不删就残留。
+    await releaseLocksForLeafNames(env.DB, removed.map((b) => b.leaf_name));
+    await releaseLocksForResource(env.DB, davPath);
+
     // 集合内容变了，根导航与该集合的导航都要失效
     await purgeEntries([
       ['/', 1],

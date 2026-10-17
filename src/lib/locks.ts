@@ -19,6 +19,7 @@
 // href 用同一种格式，而 <D:response><D:href> 是编码过的；中文文件名不编码
 // 会让严格解析器读到前后不一致的格式。
 import { encodeHref } from './xml';
+import { canonicalDavPath } from './collections';
 
 export interface LockRow {
   token: string;
@@ -223,8 +224,170 @@ export async function acquireLock(
   };
 }
 
+/**
+ * 按**令牌**释放一把锁。
+ *
+ * ⚠️ 参数是 `token`（形如 `urn:uuid:…` 或存量行的 `<urn:uuid:…>`），
+ * **不是资源路径**。库里有两根轴 —— `token` 与 `resource` —— 类型都是
+ * string，传错位置不会报错，只会**匹配零行、静默什么都不删**。
+ * 这个坑已经踩过两次（`0b8e38b` 的 handleUnlock、`9071c1b` 的 MOVE），
+ * 所以：想按路径销毁请用下面的 `releaseLocksForResource()`。
+ */
 export async function releaseLock(db: D1Database, token: string): Promise<void> {
   await db.prepare(`DELETE FROM locks WHERE token = ?`).bind(token).run();
+}
+
+/** LIKE 的通配符转义（书名里可能有 `_` / `%`，不转义会误伤别的行）。 */
+function escapeLike(s: string): string {
+  return s.replace(/[\\%_]/g, (c) => `\\${c}`);
+}
+
+/**
+ * 取资源路径的**末段**（叶子名）。
+ *
+ * **不解码**：库里 `resource` 的每一段都是 `canonicalDavPath()` 解过一次的规范
+ * 形态（LOCK 分支传进来的正是 `canonicalDavPath()` 的产物），与 `books.leaf_name`
+ * 处在同一坐标系，直接比较即可。
+ *
+ * 反过来「再解一次」会引入一个**静默**的新 bug：URL 里写作 `100%2541.epub` 的名字
+ * 入库是 `100%41.epub`，再解一次得到 `100A.epub` —— 与 `leaf_name` 不等，于是锁
+ * 匹配不上、清不掉，而且**不报错**（比抛异常更难发现；这条是写完测试才抓到的）。
+ * 历史行/异常写入若仍带编码形态，由 `resourceMatchesLeafName` 那条兜底覆盖。
+ */
+export function leafNameOfResource(resource: string): string {
+  return resource.slice(resource.lastIndexOf('/') + 1);
+}
+
+/**
+ * 锁行的 `resource` 是否指向名为 `leafName` 的资源。
+ *
+ * 两条判据，**原样优先**：
+ *   1. 库里末段与 `leaf_name` 直接相等（常规路径：两边都是解过一次的规范形态）；
+ *   2. 否则把末段再安全解码一次比对（兜底：历史行、或绕过
+ *      `canonicalDavPath()` 手工写入的带编码形态）。
+ *
+ * 第 2 条必须是 `safeDecodeSegment` 而不是裸 `decodeURIComponent()`：`%` 是合法
+ * 文件名字符，`100%.epub` 这种末段裸解码会抛 `URIError: URI malformed`；调用点在
+ * 循环里，**表里只要存在这样一行**，循环就中断 —— handleDelete 在删完 D1/R2 之后
+ * 500（客户端看到删除失败而书已经没了），集合 DELETE 的成员锁预检则在删除**之前**
+ * 就 500（一个成员都删不掉）。`%E6` 这种半截转义同理（`decodeDavPath` 的 try/catch
+ * 原样保留它，所以它照样能进库）。
+ */
+export function resourceMatchesLeafName(resource: string, leafName: string): boolean {
+  const leaf = leafNameOfResource(resource);
+  return leaf === leafName || safeDecodeSegment(leaf) === leafName;
+}
+
+/**
+ * 安全解码**单个路径段**（拿不到可读文本就退回原样）。
+ *
+ * ⚠️ 只在「兜底」语境里用（见 `resourceMatchesLeafName` 第 2 条）。库里的
+ * `resource` 已经解过一次，常规路径下再解就是**双重解码**，会把 `100%41.epub`
+ * 变成 `100A.epub` —— 静默失配。
+ *
+ * ⚠️ 形状上必须是「**先切段、再解码这一段**」，不能反过来解整条路径再切：
+ * 后者会把某段里的 `%2F` 解成 `/`，切段边界就错了。
+ */
+export function safeDecodeSegment(segment: string): string {
+  try {
+    return decodeURIComponent(segment);
+  } catch {
+    return segment;
+  }
+}
+
+/**
+ * 按**资源路径**销毁锁 —— 资源被删除时用（RFC 4918 §9.6 的 MUST：
+ * "destroy locks rooted on the deleted resource"）。
+ *
+ * ⚠️ 参数是 `resourcePath`（形如 `/最近收录/x.epub`），**不是 token**。
+ * 传成 token 会匹配零行、静默空操作 —— 这正是 `releaseLock(db, davPath)`
+ * 那个复发的 bug。两者的参数名刻意取成一眼能分辨的样子。
+ *
+ * 语义（为什么不是一个精确匹配就够）：
+ *   1. **尾斜杠两种形态都要删**：LOCK 打到 `/最近收录` 与 `/最近收录/` 会写出
+ *      两行不同的 `resource`（`canonicalDavPath` 保留尾斜杠），但它们指向同一
+ *      个集合。只删一种形态，另一种会残留成「资源没了锁还在」。
+ *   2. **集合要连带子树**：集合 DELETE 等价于 Depth: infinity（§9.6.1），会删掉
+ *      所有成员，所以成员路径上的锁也必须销毁。前缀带尾斜杠，避免
+ *      `/最近收录/形态/` 误匹配 `/最近收录/形态学/x.epub`。
+ *      （成员锁在删除前已被成员检查 423 拦住，这里是防竞态与别名路径的兜底。）
+ *   3. **根 `/` 绝不做前缀匹配** —— `/` 的前缀会命中全库每一把锁。
+ *
+ * 路径会先走 `canonicalDavPath()` 归一：**这是本函数最容易被忽略的一步**。
+ * 入库的 `resource` 是规范形态（LOCK 的入口就是 `canonicalDavPath(davPath)`），
+ * 而调用方拿到的是 **URL 里的原始路径** —— 同一个集合有别名写法
+ * （`/recent/` ↔ `/最近收录/`、`/按书名/A` ↔ `/title/A`、以及 `%E6%9C%80…`
+ * 这种百分号编码形态）。只做 `decodeDavPath` 不够：它解决 `%E6%9C%80`，
+ * 但解决不了 `/recent/` 这种**别名** —— 实测在真机上就是这么漏的：
+ *
+ *   LOCK   /dav/recent/          → 200，行 resource = "/最近收录/"
+ *   DELETE /dav/recent/  If: (…) → 204，**集合自身的锁没被删掉**
+ *   PUT    /dav/recent/x.epub    → 423   ← 锁残留把自己挡在门外
+ *
+ * 单测当时全绿，因为测试里写的是规范形态 `/最近收录/`（原始路径 == 规范路径），
+ * 别名这条路根本没被走到。所以这里用 canonicalDavPath，让**调用方传什么形态
+ * 都对**，而不是要求每个调用点自己记得先归一。
+ *
+ * 返回实际删掉的行数（调用方可据此判断，而不是靠猜）。
+ */
+export async function releaseLocksForResource(
+  db: D1Database,
+  resourcePath: string,
+): Promise<number> {
+  const decoded = canonicalDavPath(resourcePath);
+  // 去掉尾斜杠作为「基名」，两种形态（有无尾斜杠）都用它匹配
+  const base = decoded.length > 1 && decoded.endsWith('/') ? decoded.slice(0, -1) : decoded;
+
+  if (base === '/' || base === '') {
+    // 根：只删根锁本身。前缀匹配会清空全库的锁（含别的客户端正在用的锁）。
+    const res = await db.prepare(`DELETE FROM locks WHERE resource = ?`).bind('/').run();
+    return res.meta?.changes ?? 0;
+  }
+
+  const res = await db
+    .prepare(
+      `DELETE FROM locks
+        WHERE resource = ? OR resource = ? OR resource LIKE ? ESCAPE '\\'`,
+    )
+    .bind(base, `${base}/`, `${escapeLike(base)}/%`)
+    .run();
+  return res.meta?.changes ?? 0;
+}
+
+/**
+ * 按**叶子名**销毁锁（一本书可能同时出现在多个集合路径下）。
+ *
+ * 为什么需要它：锁键是路径，而同一本书有多个别名路径
+ * （`/按书名/A/q.epub`、`/按格式/epub/q.epub`、`/最近收录/q.epub`）。
+ * 删掉一本书时，只有把它**所有**别名路径上的锁一起销毁，
+ * §9.6 的「destroy locks rooted on the deleted resource」才算真的做到 ——
+ * 否则删了书、另一个路径上的锁还挡着同名文件被重新创建。
+ *
+ * 匹配方式与 handleDelete 的成员锁检查一致：看资源路径的**末段**
+ * （`leaf_name` 全局唯一，所以末段相等即同一本书）。
+ * 不过滤过期行：书没了，过期行也是垃圾，顺手清掉。
+ */
+export async function releaseLocksForLeafNames(
+  db: D1Database,
+  leafNames: readonly string[],
+): Promise<number> {
+  if (leafNames.length === 0) return 0;
+  const wanted = new Set(leafNames);
+  const { results } = await db
+    .prepare(`SELECT token, resource FROM locks`)
+    .all<{ token: string; resource: string }>();
+  let removed = 0;
+  for (const row of results ?? []) {
+    // 原样优先（常规路径：两边都是解过一次的规范形态），解码兜底（历史行/异常写入）。
+    // 为什么不能只解一次比对、以及为什么兜底必须用 safeDecodeSegment 而不是裸
+    // decodeURIComponent，都写在 resourceMatchesLeafName 的注释里。
+    const leaf = leafNameOfResource(row.resource);
+    if (!wanted.has(leaf) && !wanted.has(safeDecodeSegment(leaf))) continue;
+    await releaseLock(db, row.token);
+    removed++;
+  }
+  return removed;
 }
 
 /**

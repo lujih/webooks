@@ -48,6 +48,8 @@ npm run deploy
 
 ```bash
 node scripts/dav-probe.mjs --url https://你的域名/dav/
+# 写路径（LOCK / DELETE / MOVE / 覆盖）需要写口令，不带口令时这些动词只会看到 401
+node scripts/dav-probe.mjs --url https://你的域名/dav/ --user x --pass "$WRITE_TOKEN"
 ```
 
 ---
@@ -496,6 +498,8 @@ curl -X POST "https://你的域名/api/admin/purge?path=/title/A/" -H "Authoriza
 ```bash
 # ① DAV 一致性 + 边缘动词放行 + Expect: 100-continue
 node scripts/dav-probe.mjs --url https://你的域名/dav/
+#    再带口令跑一遍，才能把写路径也验证到（否则 LOCK/DELETE/MOVE 只会看到 401）
+node scripts/dav-probe.mjs --url https://你的域名/dav/ --user x --pass "$WRITE_TOKEN"
 
 # ② 请求体体积边界（100 MB 天花板在哪、超限时什么表现）
 node scripts/size-probe.mjs --url https://你的域名/dav/ --dry-run   # 先看计划
@@ -506,7 +510,8 @@ node scripts/size-probe.mjs --url https://你的域名/dav/             # 再真
 
 | 分组 | 检查内容 |
 |---|---|
-| **动词放行** | PROPFIND / PROPPATCH / MKCOL / COPY / MOVE / LOCK / UNLOCK 是否真的到达 Worker。**它会区分「源站按设计拒绝」和「边缘拦截」** —— 后者意味着整套方案要改 |
+| **动词放行** | PROPFIND / PROPPATCH / MKCOL / COPY / MOVE / LOCK / UNLOCK / DELETE / PUT 是否真的到达 Worker。**它会区分「源站按设计拒绝」和「边缘拦截」** —— 后者意味着整套方案要改 |
+| **凭据路径** | 写动词现在需要写口令（见下）。不带口令时它们返回的 401 是**自家 Worker 的凭据闸门**（`www-authenticate: Basic realm="webooks"`），探针记为 INFO 并在结论区写「N 个写动词的凭据路径未验证」；**带了口令仍 401 才算 FAIL**（口令错） |
 | Depth 语义 | 0 / 1 / 缺失 / infinity 四种情况的实际返回 |
 | 协议声明 | OPTIONS 的 `DAV` 头，以及「声明 Class 2 但没实现 LOCK」这类谎言 |
 | PROPFIND | allprop / propname / 未知属性进 404 propstat / 空 body（对应 litmus `props` 套件） |
@@ -514,7 +519,14 @@ node scripts/size-probe.mjs --url https://你的域名/dav/             # 再真
 | 编码 | 中文文件名与 href 的百分号编码 |
 | **Expect: 100-continue** | 用**原始套接字**手写 HTTP/1.1 —— fetch 会自己处理掉这个握手。这正是 r2-webdav 的 litmus `http` 套件挂掉的点 |
 
-退出码：有 FAIL 时为 1。「按设计拒绝」（如 LOCK 返回 501）记为 INFO，不算失败。
+退出码：有 FAIL 时为 1。「按设计拒绝」（如未带口令时 LOCK 返回 401）记为 INFO，不算失败。
+
+**不带 `--pass` 跑出来的「0 失败」不等于写路径已验证。** 写动词（LOCK / DELETE /
+MOVE / 覆盖已有书）需要写口令 —— 不带凭据时它们只会返回 401，探针记 INFO 而不是
+FAIL。所以结论区会额外打印一条 `⚠ N 个写动词的凭据路径未验证`，并提醒：**不带凭据
+时探针清理也删不掉自己写进去的文件**，`__probe_*` 会永久留在书库里（「清理」分组会
+逐条列出残留文件名）。要真正验证写路径，带上写口令重跑；若带了口令仍 401，那才是
+真失败（口令错），探针会报 `✘ 已提供凭据但被拒`。
 
 ### 关于真正的 litmus
 

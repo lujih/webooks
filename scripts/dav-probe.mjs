@@ -91,22 +91,59 @@ function originReached(res, body) {
   // Worker 自己加的标记头（PROPFIND 的 207 响应没有 Allow/DAV 头，只能靠这个认）
   if (res.headers.get('x-dav-entries') !== null) return true;
   if (res.headers.get('x-dav-cache') !== null) return true;
+
+  // ★ 凭据闸门：401 + `WWW-Authenticate: Basic realm="webooks"` 是**自家 Worker**
+  //   的固定形态（src/lib/auth.ts 的 unauthorizedResponse()，realm 是它的默认值）。
+  //   边缘/WAF 拦截**不会**替我们发 Basic 挑战 —— 它只会回 HTML/403。
+  //
+  //   少了这一条，LOCK / DELETE / MOVE 这些要求写口令的动词（task-10 起闸门在
+  //   分发层）在未带凭据时全部落进 classifyFailure() 的 unknown，结论区于是
+  //   打印「主因判定：Cloudflare 边缘没有把这些动词转发到 Worker」——
+  //   而请求其实早就到达 Worker、是 Worker 自己回的 401。这是**假诊断**，
+  //   比不报还坏：它会让人去查 WAF 规则，而真正该做的是补一个写口令。
+  //
+  //   判据必须连 realm 一起认：裸 401 也可能来自前置的 Cloudflare Access，
+  //   那种情况确实不该当成「自家源站已经答上了」。
+  const wwwAuth = res.headers.get('www-authenticate') ?? '';
+  if (res.status === 401 && /realm="webooks"/.test(wwwAuth)) return true;
+
   const text = (body ?? '').slice(0, 800);
   if (/<D:multistatus/.test(text)) return true;
+  // ★ 自家 Worker 生成的 DAV XML 错误/成功体（RFC 4918 §16 的 `<D:error>` 根元素，
+  //   以及 §9.10.1 的 LOCK 200 `<D:prop>`）。
+  //
+  //   少了这一条，**UNLOCK** 会重演同一个假诊断：匿名 UNLOCK 不带 Lock-Token
+  //   时按 §9.11.1 回 400，正文正是
+  //   `<D:error xmlns:D="DAV:"><D:lock-token-matches-request-uri/></D:error>`
+  //   —— 没有 Allow/DAV/x-dav-* 任何一个头，四句正文也不匹配，于是
+  //   originReached() 判否、classifyFailure() 归到 unknown（400 不是 5xx/401/403/405），
+  //   最后照样打印「主因判定：Cloudflare 边缘没有把这些动词转发到 Worker」。
+  //   实测：光修 401 那条，匿名跑法仍然是这个假结论（红灯在
+  //   test/dav-probe.behavior.test.mjs 的 A1）。
+  //
+  //   判据用 `xmlns:D="DAV:"`：DAV 命名空间前缀是**我们自己**拼的（见
+  //   src/lib/xml.ts 与各 handler 的模板字符串），而边缘/WAF 拦截页是 HTML，
+  //   不会出现这个命名空间。它比逐个列举根元素稳，新增 DAV XML 响应也不必回来改。
+  if (/xmlns:D="DAV:"/.test(text)) return true;
   if (/Collections are virtual|not implemented|Properties are read-only|Not Found/i.test(text)) return true;
   return false;
 }
 
 /**
- * 把失败归类。这三种情况处置完全不同，绝不能混为一谈：
+ * 把失败归类。这四种情况处置完全不同，绝不能混为一谈：
  *
  *   worker-crash  5xx 且响应体形如 "error code: 1101"  → 请求已经到达 Worker，
  *                 是 Worker 自己的代码抛了异常。
  *                 ⚠️ 典型误区是把它当成「边缘拦了 WebDAV 动词」——但边缘拦截
  *                    只影响 PROPFIND/MKCOL 这类自定义动词，不会影响 GET/OPTIONS；
  *                    而且边缘的拦截页是 HTML/403，不会是 1101。
+ *   auth-required 401 + `WWW-Authenticate: Basic realm="webooks"` → 也到达了
+ *                 Worker，是自家凭据闸门（写动词需要口令）。见 originReached()。
  *   edge-block    403/405 且响应里没有任何 Worker 标记     → 边缘/WAF 拦截。
  *   unknown       归不了类，如实报告，不猜。
+ *
+ * ⚠️ `auth-required` 的 detail 必须给出可执行的下一步（--pass 用法），
+ *   光说「需要认证」等于把诊断工作推给读输出的人。
  */
 function classifyFailure(res, body) {
   const text = (body ?? '').slice(0, 2000);
@@ -121,6 +158,15 @@ function classifyFailure(res, body) {
     return {
       kind: 'worker-crash',
       detail: `Worker 运行时异常（Cloudflare ${cfCode}）—— 请求已到达 Worker，是代码抛异常，不是边缘拦截`,
+    };
+  }
+  const wwwAuth = res.headers.get('www-authenticate') ?? '';
+  if (res.status === 401 && /realm="webooks"/.test(wwwAuth)) {
+    return {
+      kind: 'auth-required',
+      detail:
+        '请求已到达源站：这是本站自己的凭据闸门（写动词需要写口令），不是边缘拦截。'
+        + '用 --pass <WRITE_TOKEN> 重跑即可验证写路径',
     };
   }
   if (res.status === 403 || res.status === 405) {
@@ -150,6 +196,10 @@ async function probeVerbs() {
   const verbs = ['OPTIONS', 'PROPFIND', 'PROPPATCH', 'MKCOL', 'COPY', 'MOVE', 'LOCK', 'UNLOCK', 'DELETE', 'PUT'];
   const blocked = [];
   const crashed = [];
+  /** 未带凭据时被自家闸门挡下的动词 —— 结论区据此提示「写路径未验证」 */
+  const needsAuth = [];
+  /** 给了凭据仍被拒的动词 —— 这才是真 fail（口令错/权限不足） */
+  const rejected = [];
 
   for (const verb of verbs) {
     let res;
@@ -163,21 +213,70 @@ async function probeVerbs() {
       continue;
     }
 
+    // ★ 5xx 必须在 originReached() **之前**判定。
+    //
+    //   ⚠️ 顺序不是风格问题：裸 500 的正文（"Internal Server Error"）既没有
+    //     Allow/DAV 头也没有 DAV XML，originReached() 判否 → 掉进下面那个
+    //     「边缘没转发」分支 → 结论区打印
+    //     「主因判定：Cloudflare 边缘没有把这些动词转发到 Worker」。
+    //     而真相是 Worker 自己抛了异常。实测：本地 wrangler dev 的崩就是这种
+    //     裸 500（不带 cf-error-code），所以这条分支是**日常**会走到的，不是边角。
+    //
+    //   判据是状态码本身：`/health` 已经证明链路通（预检在上面），随后所有
+    //   动词 5xx —— 边缘拦截只影响 PROPFIND/MKCOL 这类自定义动词、且回
+    //   HTML/403，绝不会对 GET/OPTIONS 也回 5xx。
+    if (res.status >= 500) {
+      const verdict = classifyFailure(res, body);
+      record('动词放行', verb, 'fail',
+        verdict.kind === 'worker-crash'
+          ? verdict.detail
+          : `HTTP ${res.status} —— Worker 自己回的错误（请求已到达源站，不是边缘拦截）`);
+      crashed.push(`${verb} → HTTP ${res.status}`);
+      continue;
+    }
+
     if (!originReached(res, body)) {
       const verdict = classifyFailure(res, body);
-      if (verdict.kind === 'worker-crash') {
-        // Worker 自己崩了，这个动词通没通已经无从谈起 —— 先记 crash，不记 blocked
-        record('动词放行', verb, 'fail', verdict.detail);
-        crashed.push(verdict.detail);
-      } else {
-        record('动词放行', verb, 'fail', verdict.detail);
-        blocked.push(verb);
-      }
-    } else {
-      record('动词放行', verb, 'pass', `HTTP ${res.status}（已到达源站）`);
+      record('动词放行', verb, 'fail', verdict.detail);
+      blocked.push(verb);
+      continue;
     }
+
+    // 已到达源站。**401 单独处理**（写动词的凭据闸门）。
+    //
+    // ⚠️ 判据必须落在**状态码**上，不能只看 classifyFailure 的 kind：
+    //   kind 的判定一旦漏了（改坏/改名），401 就会掉进下面的 pass 分支，
+    //   于是「缺凭据」被报成「动词放行正常」—— 比报错更坏，因为它假装
+    //   验证过了。状态码是唯一不会漂的判据。
+    if (res.status === 401) {
+      if (authHeader) {
+        // 已经给了凭据还是 401 —— 说明口令不对（或权限不足）。
+        // 这必须是 fail：脚本带着口令跑出全绿，人就会以为写路径是通的。
+        record('动词放行', verb, 'fail',
+          'HTTP 401 —— 已带凭据仍被拒，口令错误或权限不足（不是「边缘拦截」）');
+        rejected.push(verb);
+      } else {
+        // 没给凭据 → 这条动词的凭据路径**根本没验证过**。
+        // 记 info 而不是 fail：这不是站点的缺陷，是本次调用缺输入。
+        record('动词放行', verb, 'info',
+          'HTTP 401 —— 到达源站，该动词需要写口令；本次未提供凭据（--pass <WRITE_TOKEN>）');
+        needsAuth.push(verb);
+      }
+      continue;
+    }
+
+    // 4xx 且不是自家源站（没有 Allow/DAV/x-dav-* 头、也不是自家 DAV XML）：
+    // 这才有「边缘没转发」的意义。
+    if (res.status >= 400 && !originReached(res, body)) {
+      const verdict = classifyFailure(res, body);
+      record('动词放行', verb, 'fail', verdict.detail);
+      blocked.push(verb);
+      continue;
+    }
+
+    record('动词放行', verb, 'pass', `HTTP ${res.status}（已到达源站）`);
   }
-  return { blocked, crashed };
+  return { blocked, crashed, needsAuth, rejected };
 }
 
 // ── B. Depth 语义 ─────────────────────────────────────────────────────
@@ -256,16 +355,45 @@ async function probeConformance() {
     `HTTP ${emptyBody.status}`);
 
   // 写路径往返
+  //
+  // ⚠️ 凭据闸门（task-10 起在分发层）：本段有两处需要写口令的地方 ——
+  //   · PUT **覆盖**已有书（handlePut：existing && !onlyIfAbsent → 401）
+  //   · 清理用的 DELETE（分发层无条件要口令）
+  //   PUT **新建**保持匿名，所以无凭据时前半截照样通过、后半截是 401。
+  //   那种 401 要如实说成「本次没验证过」，不能记成站点失败。
   const name = `__probe_${Date.now()}.epub`;
   const payload = `probe-payload-${Date.now()}`;
+  const leafPath = `./recent/${encodeURIComponent(name)}`;
 
-  const put = await req(`./recent/${encodeURIComponent(name)}`, {
+  const put = await req(leafPath, {
     method: 'PUT', body: payload, headers: { 'content-type': 'application/epub+zip' },
   });
-  record('写入', 'PUT 新建返回 201', put.status === 201 ? 'pass' : 'fail', `HTTP ${put.status}`);
+  const putBody = await put.text().catch(() => '');
+  if (put.status === 201) {
+    record('写入', 'PUT 新建返回 201', 'pass', 'HTTP 201（新建保持匿名）');
+  } else if (classifyFailure(put, putBody).kind === 'auth-required') {
+    // 新建本应匿名。真拿到 401 = 闸门位置变了，如实报（但别混进「站点坏了」）
+    record('写入', 'PUT 新建返回 201', 'info',
+      'HTTP 401 —— 新建被凭据闸门挡下，与本仓库「新增保持匿名」的设定不符，请核对分发层');
+  } else {
+    record('写入', 'PUT 新建返回 201', 'fail', `HTTP ${put.status}`);
+  }
 
-  const putAgain = await req(`./recent/${encodeURIComponent(name)}`, { method: 'PUT', body: payload });
-  record('写入', 'PUT 覆盖返回 204', putAgain.status === 204 ? 'pass' : 'fail', `HTTP ${putAgain.status}`);
+  const putAgain = await req(leafPath, { method: 'PUT', body: payload });
+  const putAgainBody = await putAgain.text().catch(() => '');
+  const overwriteVerdict = classifyFailure(putAgain, putAgainBody);
+  if (putAgain.status === 204) {
+    record('写入', 'PUT 覆盖返回 204', 'pass', 'HTTP 204');
+  } else if (overwriteVerdict.kind === 'auth-required' && !authHeader) {
+    record('写入', 'PUT 覆盖返回 204', 'info',
+      'HTTP 401 —— 覆盖已有书需要写口令（设计如此，见 handlePut）；本次未提供凭据，故未验证');
+  } else if (overwriteVerdict.kind === 'auth-required') {
+    // 带了凭据还是 401 → 口令错。必须 fail，否则「带口令跑出全绿」是假的
+    record('写入', 'PUT 覆盖返回 204', 'fail',
+      'HTTP 401 —— 已带凭据仍被拒，口令错误或权限不足（不是「边缘拦截」）');
+  } else {
+    record('写入', 'PUT 覆盖返回 204', 'fail', `HTTP ${putAgain.status}`);
+  }
 
   const listed = await req('./recent/', { method: 'PROPFIND', headers: { depth: '1' } });
   const listedXml = await listed.text();
@@ -341,13 +469,52 @@ async function probeConformance() {
       href ? `href = ${href}` : '响应里没有 href');
   }
 
-  // 清理
+  // ── 清理 ────────────────────────────────────────────────────────────
+  //
+  // ⚠️ 这里**绝不许静默失败**。本段前面的 PUT 已经在真实书库里落了两个
+  //   `__probe_*` / `__探针_*` 对象；DELETE 是需要写口令的（分发层无条件
+  //   要凭据），所以**不传凭据跑探针必然删不掉** —— 如果不报出来，每跑一次
+  //   探针就往线上书库糊一个永久垃圾文件，而且没人会知道。
+  //
+  //   修复前这里就是 `await req(...).catch(() => {})`：既不看状态码也不看
+  //   正文，401 被完全吞掉。下面按状态码逐个判定并记 fail/warn。
+  const leftovers = [];
   for (const n of [name, cjk]) {
-    await req(`./recent/${encodeURIComponent(n)}`, { method: 'DELETE' }).catch(() => {});
+    const del = await req(`./recent/${encodeURIComponent(n)}`, { method: 'DELETE' }).catch((err) => err);
+    if (del instanceof Error) {
+      record('清理', `DELETE ${n}`, 'fail', `请求异常：${del.message}`);
+      leftovers.push(n);
+      continue;
+    }
+    const delBody = await del.text().catch(() => '');
+    if (del.status === 204 || del.status === 404) continue; // 删掉或本来就没落盘
+    if (classifyFailure(del, delBody).kind === 'auth-required') {
+      // 这是无凭据跑法的**必然**结果，不是站点缺陷 —— 但垃圾是真的留下了
+      record('清理', `DELETE ${n}`, authHeader ? 'fail' : 'warn',
+        authHeader
+          ? 'HTTP 401 —— 已带凭据仍被拒，探针文件留在书库里了，请手工清理'
+          : 'HTTP 401 —— DELETE 需要写口令，探针文件留在了书库里（用 --pass 重跑可自动清掉）');
+    } else {
+      record('清理', `DELETE ${n}`, 'fail', `HTTP ${del.status} —— 探针文件可能仍在书库里`);
+    }
+    leftovers.push(n);
   }
-  const afterDelete = await req(`./recent/${encodeURIComponent(name)}`, { method: 'PROPFIND', headers: { depth: '0' } });
-  record('删除', 'DELETE 后访问返回 404', afterDelete.status === 404 ? 'pass' : 'fail',
-    `HTTP ${afterDelete.status}`);
+  for (const n of leftovers) {
+    // 把「留了什么垃圾」写进结论区，让人能照着清
+    record('清理', `残留文件：${n}`, 'info',
+      `书库里还剩 /最近收录/${n}（可用 POST /api/admin/delete 带 {"leafNames":["${n}"]} 清理）`);
+  }
+
+  // 只有前面的 DELETE 真成功了，这条才有意义 —— 否则量到的是「垃圾还在」
+  // 而不是「DELETE 的语义对不对」。
+  if (leftovers.length === 0) {
+    const afterDelete = await req(`./recent/${encodeURIComponent(name)}`, { method: 'PROPFIND', headers: { depth: '0' } });
+    record('删除', 'DELETE 后访问返回 404', afterDelete.status === 404 ? 'pass' : 'fail',
+      `HTTP ${afterDelete.status}`);
+  } else {
+    record('删除', 'DELETE 后访问返回 404', 'skip',
+      '清理未成功，跳过（否则测到的是残留文件而不是 DELETE 语义）');
+  }
 }
 
 // ── D. Expect: 100-continue（原始套接字）───────────────────────────────
@@ -470,10 +637,25 @@ async function probeExpectContinue() {
   } else {
     record('Expect: 100-continue', 'PUT 结果', 'pass', `最终 ${r.status}`);
   }
-  // 清理
+  // 清理（与 probeConformance 同一套要求：DELETE 需要写口令，失败必须报出来）
   await req('./recent/', { method: 'PROPFIND', headers: { depth: '1' } }).catch(() => {});
-  const cleanup = await req(`./recent/${encodeURIComponent(path.split('/').pop())}`, { method: 'DELETE' }).catch(() => null);
-  if (cleanup) await cleanup.text().catch(() => {});
+  const probeLeaf = String(path.split('/').pop());
+  const cleanup = await req(`./recent/${encodeURIComponent(probeLeaf)}`, { method: 'DELETE' }).catch((err) => err);
+  if (cleanup instanceof Error) {
+    record('Expect: 100-continue', '探针文件清理', 'fail', `请求异常：${cleanup.message}`);
+    return;
+  }
+  const cleanupBody = await cleanup.text().catch(() => '');
+  if (cleanup.status === 204 || cleanup.status === 404) return;
+  if (classifyFailure(cleanup, cleanupBody).kind === 'auth-required') {
+    record('Expect: 100-continue', '探针文件清理', authHeader ? 'fail' : 'warn',
+      authHeader
+        ? 'HTTP 401 —— 已带凭据仍被拒，探针文件留在书库里了，请手工清理'
+        : `HTTP 401 —— DELETE 需要写口令，残留 /最近收录/${probeLeaf}（用 --pass 重跑可自动清掉）`);
+  } else {
+    record('Expect: 100-continue', '探针文件清理', 'fail',
+      `HTTP ${cleanup.status} —— 残留 /最近收录/${probeLeaf}`);
+  }
 }
 
 // ── 主流程 ────────────────────────────────────────────────────────────
@@ -522,7 +704,7 @@ async function main() {
     process.exit(1);
   }
 
-  const { blocked, crashed } = await probeVerbs();
+  const { blocked, crashed, needsAuth, rejected } = await probeVerbs();
   await probeDepth();
   await probeConformance();
   await probeExpectContinue();
@@ -542,10 +724,37 @@ async function main() {
   const fails = results.filter((r) => r.status === 'fail');
   const warns = results.filter((r) => r.status === 'warn');
   const passes = results.filter((r) => r.status === 'pass');
+  const infos = results.filter((r) => r.status === 'info');
 
   console.log('');
   console.log('='.repeat(74));
-  console.log(`${passes.length} 通过 · ${warns.length} 警告 · ${fails.length} 失败 · ${results.length} 项`);
+  console.log(
+    `${passes.length} 通过 · ${warns.length} 警告 · ${fails.length} 失败 · ${results.length} 项`
+    + (infos.length > 0 ? `（其中 ${infos.length} 条 INFO）` : ''),
+  );
+
+  // ── 哪些内容「没被验证」────────────────────────────────────────────
+  //
+  // ⚠️ 这一节的存在理由：没有凭据时，写动词全被 401 挡下、清理也删不掉，
+  //   而这些都是 info（不是 fail）—— 于是「0 失败」看起来像「一切都好」。
+  //   实际上写路径**一个字都没验证过**。不把这件事说出来，全绿就是误读。
+  if (needsAuth.length > 0 || rejected.length > 0) {
+    console.log('');
+    if (rejected.length > 0) {
+      console.log(`${C.red}✘ 已提供凭据但被拒：${rejected.join(', ')}${C.reset}`);
+      console.log('  口令不对（或权限不足）。请核对 WRITE_TOKEN 后重跑 —— 这不代表边缘有问题。');
+    }
+    if (needsAuth.length > 0) {
+      console.log(`${C.yellow}⚠ ${needsAuth.length} 个写动词的凭据路径未验证：${needsAuth.join(', ')}${C.reset}`);
+      console.log('  它们返回的都是自家 Worker 的 401（www-authenticate: Basic realm="webooks"）——');
+      console.log('  请求已经到达源站，只是本次调用没带写口令。要真正验证写路径，请带上凭据重跑：');
+      console.log('');
+      console.log('    node scripts/dav-probe.mjs --url <本站>/dav/ --user x --pass <WRITE_TOKEN>');
+      console.log('');
+      console.log('  注意：不带凭据时 DELETE 也会被拒，探针落盘的 __probe_* 文件会留在书库里');
+      console.log('  （上面的「清理」分组会逐条列出残留文件名，可走 /api/admin/delete 清掉）。');
+    }
+  }
 
   if (fails.length > 0) {
     console.log('');
@@ -559,6 +768,11 @@ async function main() {
     } else if (blocked.length > 0) {
       console.log('主因判定：Cloudflare 边缘没有把这些动词转发到 Worker。');
       console.log('这是本项目最大的未知数，需要据此调整方案（例如把写入收敛到 POST + 预签名直传）。');
+    } else {
+      // 没有 blocked 也没有 crashed，却仍有 fail：那都是具体探针的失败，
+      // 不能再去猜「边缘拦没拦」—— 曾经这里什么都不打，读者只能自己猜。
+      console.log('主因判定：没有整体性故障（动词与 /health 都到达了源站），');
+      console.log('上面的失败项是具体行为不符，逐条看 detail 即可。');
     }
   }
   process.exit(fails.length > 0 ? 1 : 0);

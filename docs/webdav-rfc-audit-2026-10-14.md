@@ -331,7 +331,24 @@ curl -i -X LOCK "$B/按书名/A/q.epub" --data-binary '…lockinfo…'
 curl -i -X DELETE "$B/按书名/A/" -H "X-Write-Token: $T"   # → 204，锁内的书没了
 ```
 
-**建议修法**：集合删除前先取活锁集合 `allLiveLocks(env.DB)`，凡 `matchLocksToPaths` 命中本次将被删路径的，就返回 207，并在 `<D:response>` 里逐条给 `<D:status>HTTP/1.1 423 Locked</D:status><D:error><D:lock-token-submitted><D:href>…</D:href></D:lock-token-submitted></D:error>`（§9.6.2 示例，L2512-L2519）。同时对**已删除资源上的锁**执行 `releaseLock`（§9.6 的 MUST destroy）。
+**状态：已修复**（本条实际是三个独立缺陷，逐个定论）
+
+1. **成员锁被无视** —— 已修复（`1e9306c`）。修法不是本条原先建议的 207 逐条，而是**在删除前整体拒绝**：`handleDelete` 的集合分支先用**只读**的 `listBooksInBucket` 取候选、再取 `allLiveLocks(env.DB)`，凡命中候选的 leaf_name 就 `return lockConflictResponse(lock, resource)`（423）。
+   - 为什么不用 207：集合删除只删 D1/R2，成员一个都没删成功就整体不删，退回 423 比「删了一半再回报 207」对客户端更安全（207 会让同步引擎以为部分成功）。
+   - 修的过程中踩到一个值得记的坑：最初用 `deleteBooksInBucket`（边翻页边 DELETE）当候选来源，于是「检查时行已经没了」，锁检查永远查不到东西 → 必须用只读的 `listBooksInBucket`。
+   - 比对只看末段 `leaf_name`：叶子是全局唯一查找，同一本书在任何桶下都指向同一资源，锁不该因路径写法不同而失效。
+
+2. **`releaseLock` 传的是资源路径（§9.6 MUST destroy 未实现）** —— 已修复（本次，task-13）。`handleDelete` 的成功路径原先完全不碰 locks 表，集合分支同样不碰：删掉的书在 TTL（最长 3600s）内**无法被同一路径重新创建**（DELETE 204 后同路径 PUT → 423）。修法：
+   - 新增 `releaseLocksForResource(db, resourcePath)` —— 参数名刻意叫 `resourcePath` 防复发（「路径与 token 都是 string」这个坑已踩两次：`0b8e38b` 的 `handleUnlock`、`9071c1b` 的 MOVE）；尾斜杠两种形态 + 子树 `LIKE '…/%'` 都覆盖；根路径只删根锁本身（前缀匹配会清空全库的锁）。
+   - 新增 `releaseLocksForLeafNames(db, leafNames)` —— 一本书有多个别名路径（按书名/按作者/按格式/最近收录），§9.6 针对的是**资源**而不是「这次请求用的那条路径」。
+   - 叶子 DELETE / 集合 DELETE / MOVE 源 / 管理后台 `/api/admin/delete` 四处都接上了。
+   - MOVE 分支里那句 `await releaseLock(env.DB, davPath)`（把路径当 token，`9071c1b` 引入）已被 `releaseLocksForResource` 取代 —— 原语句只匹配零行、静默空操作。
+
+3. **`deleteBooksInBucket` 疑似漏删 R2 对象** —— **不成立**（已核实）。当前 `handleDelete` 集合分支明确遍历 `for (const b of removed)` 删 `b.r2_key` 与 `b.cover_key`；本条当初的「需另行确认」以实测为准：无泄漏。
+
+**验证**（`test/lock-lifecycle.test.ts`，7 例）：`LOCK → 带 If 令牌 DELETE → 204` 后断言 `SELECT token, resource FROM locks` **为空**（DB 事实）**且**同一路径再 PUT 得 **201**（用户可见状态码）；集合删除后集合自身锁 + 成员残留锁都清空；别名路径（`/recent/` 这种 ASCII 形态）建的集合锁也必须能按别名路径删掉；MOVE 后源锁清空；admin delete 后清空。每组都带**负向控制**（不带 If 令牌仍 423），否则「锁整个不生效了」会让所有断言一起假绿。变异验证 6 组全部变红（详见 task-13 报告）。
+
+> 别名那条是**真机验证时抓到的漏网**：helper 最初只做 `decodeDavPath`（管百分号编码，不管别名），而单测的路径恰好全都是规范形态，于是「LOCK `/recent/` → DELETE `/recent/`」在真机上留下 `resource = /最近收录/` 的残锁、单测却全绿。现在 helper 用 `canonicalDavPath` 归一，并补了这条回归用例（变异：把归一改回 `decodeDavPath` → 该条变红）。
 
 ---
 
@@ -355,6 +372,9 @@ PUT /dav/按书名/A/if.epub   If: (<urn:uuid:11111111-1111-1111-1111-1111111111
 > While the Overwrite header appears to duplicate the functionality of using an "If-Match: *" header, **If-Match applies only to the Request-URI, and not to the Destination of a COPY or MOVE.** — §10.6（L3919-L3922）
 
 **建议修法**：`src/lib/preconditions.ts` 目前只处理 If-Match/If-None-Match。建议新增一个最小可用的 `If` 求值器：解析 `List` 序列（`(Cond | [etag] | Not Cond)*`），对 Request-URI 与 Destination 两个 resource-tag 分别求值，任一 tag 下所有 list 全失败即 412；**不要**只做正则抽 token。同时把 §10.4.1 第二用途记在注释里 —— token 出现在 `If` 里即算「已提交」，与是否求值通过无关。
+
+**进展（task-13，部分修复）**：本条**只**解决了「MOVE/COPY 完全不看 `If` 头」这一个子问题 —— 修复前 `handleMoveCopy` 的锁检查是裸的 `liveLockForResource` 循环，导致**持锁者自己带正确令牌也被 423**（违反 §9.9.1）。现在 MOVE/COPY 的锁检查复用 `ifTokenAuthorizes()`（与 PUT/DELETE 同一判据：`extractLockTokens(ifHeader)` ∩ `stripBrackets(lock.token)`）。
+完整的 `If` 求值器（含 `[etag]`、`Not`、多 resource-tag、无锁时的 412）**仍未实现**，本条其余部分继续有效。
 
 ### 🟠-2 `If-Match` 用了**弱比较**（剥掉 `W/` 前缀），且 `If-Match` 与 `If-None-Match` 语义被同一条代码路径处理
 
@@ -730,7 +750,7 @@ README 记录：Depth 缺失按 1 处理。代码 `resolveDepth`（`src/webdav/p
 
 ## 修复优先级建议
 
-1. **立刻**（数据丢失）：🔴-1 MOVE 自毁、🔴-9 DELETE 集合删掉锁定成员、🔴-3 覆盖时 R2 孤儿泄漏
+1. **立刻**（数据丢失）：🔴-1 MOVE 自毁、🔴-9 DELETE 集合删掉锁定成员、🔴-3 覆盖时 R2 孤儿泄漏 —— 三条均已修复（🔴-9 的成员锁部分见 `1e9306c`；其 §9.6 MUST destroy 部分见 task-13）
 2. **本迭代**（协议正确性）：🔴-4 `activelock`、🔴-2 `Overwrite`、🟠-4 LOCK 刷新 412、🟠-8 UNLOCK 400
 3. **下迭代**：🔴-5/🔴-6/🔴-7 锁属性与解析、🟠-1 `If` 头求值、🟠-2 强比较、🟠-5/🟠-6 LOCK 状态码与 Depth
 4. **可排期**：🟠-3 条件请求顺序、🟡 全部

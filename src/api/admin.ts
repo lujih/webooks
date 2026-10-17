@@ -27,6 +27,7 @@ import {
 import { sniffKindFromBucket } from '../lib/kind-sniff';
 import { r2HttpMetadata } from '../lib/r2';
 import { hasAdminToken } from '../lib/auth';
+import { releaseLocksForLeafNames } from '../lib/locks';
 import { handleAdminRequests, handleCreditBoard, handleCreditPurge } from './requests';
 import { jsonResponse, textResponse } from '../lib/http';
 import {
@@ -264,6 +265,13 @@ async function deleteBooks(env: Env, cfg: Settings, request: Request): Promise<R
   }
 
   if (deleted.length > 0) {
+    // §9.6 MUST destroy：书没了，它在**所有别名路径**上的锁也必须销毁。
+    // 管理后台按 leaf_name 删书，而一把锁的 resource 是某条具体路径
+    // （`/最近收录/x.epub`、`/按书名/A/x.epub`…），只删一条路径会留下
+    // 「资源已不存在、锁还在」的残行 —— TTL 内会挡住同名文件被重新上传。
+    // 与 WebDAV 的 DELETE 用同一个 helper，判据（末段 leaf_name）也保持一致。
+    await releaseLocksForLeafNames(env.DB, deleted);
+
     await rebuildBuckets(env.DB);
     // 让读者侧的目录缓存立刻失效，否则删掉的书在 TTL 内仍会显示。
     // 路径段必须与 nodePath() 一致（中文），否则缓存键对不上、失效没有效果。
