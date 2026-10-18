@@ -7,19 +7,24 @@
  *   知道「该传什么」—— 这是书库从「谁传了什么」变成「大家需要什么」
  *   的关键一步。
  *
- * 设计取舍：
- *   · 页面本身静态（零依赖、内联 CSS/JS），列表用 fetch 拿 ——
- *     这样新增一条求书不需要重新生成 HTML，且列表可以分页
- *   · 表单用原生 fetch 提交，不刷新页面；提交后局部刷新列表
- *   · ⚠️ 样式**全部**来自 lib/theme.ts，不再自造一套。
- *     上一版这里自成体系（自造 .wrap/header/panel/button/输入框、
- *     19 个硬编码圆角、max-width 960px），结果是这个页面看起来
- *     像另一个产品 —— 而它和首页、浏览页是同一个站。
- *   · 数字「N 人求」不做成 badge/药丸：那会让每个条目都变成一颗
- *     徽章，而「有多少人在求」是辅助信息。改用右对齐的数字，
- *     与首页的上传者榜单同一套「记录行」语言。
+ * ── 版面：这是一本**登记簿**，不是一张表单 + 一个列表 ──
  *
- * 数据来自 /api/requests（见 src/api/requests.ts）。
+ * 全站的身份是「目录页 / 借阅登记簿」：编号、纸色细线、右对齐的
+ * 等宽数字列。这个页面把那一套语言推到最前面 ——
+ *
+ *   · 写下来：两行下划线字段 + 一颗按钮，像在登记簿上添一行；
+ *   · 正在找的书：每行一个行号、书名、作者、时间，最右是**求的人数**。
+ *     行号是真实的序号，不是装饰 —— 它让「第 14 个人在求这本书」读起来
+ *     像一条记录，而不是一张卡片。
+ *
+ * 「N 人求」不做成徽章/药丸：那会让每行都变成一颗徽章，而求的人数是
+ * 辅助信息，右对齐的数字列就够了。
+ *
+ * ⚠️ 上一版这里有一处隐形的坏味道：列表行写了 `opacity:0` +
+ *   `animation:up .45s forwards`，而 `up` 这组 keyframes 在改版后的
+ *   theme 里已经不存在了 —— 动画不会运行，`forwards` 也就不生效，
+ *   于是 `opacity:0` **永久生效**，整张清单是隐形的。
+ *   现在没有入场动画：静态页面就该立刻可读。
  */
 
 import { themeCss } from './lib/theme';
@@ -32,130 +37,132 @@ export function requestsHtml(): string {
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <link rel="icon" href="/favicon.ico" sizes="32x32">
 <title>求书墙 · webooks</title>
-<style>${themeCss()}
+<style>
+${themeCss()}
 
-  /* ── 页头：与其余页面统一用 .bar-head（见 browse/upload/admin）── */
-  .bar-head{display:flex;align-items:baseline;gap:var(--s3);flex-wrap:wrap;margin-bottom:var(--s5)}
-  .mk{font-family:var(--serif);font-size:1.05rem;letter-spacing:.3em;color:var(--glow)}
-  .mk a{color:inherit;text-decoration:none}
-  .back{margin-left:auto;font-size:.8rem;font-family:var(--serif);letter-spacing:.08em}
-
-  h1{
-    font-family:var(--serif);font-weight:400;
-    font-size:clamp(1.6rem,4.5vw,2.2rem);letter-spacing:.03em;
-    margin-bottom:var(--s3);
-  }
-  .lede{color:var(--paper-dim);max-width:38rem;line-height:1.8;margin-bottom:var(--s5)}
-
-  /* ── 提交表单 ── */
-  /* 用下划线而不是方框：这是页面上唯一的输入区，
-     做成「写在纸上的两行」比做成卡片更轻，也符合书库的语气。 */
-  .ask{border-top:1px solid var(--line);padding-top:var(--s4);margin-bottom:var(--s6)}
+  /* ── 写下来 ── */
+  .ask{border-top:1px solid var(--rule-strong);padding-top:var(--s4);margin:var(--s6) 0 var(--s8)}
   form{
-    display:grid;gap:var(--s3);align-items:end;
-    grid-template-columns:minmax(0,2fr) minmax(0,1.4fr) auto;
+    display:grid;gap:var(--s3) var(--s4);align-items:end;
+    grid-template-columns:minmax(0,1.7fr) minmax(0,1.1fr) auto;
   }
-  @media(max-width:640px){form{grid-template-columns:1fr}}
-  label{display:block;font-size:.8rem;color:var(--paper-dim);margin-bottom:var(--s2);letter-spacing:.04em}
+  .field{display:flex;flex-direction:column;gap:var(--s1);min-width:0}
+  label{font-size:var(--fz-sm);color:var(--paper-dim);letter-spacing:.04em}
   /* 不写「（必填）」「（不知道可以不填）」这类括号补充 ——
-     第一个是 placeholder 里的示例，第二个用 optional 表达更轻。
-     必填由 required 属性表达，不需要文案重复一遍。 */
-  .opt{opacity:.6}
+     前者由 required 属性表达，后者用「可留空」三个字更轻。 */
+  .opt{color:var(--paper-faint)}
   input[type=text]{
-    width:100%;padding:.7rem .2rem;font:inherit;font-size:1rem;color:var(--paper);
-    background:transparent;
-    border:0;border-bottom:1px solid var(--line-soft);
-    border-radius:0;
-    transition:border-color var(--dur) var(--ease);
+    width:100%;min-height:44px;padding:.5rem 0;
+    font:inherit;font-size:1rem;color:var(--paper);
+    background:transparent;border:0;border-radius:0;
+    border-bottom:1px solid var(--edge);
+    transition:border-bottom-color var(--dur) var(--ease);
   }
-  input[type=text]::placeholder{color:var(--paper-dim);opacity:.55}
-  input[type=text]:hover{border-bottom-color:var(--line)}
-  input[type=text]:focus{outline:none;border-bottom-color:var(--glow)}
-  /* 键盘焦点必须有可见形态 —— 下划线变琥珀 + 上方留出描边空间 */
-  input[type=text]:focus-visible{outline:2px solid var(--glow);outline-offset:6px}
+  input[type=text]:hover{border-bottom-color:var(--brass)}
+  input[type=text]:focus{outline:none;border-bottom-color:var(--brass)}
+  /* 键盘焦点必须有可见形态，不能只改下划线颜色 */
+  input[type=text]:focus-visible{outline:2px solid var(--brass);outline-offset:4px}
+  form .btn{align-self:end}
 
   /* ── 消息 ── */
-  .msg{margin-top:var(--s4);font-size:.88rem;min-height:1.2em;line-height:1.6}
+  .msg{margin-top:var(--s3);font-size:var(--fz-sm);line-height:1.7;min-height:1.4em}
   .msg.ok{color:var(--ok)}
   .msg.err{color:var(--er)}
   .msg.info{color:var(--paper-dim)}
 
-  /* ── 求书清单 ── */
+  /* ── 清单 ── */
   .wall-head{
     display:flex;align-items:baseline;gap:var(--s3);flex-wrap:wrap;
-    border-top:1px solid var(--line);padding-top:var(--s4);
-    margin-bottom:var(--s3);
+    padding-bottom:var(--s2);border-bottom:1px solid var(--rule-strong);
   }
   .wall-head h2{
-    font-family:var(--serif);font-weight:400;font-size:1.1rem;
-    letter-spacing:.1em;margin:0;color:var(--paper);
+    font-family:var(--serif);font-weight:400;font-size:.95rem;
+    letter-spacing:.12em;color:var(--paper-dim);
   }
-  .count{font-size:.8rem;color:var(--paper-dim);font-family:var(--serif);letter-spacing:.06em}
+  .count{font-size:var(--fz-xs);color:var(--paper-faint);font-variant-numeric:tabular-nums}
+  /* 「看更多」是交互元素，所以用黄铜；它足够小，不抢主按钮 */
   .more{
-    margin-left:auto;font-size:.82rem;color:var(--glow);
-    background:none;border:0;padding:0;cursor:pointer;
-    min-height:44px; /* 触控目标 */
+    margin-left:auto;display:inline-flex;align-items:center;
+    min-height:44px;padding:0;font:inherit;font-size:var(--fz-sm);
+    color:var(--brass);background:none;border:0;cursor:pointer;
+    /* 下划线用 text-decoration：它附着在文字上，
+       而 min-height:44px 撑高的盒子若用 border-bottom，
+       那条线会飘在文字下方二十像素处。 */
+    text-decoration:underline;text-decoration-color:transparent;
+    text-underline-offset:.34em;text-decoration-thickness:1px;
   }
-  .more:hover{color:var(--glow-bright)}
+  .more:hover{color:var(--brass-lift);text-decoration-color:var(--edge-warm)}
 
-  /* 记录行：横线分隔的密集列表，与首页榜单同一套语言。
-     刻意**不做成卡片** —— 每条一个圆角方框会让页面变成 SaaS 列表。 */
-  ul{list-style:none;padding:0;margin:0}
+  ul{list-style:none}
+  /* 一行 = 一条登记。行号是真实序号，不是装饰。 */
   li.rq{
-    display:flex;align-items:baseline;gap:var(--s3);
-    padding:var(--s3) 0;
-    border-bottom:1px solid var(--line-soft);
-    opacity:0;animation:up .45s var(--ease) forwards;
+    display:grid;grid-template-columns:2.4rem minmax(0,1fr) auto auto;
+    align-items:baseline;gap:var(--s2) var(--s4);
+    padding:.66rem 0;border-bottom:1px solid var(--rule);
   }
+  .rn{
+    font-family:var(--mono);font-size:.72rem;color:var(--paper-faint);
+    font-variant-numeric:tabular-nums;letter-spacing:.04em;
+  }
+  .rmain{min-width:0}
   /* 书名：衬线，与书库里的书名同族 */
-  .rtitle{font-family:var(--serif);font-size:1.05rem;letter-spacing:.02em;color:var(--paper);line-height:1.4}
+  .rtitle{font-family:var(--serif);font-size:1.02rem;letter-spacing:.01em;color:var(--paper);line-height:1.45;word-break:break-word}
   /* 作者是补充信息，用次要色，不加「· 」前缀（那是 meta 串的模板腔） */
-  .rauthor{font-size:.85rem;color:var(--paper-dim);margin-left:var(--s2)}
-  .rwhen{font-size:.78rem;color:var(--paper-dim);white-space:nowrap;margin-left:auto;font-variant-numeric:tabular-nums}
-  /* 「N 人求」用琥珀 —— 这是这一行里唯一值得被注意的信息 */
+  .rauthor{font-size:var(--fz-sm);color:var(--paper-dim);margin-left:var(--s2)}
+  .rwhen{
+    font-family:var(--mono);font-size:.72rem;color:var(--paper-faint);
+    white-space:nowrap;font-variant-numeric:tabular-nums;
+  }
+  /* 「N 人求」是这一行里唯一值得被注意的信息 —— 也是全页唯一的黄铜数字 */
   .rhits{
-    font-family:var(--mono);font-size:.78rem;color:var(--glow);
-    white-space:nowrap;min-width:4.5em;text-align:right;
+    font-family:var(--mono);font-size:.78rem;color:var(--brass);
+    white-space:nowrap;min-width:4.6em;text-align:right;
     font-variant-numeric:tabular-nums;
   }
 
   /* 空状态：说明「为什么空」并给出下一步 */
-  .empty{
-    padding:var(--s6) var(--s4);text-align:center;
-    border:1px dashed var(--line-soft);border-radius:var(--r1);
-    color:var(--paper-dim);line-height:1.9;
-  }
-  .empty b{font-family:var(--serif);color:var(--paper);font-weight:400;font-size:1.05rem;letter-spacing:.04em}
-  .empty a{color:var(--glow)}
+  .empty{margin-top:var(--s6)}
+  .empty a{color:var(--brass)}
 
-  @media(prefers-reduced-motion:reduce){
-    li.rq{animation:none!important;opacity:1!important}
+  /* ── 响应式：手机上把行号让给「时间」一行 ── */
+  @media (max-width:640px){
+    form{grid-template-columns:1fr;gap:var(--s3)}
+    form .btn{width:100%}
+    .ask{margin-bottom:var(--s7)}
+  }
+  @media (max-width:560px){
+    li.rq{grid-template-columns:minmax(0,1fr) auto;gap:2px var(--s3);padding:.6rem 0}
+    .rn{display:none}
+    .rmain{grid-column:1;grid-row:1}
+    .rhits{grid-column:2;grid-row:1}
+    .rwhen{grid-column:1;grid-row:2}
+    .rauthor{display:inline;margin-left:.5em}
   }
 </style>
 </head>
 <body>
 <div class="wrap">
 
-  <div class="bar-head reveal" style="animation-delay:.03s">
+  <div class="bar-head">
     <span class="mk"><a href="/">we·books</a></span>
-    <a class="back" href="/">← 回到首页</a>
+    <a class="back" href="/">回到书库</a>
   </div>
 
-  <h1 class="reveal" style="animation-delay:.08s">找不到想看的书</h1>
-  <p class="lede reveal" style="animation-delay:.12s">
+  <h1>找不到想看的书</h1>
+  <p class="lede">
     写下书名，它会出现在下面的清单里。有人手上有这本就会来上传 ——
-    上架之后管理员会把它从清单里划掉。同一本书会合并成一条，求的人越多越靠前。
+    上架之后管理员会把它从清单里划掉。同一本书合并成一条，求的人越多越靠前。
   </p>
 
-  <section class="ask reveal" style="animation-delay:.16s">
+  <section class="ask">
     <form id="f">
-      <div>
+      <div class="field">
         <label for="title">书名</label>
         <input type="text" id="title" name="title" required maxlength="120"
                placeholder="例如：三体" autocomplete="off">
       </div>
-      <div>
-        <label for="author">作者 <span class="opt">（不知道可以不填）</span></label>
+      <div class="field">
+        <label for="author">作者 <span class="opt">可留空</span></label>
         <input type="text" id="author" name="author" maxlength="80"
                placeholder="例如：刘慈欣" autocomplete="off">
       </div>
@@ -165,19 +172,19 @@ export function requestsHtml(): string {
   </section>
 
   <section class="wall">
-    <div class="wall-head reveal" style="animation-delay:.2s">
+    <div class="wall-head">
       <h2>正在找的书</h2>
       <span class="count" id="count"></span>
       <button class="more" id="more" hidden>看更多</button>
     </div>
     <ul id="list"></ul>
     <div class="empty" id="empty" hidden>
-      <b>清单还是空的</b><br>
-      上面写第一本 —— 有书的人看到就会传上来。
+      <b>清单还是空的</b>
+      <span>上面写第一本 —— 有书的人看到就会传上来。</span>
     </div>
   </section>
 
-  <footer class="site-foot reveal" style="animation-delay:.5s">
+  <footer class="site-foot">
     <span class="lamps" aria-hidden="true"><i></i><i></i><i></i></span>
     <span>webooks · 匿名开放 · 无需注册</span>
     <a href="/">首页</a>
@@ -213,13 +220,21 @@ export function requestsHtml(): string {
   }
 
   function render(rows, append){
-    if (!append) listEl.innerHTML = '';
+    if (!append) listEl.textContent = '';
     var frag = document.createDocumentFragment();
+    var base = append ? shown - rows.length : 0;
     rows.forEach(function (r, i) {
       var li = document.createElement('li');
       li.className = 'rq';
-      // 逐条浮现，但延迟封顶 —— 50 条各自 delay 会让最后一条等太久
-      li.style.animationDelay = Math.min(i * 0.02, 0.4) + 's';
+
+      // 行号：登记簿上的序号。它不是装饰 —— 它让「第几条」可被指认。
+      var n = document.createElement('span');
+      n.className = 'rn';
+      n.textContent = String(base + i + 1).padStart(2, '0');
+      li.appendChild(n);
+
+      var main = document.createElement('span');
+      main.className = 'rmain';
 
       // ⚠️ 求书内容是匿名提交的，**必须**转义。
       //   这里用 textContent 而不是 innerHTML —— 天然免疫，
@@ -227,14 +242,15 @@ export function requestsHtml(): string {
       var title = document.createElement('span');
       title.className = 'rtitle';
       title.textContent = r.title;
-      li.appendChild(title);
+      main.appendChild(title);
 
       if (r.author) {
         var author = document.createElement('span');
         author.className = 'rauthor';
         author.textContent = r.author;
-        li.appendChild(author);
+        main.appendChild(author);
       }
+      li.appendChild(main);
 
       var when = document.createElement('span');
       when.className = 'rwhen';
@@ -297,7 +313,7 @@ export function requestsHtml(): string {
         form.reset();
         document.getElementById('title').focus();
         shown = 0;
-        listEl.innerHTML = '';
+        listEl.textContent = '';
         load(false);
       })
       .catch(function(){

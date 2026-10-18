@@ -2,7 +2,7 @@
  * 上传页（/upload）—— 支持批量。
  *
  * 单文件、无构建步骤，内联 CSS/JS，直接由 Worker 提供。
- * 复用 lib/theme 的设计系统（「深夜图书馆」），与首页/目录页同一套视觉语言。
+ * 复用 lib/theme 的设计系统（「开架目录」），与首页/目录页同一套视觉语言。
  *
  * 每个文件的流程：
  *   人机验证取令牌 → init 拿预签名 URL → 浏览器直传 R2（进度）→ complete 登记元数据
@@ -16,10 +16,26 @@
 import { ALLOWED_UPLOAD_FORMATS, EBOOK_FORMATS, COMIC_FORMATS } from './lib/collections';
 import { themeCss } from './lib/theme';
 
-export function uploadHtml(turnstileSiteKey: string | null): string {
+// mountPath 有默认值：测试直接调 uploadHtml(null) 不传第二参，
+// 而页脚那条「进入书库」链接必须是真实的挂载路径（可以配成根挂载 ''）。
+export function uploadHtml(turnstileSiteKey: string | null, mountPath = '/dav'): string {
   // accept 用归一化后的格式列表；浏览器据此过滤文件选择框
   const accept = ALLOWED_UPLOAD_FORMATS.map((f) => `.${f}`).join(',');
-  const formatList = [...EBOOK_FORMATS, ...COMIC_FORMATS].join(' / ');
+  // 格式逐个列成小块，而不是拼成一句逗号汤 —— 后者在手机上会折成三行，
+  // 没人会去读。
+  //
+  // 但 22 个方块平铺是一堵墙：读者看不出「EPUB 和 CBT 不是一类东西」。
+  // 按电子书 / 漫画分成两行，每行一句话说得清 —— 这正是这两个数组
+  // 在 lib/collections 里被分开定义的原因，之前只是没用上。
+  const chipRow = (label: string, formats: readonly string[]): string =>
+    `<div class="fmtrow"><span class="fmtkind">${label}</span><span class="fmtlist">` +
+    formats.map((f) => `<span>${f.toUpperCase()}</span>`).join('') +
+    '</span></div>';
+  const formatChips =
+    chipRow('电子书', EBOOK_FORMATS) + chipRow('漫画', COMIC_FORMATS);
+  // 页脚「进入书库」：指向书库根目录。mountPath 可以是空串（根挂载），
+  // 那样书库根就是站点根 '/', 否则是 '/dav/'。两种都要正确。
+  const mountHref = mountPath === '' ? '/' : `${mountPath}/`;
 
   return `<!doctype html>
 <html lang="zh-CN"><head><meta charset="utf-8">
@@ -28,94 +44,136 @@ export function uploadHtml(turnstileSiteKey: string | null): string {
 <title>上架书籍 · webooks</title>
 <style>
 ${themeCss()}
-  /* ── 页头 ── */
-  .bar-head{display:flex;align-items:baseline;gap:var(--s3);margin-bottom:var(--s5)}
-  .mk{font-family:var(--serif);font-size:1.05rem;letter-spacing:.3em;color:var(--glow)}
-  .mk a{color:inherit;text-decoration:none}
-  .back{margin-left:auto;font-size:.8rem;font-family:var(--serif);letter-spacing:.08em}
-  h1{font-family:var(--serif);font-weight:400;font-size:clamp(1.6rem,4.5vw,2.2rem);letter-spacing:.03em;margin-bottom:var(--s2)}
-  .sub{color:var(--paper-dim);font-size:.92rem;line-height:1.75;margin-bottom:var(--s5);max-width:40rem}
 
-  /* ── 拖放区 ── */
+  /* ── 页头（theme 里的 .bar-head / .mk / .back / h1 直接用，不再各写一套） ── */
+  .sub{color:var(--paper-dim);font-size:.95rem;line-height:1.9;max-width:40rem;margin-bottom:var(--s6)}
+  .sub b{color:var(--paper);font-weight:600}
+
+  /* ── 拖放区 ──
+     不是一个大虚线框：先用一条实线起头，标题写在左上，
+     说明在下面，右端是「选择文件」这个动作。虚线只画在真正
+     「把东西丢进来」的那块区域上，把它压到下方一行高的窄条里。 */
+  .dropwrap{border-top:2px solid var(--brass);background:var(--wash-warm)}
   #drop{
-    border:2px dashed var(--line);border-radius:var(--r3);
-    padding:var(--s7) var(--s4);text-align:center;cursor:pointer;
-    background:rgba(0,0,0,.22);
-    transition:border-color var(--dur) var(--ease),background var(--dur) var(--ease),transform var(--dur) var(--ease);
+    display:grid;grid-template-columns:minmax(0,1fr) auto;
+    align-items:center;gap:var(--s4) var(--s5);
+    padding:var(--s5) var(--s5) var(--s5) var(--s4);
+    cursor:pointer;
   }
-  #drop:hover{border-color:var(--glow);background:rgba(255,180,77,.05)}
-  #drop.drag,#drop.over{border-color:var(--glow);background:rgba(255,180,77,.1);transform:scale(1.008)}
-  .dropmark{color:var(--glow);opacity:.85;margin-bottom:var(--s3)}
-  .droptitle{font-family:var(--serif);font-size:1.15rem;letter-spacing:.05em}
-  .droptitle a{color:var(--glow);border-bottom:1px solid var(--glow);text-decoration:none}
-  .droptitle a:hover{color:var(--glow-bright)}
-  /* 留名行：在拖放区**外面**，独立成一条。
-     视觉上刻意弱于拖放区（无虚线大边框、字号更小）——
-     它是可选的附注，不是主操作。 */
-  .creditbar{
-    display:flex;align-items:center;gap:10px;flex-wrap:wrap;
-    margin:var(--s3) 0 0;padding:10px 14px;
-    border:1px solid var(--line-soft);border-radius:var(--r1);
-    background:rgba(0,0,0,.18);
+  #drop:hover{background:rgba(220,168,95,.1)}
+  #drop.drag,#drop.over{background:rgba(220,168,95,.16)}
+  #drop:focus-visible{outline:2px solid var(--brass);outline-offset:-3px}
+  .droptitle{
+    font-family:var(--serif);font-size:1.18rem;letter-spacing:.03em;
+    color:var(--paper);line-height:1.5;
   }
-  .creditbar label{font-size:.86rem;color:var(--paper-dim);white-space:nowrap}
-  .creditbar input{
-    flex:1;min-width:150px;padding:8px 11px;font:inherit;font-size:.92rem;
-    color:var(--paper);background:var(--ink-2);
-    border:1px solid var(--line);border-radius:var(--r1);
+  .droptitle em{font-style:normal;color:var(--brass);border-bottom:1px solid var(--edge-warm)}
+  .dropsub{grid-column:1/-1;font-size:var(--fz-sm);color:var(--paper-dim);line-height:1.7}
+  /* 「选择文件」是这一页唯一的主按钮，所以它是唯一的实心黄铜 */
+  .droppick{
+    display:inline-flex;align-items:center;justify-content:center;gap:var(--s2);
+    min-height:44px;padding:.6rem 1.2rem;
+    font-size:.95rem;font-weight:600;white-space:nowrap;
+    background:var(--brass);color:#0b100e;
+    border:1px solid var(--brass);border-radius:var(--r1);
+    transition:background var(--dur) var(--ease),border-color var(--dur) var(--ease);
   }
-  .creditbar input:focus{outline:2px solid var(--glow);outline-offset:1px}
-  .creditbar .tip{font-size:.8rem;color:var(--paper-dim);opacity:.75}
-  .hint{color:var(--paper-dim);font-size:.83rem;margin-top:var(--s3)}
+  #drop:hover .droppick{background:var(--brass-lift);border-color:var(--brass-lift)}
+  .dropmark{display:none}
   input[type=file]{display:none}
 
-  /* ── 队列 ── */
-  #queueWrap{margin-top:var(--s5);display:none}
-  #queueWrap.show{display:block;animation:up .4s var(--ease) forwards}
-  .qhead{
-    display:flex;align-items:baseline;gap:var(--s3);flex-wrap:wrap;
-    padding-bottom:var(--s3);border-bottom:1px solid var(--line);margin-bottom:var(--s3);
+  /* ── 留名：可选，视觉上必须弱于拖放区 ──
+     它与「接受格式」并排成两列，而不是各自占一整行 ——
+     这两条都是附注，不该把主操作推下去。 */
+  .meta{
+    display:grid;grid-template-columns:minmax(0,1.2fr) minmax(0,1fr);
+    gap:var(--s4) var(--s6);margin-top:var(--s5);
+    padding-top:var(--s4);border-top:1px solid var(--rule);
   }
-  .qhead .qt{font-family:var(--serif);font-size:1rem;letter-spacing:.04em}
-  .qhead .qs{color:var(--paper-dim);font-size:.82rem;margin-left:auto}
-  .qbar{height:4px;background:rgba(0,0,0,.5);border-radius:999px;overflow:hidden;border:1px solid var(--line-soft);margin-bottom:var(--s4)}
-  .qbar>i{display:block;height:100%;width:0;background:linear-gradient(90deg,var(--glow-deep),var(--glow));transition:width .3s var(--ease)}
+  .field{display:flex;flex-direction:column;gap:var(--s1);min-width:0}
+  .field label{font-size:var(--fz-sm);color:var(--paper-dim);letter-spacing:.04em}
+  .field .tip{font-size:var(--fz-xs);color:var(--paper-faint)}
+  #credit{
+    width:100%;min-height:44px;padding:.5rem 0;
+    font:inherit;font-size:1rem;color:var(--paper);
+    background:transparent;border:0;border-radius:0;
+    border-bottom:1px solid var(--edge);
+    transition:border-bottom-color var(--dur) var(--ease);
+  }
+  #credit:hover{border-bottom-color:var(--brass)}
+  #credit:focus{outline:none;border-bottom-color:var(--brass)}
+  #credit:focus-visible{outline:2px solid var(--brass);outline-offset:4px}
 
-  ul.q{list-style:none;padding:0;margin:0;display:flex;flex-direction:column;gap:var(--s2)}
+  /* ── 接受格式：列出格式，而不是一句逗号汤 ──
+     每个格式一个小块，等宽、方角。它读起来像一份清单，而不是一段话。 */
+  .fmtrow{display:grid;grid-template-columns:3.4rem minmax(0,1fr);gap:var(--s3);align-items:baseline}
+  .fmtrow+.fmtrow{margin-top:var(--s2)}
+  /* nowrap：3 个汉字在 3.4rem 里刚好放得下，别再被挤成竖排 */
+  .fmtkind{font-size:var(--fz-xs);color:var(--paper-faint);letter-spacing:.02em;white-space:nowrap}
+  .fmtlist{display:flex;flex-wrap:wrap;gap:4px}
+  /* 不用描边框：16 个方块并排、每个都有一圈边，远看会连成一个大方框，
+     而框里的内容并没有被框起来的意思。改成极淡的底色块 ——
+     它在深底上是一个小小的「一档」，不会连成墙。 */
+  .fmtlist span{
+    font-family:var(--mono);font-size:.68rem;letter-spacing:.04em;
+    padding:1px 5px;color:var(--paper-dim);background:var(--wash);
+  }
+  .fmtlabel{font-size:var(--fz-sm);color:var(--paper-dim);letter-spacing:.04em}
+
+  /* ── 队列 ── */
+  #queueWrap{margin-top:var(--s7);display:none}
+  #queueWrap.show{display:block}
+  #queueWrap>.qhead{
+    display:flex;align-items:baseline;gap:var(--s3);flex-wrap:wrap;
+    padding-bottom:var(--s2);border-bottom:1px solid var(--rule-strong);
+  }
+  .qhead .qt{font-family:var(--serif);font-size:.95rem;letter-spacing:.12em;color:var(--paper-dim)}
+  .qhead .qs{font-size:var(--fz-xs);color:var(--paper-faint);margin-left:auto;font-variant-numeric:tabular-nums}
+  /* 总进度：一条细线，不是一根胶囊。走黄铜。 */
+  .qbar{height:2px;background:var(--rule);overflow:hidden;margin-bottom:var(--s4)}
+  .qbar>i{display:block;height:100%;width:0;background:var(--brass);transition:width .3s var(--ease)}
+
+  ul.q{list-style:none;display:block;border-top:1px solid var(--rule)}
   li.qi{
-    display:flex;gap:var(--s3);align-items:flex-start;
-    padding:var(--s3);border:1px solid var(--line-soft);border-radius:var(--r2);
-    background:rgba(0,0,0,.2);
+    display:grid;grid-template-columns:auto minmax(0,1fr);align-items:start;
+    gap:var(--s2) var(--s3);
+    padding:.6rem 0;border-bottom:1px solid var(--rule);
   }
-  li.qi.uploading{border-color:var(--line);background:rgba(255,180,77,.05)}
-  li.qi.done{border-color:rgba(126,217,87,.35)}
-  li.qi.error{border-color:rgba(255,107,107,.45);background:rgba(255,107,107,.05)}
-  li.qi.skip{opacity:.6}
   .qmark{
-    width:22px;height:22px;flex:0 0 auto;margin-top:1px;
+    width:1.5rem;height:1.5rem;flex:0 0 auto;margin-top:1px;
     display:flex;align-items:center;justify-content:center;
-    font-size:.72rem;font-family:var(--mono);border-radius:50%;
-    border:1px solid var(--line-soft);color:var(--paper-dim);
+    font-family:var(--mono);font-size:.7rem;
+    color:var(--paper-faint);border:1px solid var(--rule-strong);border-radius:var(--r1);
   }
-  li.qi.uploading .qmark{border-color:var(--glow);color:var(--glow)}
-  li.qi.done .qmark{border-color:var(--ok);color:var(--ok)}
-  li.qi.error .qmark{border-color:var(--er);color:var(--er)}
-  .qbody{flex:1;min-width:0}
-  .qname{font-size:.9rem;word-break:break-all;line-height:1.45}
-  .qsub{color:var(--paper-dim);font-size:.78rem;margin-top:.15rem;line-height:1.5}
+  li.qi.uploading .qmark{border-color:var(--brass);color:var(--brass)}
+  li.qi.done .qmark{border-color:var(--jade-deep);color:var(--jade);background:rgba(143,179,164,.1)}
+  li.qi.error .qmark{border-color:rgba(239,139,124,.5);color:var(--er)}
+  li.qi.skip{opacity:.55}
+  .qbody{min-width:0;display:flex;flex-direction:column;gap:1px}
+  .qname{font-size:.94rem;word-break:break-all;line-height:1.45}
+  .qsub{font-family:var(--mono);font-size:.72rem;color:var(--paper-dim);line-height:1.6;word-break:break-word}
   .qsub.err{color:var(--er)}
-  .qsub.ok{color:var(--ok)}
-  .qbar2{height:4px;background:rgba(0,0,0,.5);border-radius:999px;overflow:hidden;margin-top:.4rem;display:none}
+  .qsub.ok{color:var(--jade)}
+  /* 单文件进度：1px 细线，不再是一条会撑宽的胶囊 */
+  .qbar2{height:1px;background:var(--rule);overflow:hidden;margin-top:4px;display:none}
   li.qi.uploading .qbar2{display:block}
-  .qbar2>i{display:block;height:100%;width:0;background:linear-gradient(90deg,var(--glow-deep),var(--glow));transition:width .2s var(--ease)}
-  .qcover{width:34px;height:46px;flex:0 0 auto;border-radius:2px;overflow:hidden;background:#1a1612;border:1px solid var(--line-soft)}
+  .qbar2>i{display:block;height:100%;width:0;background:var(--brass);transition:width .2s var(--ease)}
+  .qcover{
+    grid-row:1/3;grid-column:1;width:34px;height:46px;flex:0 0 auto;
+    border-radius:1px;overflow:hidden;background:var(--ink-2);
+    border:1px solid var(--rule-strong);
+  }
   .qcover img{width:100%;height:100%;object-fit:cover;display:block}
+  /* 有封面时把序号让出去，封面占第一列 */
+  li.qi:has(.qcover){grid-template-columns:auto minmax(0,1fr)}
+  li.qi:has(.qcover) .qmark{display:none}
 
   /* ── 消息 ── */
-  .msg{margin-top:var(--s4);font-size:.88rem;display:none;line-height:1.6}
-  .msg.show{display:block;animation:up .3s var(--ease) forwards}
+  .msg{margin-top:var(--s4);font-size:var(--fz-sm);display:none;line-height:1.75}
+  .msg.show{display:block}
   .msg.err{color:var(--er)}
   .msg.ok{color:var(--ok)}
+  .msg.info{color:var(--paper-dim)}
 
   /* ── 按钮区 ── */
   .actions{display:flex;gap:var(--s2);flex-wrap:wrap;align-items:center;margin-top:var(--s4)}
@@ -123,33 +181,43 @@ ${themeCss()}
 
   /* ── 提示 ── */
   .fineprint{
-    margin-top:var(--s6);padding-top:var(--s4);
-    border-top:1px solid var(--line);
-    font-size:.79rem;color:var(--paper-dim);line-height:1.75;
+    margin-top:var(--s8);padding-top:var(--s4);
+    border-top:1px solid var(--rule);
+    font-size:var(--fz-xs);color:var(--paper-dim);line-height:1.8;max-width:44rem;
   }
-  .eligible{color:var(--paper-dim);font-size:.79rem;line-height:1.7;margin-top:var(--s3);word-break:break-word}
+  .fineprint b{color:var(--paper);font-weight:600}
+
+  @media (max-width:640px){
+    /* 手机上按钮夹在标题与说明之间，把一句话劈成两截。
+       顺序改成「标题 → 说明 → 按钮」，读起来是一句完整的话。 */
+    #drop{grid-template-columns:1fr;gap:var(--s3);padding:var(--s4) var(--s4) var(--s5)}
+    .droptitle{order:1}
+    .dropsub{order:2}
+    .droppick{order:3;justify-self:start;margin-top:var(--s1)}
+    .meta{grid-template-columns:1fr}
+  }
 </style></head>
 <body>
 <div class="wrap">
 
-  <div class="bar-head reveal" style="animation-delay:.03s">
+  <div class="bar-head">
     <span class="mk"><a href="/">we·books</a></span>
-    <a class="back" href="/">← 回到书库</a>
+    <a class="back" href="/">回到书库</a>
   </div>
 
-  <h1 class="reveal" style="animation-delay:.08s">上架书籍</h1>
-  <p class="sub reveal" style="animation-delay:.12s">
+  <h1>上架书籍</h1>
+  <p class="sub">
     可以<b>一次选多本</b>。文件<b>直传 Cloudflare R2</b>，不经服务器中转；
     EPUB 会自动解析出真实封面、书名与作者。传完立刻能在 WebDAV 客户端与浏览器书架里看到。
   </p>
 
-  <div id="drop" class="reveal" style="animation-delay:.18s" role="button" tabindex="0" aria-label="选择要上传的书籍文件，可多选">
-    <div class="dropmark" aria-hidden="true">
-      <svg viewBox="0 0 24 24" width="30" height="30" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M12 16V4"/><path d="m7 9 5-5 5 5"/><path d="M4 17v2a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-2"/></svg>
+  <div class="dropwrap">
+    <div id="drop" role="button" tabindex="0" aria-label="选择要上传的书籍文件，可多选">
+      <div class="droptitle">把书拖到这里，或 <em id="pick">从电脑里选</em></div>
+      <span class="droppick" aria-hidden="true">选择文件</span>
+      <div class="dropsub">支持一次多选、连续拖入。只接受电子书与漫画格式。</div>
+      <input type="file" id="file" multiple accept="${accept}">
     </div>
-    <div class="droptitle">把书籍文件拖到这里，或 <a href="#" id="pick">点此选择</a></div>
-    <div class="hint">支持一次多选、连续拖入；只会接受电子书与漫画格式</div>
-    <input type="file" id="file" multiple accept="${accept}">
   </div>
 
   <!-- 留名：可选。留空统一记作「雷锋」（见 migrations/0007 的说明）
@@ -160,14 +228,16 @@ ${themeCss()}
           （曾经放在 #drop 内部，于是点输入框就弹文件框，一个字都输不进去。
             这个 bug 只在真浏览器里看得见；结构测试查不出来，
             所以下面 pages-syntax.test.ts 里有一条断言盯着它。） -->
-  <div class="creditbar reveal" style="animation-delay:.22s">
-    <label for="credit">留个名</label>
-    <input id="credit" maxlength="32" placeholder="留空记作「雷锋」" autocomplete="nickname">
-    <span class="tip">会显示在书卡片上；留空统一记作「雷锋」</span>
-  </div>
-
-  <div class="eligible reveal" style="animation-delay:.2s">
-    接受格式：<b>${formatList}</b>
+  <div class="meta">
+    <div class="field">
+      <label for="credit">留个名 <span class="tip">会显示在书卡上</span></label>
+      <input id="credit" maxlength="32" placeholder="留空记作「雷锋」" autocomplete="nickname">
+      <span class="tip">不填也行 —— 匿名上传统一记作「雷锋」，那是集体署名，不是没人。</span>
+    </div>
+    <div class="field">
+      <span class="fmtlabel">接受格式</span>
+      <div class="fmtlist">${formatChips}</div>
+    </div>
   </div>
 
   <div id="queueWrap">
@@ -193,6 +263,14 @@ ${themeCss()}
     这个书库是<b>匿名开放</b>的：任何人都能上传与下载，上传后自动上架、不经人工审核。<br>
     请勿上传你无权分发的作品。若文件涉及侵权，请联系站点管理员移除。
   </p>
+
+  <footer class="site-foot">
+    <span class="lamps" aria-hidden="true"><i></i><i></i><i></i></span>
+    <span>webooks · 匿名开放</span>
+    <a href="/">首页</a>
+    <a href="/requests">求书墙</a>
+    <a href="${mountHref}">进入书库</a>
+  </footer>
 
 </div>
 

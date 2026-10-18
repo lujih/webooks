@@ -651,3 +651,4 @@ node scripts/verify-upload-chain.mjs --site https://你的域名                
 - [RFC 合规清单](docs/rfc-compliance.md) —— 逐条对照 RFC 4918 / 9110
 - [2026-10-14 全面审查与修复记录](docs/review-2026-10-14-fixes.md) —— **数据丢失、鉴权绕过、ReDoS、ZIP bomb、锁不可用**的修复全过程
 - [WebDAV RFC 深度审计](docs/webdav-rfc-audit-2026-10-14.md) —— 逐条对照 RFC 原文的完整审计
+- [前端设计说明](docs/frontend-design.md) —— 「开架目录」的版面语言、颜色职责、**踩过的 CSS 坑**与可访问性基线

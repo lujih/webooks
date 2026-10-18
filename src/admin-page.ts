@@ -1,5 +1,5 @@
 /**
- * 管理后台（/admin）—— 「深夜图书馆」主题的站长控制台。
+ * 管理后台（/admin）—— 「开架目录」主题的站长控制台。
  *
  * 设计目标（面向不懂网络安全的站长）：
  *   · 一眼看到「安全防护哪些开着、哪些没开」—— 不用懂技术也能判断站点状态
@@ -22,118 +22,164 @@ export function adminHtml(): string {
 <meta name="robots" content="noindex,nofollow">
 <style>
 ${themeCss()}
-  .bar-head{display:flex;align-items:baseline;gap:var(--s3);margin-bottom:var(--s5)}
-  .mk{font-family:var(--serif);font-size:1.05rem;letter-spacing:.3em;color:var(--glow)}
-  .mk a{color:inherit;text-decoration:none}
-  .back{margin-left:auto;font-size:.8rem;font-family:var(--serif);letter-spacing:.08em}
-  h1{font-family:var(--serif);font-weight:400;font-size:clamp(1.5rem,4vw,2rem);letter-spacing:.03em;margin-bottom:var(--s4)}
 
-  /* ── 登录 ── */
-  .login{max-width:26rem;padding:var(--s5);border:1px solid var(--line);border-radius:var(--r3);
-    background:linear-gradient(160deg,var(--ink-2) 0%,#120f0c 100%)}
-  .login p{color:var(--paper-dim);font-size:.88rem;margin-bottom:var(--s4);line-height:1.7}
-  label{display:block;font-size:.82rem;color:var(--paper-dim);margin-bottom:var(--s2);letter-spacing:.04em}
+  /* ── 登录 ──
+     不再是一张居中的卡片：口令输入是这个后台唯一的入口动作，
+     它应该像一张**登记签收单** —— 一条说明、一行下划线、一颗按钮。 */
+  .login{max-width:30rem;border-top:2px solid var(--brass);padding-top:var(--s4)}
+  .login p{color:var(--paper-dim);font-size:var(--fz-sm);line-height:1.8;margin-bottom:var(--s5)}
+  .login code{font-size:.86em}
+  .login .field{display:flex;flex-direction:column;gap:var(--s1);margin-bottom:var(--s4)}
+  label{font-size:var(--fz-sm);color:var(--paper-dim);letter-spacing:.04em}
   input[type=password],input[type=text]{
-    width:100%;padding:.7rem .8rem;font:inherit;font-size:.95rem;
-    background:rgba(0,0,0,.45);color:var(--paper);
-    border:1px solid var(--line);border-radius:var(--r2);
+    width:100%;min-height:44px;padding:.5rem 0;
+    font:inherit;font-size:1rem;color:var(--paper);
+    background:transparent;border:0;border-radius:0;
+    border-bottom:1px solid var(--edge);
+    transition:border-bottom-color var(--dur) var(--ease);
   }
-  input:focus-visible{outline:2px solid var(--glow);outline-offset:2px}
+  input[type=password]:hover,input[type=text]:hover{border-bottom-color:var(--brass)}
+  input[type=password]:focus,input[type=text]:focus{outline:none;border-bottom-color:var(--brass)}
+  input[type=password]:focus-visible,input[type=text]:focus-visible{outline:2px solid var(--brass);outline-offset:4px}
 
-  /* ── 安全状态卡 ── */
-  .sec{display:grid;gap:var(--s2);grid-template-columns:repeat(auto-fit,minmax(240px,1fr));margin-bottom:var(--s5)}
-  .secitem{display:flex;gap:var(--s2);align-items:flex-start;padding:var(--s3);
-    border:1px solid var(--line);border-radius:var(--r2);background:rgba(0,0,0,.25)}
-  .dot2{flex:0 0 auto;width:8px;height:8px;border-radius:50%;margin-top:.45em}
-  .dot2.ok{background:var(--ok);box-shadow:0 0 8px var(--ok)}
-  .dot2.no{background:var(--er);box-shadow:0 0 8px var(--er);animation:flicker 1.6s ease-in-out infinite}
-  .sectext{min-width:0}
-  .sectitle{font-family:var(--serif);font-size:.92rem;letter-spacing:.03em}
-  .sechint{font-size:.76rem;color:var(--paper-dim);line-height:1.6;word-break:break-word}
+  /* ── 分段标题 ── */
+  .h2{
+    display:flex;align-items:baseline;gap:var(--s3);flex-wrap:wrap;
+    font-family:var(--serif);font-weight:400;font-size:.95rem;
+    letter-spacing:.12em;color:var(--paper-dim);
+    margin:var(--s7) 0 0;padding-bottom:var(--s2);
+    border-bottom:1px solid var(--rule-strong);
+  }
+  .h2:first-of-type{margin-top:0}
+  .h2 .note{font-family:var(--sans);font-size:var(--fz-xs);letter-spacing:0;color:var(--paper-faint);margin-left:auto}
+
+  /* ── 安全状态：清单，不是卡片网格 ──
+     每一项是一行：状态点 + 名称 + 说明。一行读一个开关，比一片方格快。 */
+  .sec{display:block;margin-top:var(--s3)}
+  .secitem{
+    display:grid;grid-template-columns:auto minmax(0,1fr);
+    gap:var(--s1) var(--s3);align-items:baseline;
+    padding:.55rem 0;border-bottom:1px solid var(--rule);
+  }
+  .dot2{
+    width:6px;height:6px;flex:0 0 auto;border-radius:1px;
+    align-self:center;transform:translateY(-1px);
+  }
+  .dot2.ok{background:var(--jade);box-shadow:0 0 0 3px rgba(143,179,164,.14)}
+  .dot2.no{background:var(--er);box-shadow:0 0 0 3px rgba(239,139,124,.16);animation:flicker 1.8s ease-in-out infinite}
+  .sectext{display:flex;align-items:baseline;gap:var(--s3);flex-wrap:wrap;min-width:0}
+  .sectitle{font-family:var(--serif);font-size:.95rem;letter-spacing:.02em;color:var(--paper)}
+  .sechint{font-size:var(--fz-xs);color:var(--paper-dim);line-height:1.7;word-break:break-word;flex:1 1 14rem}
 
   /* ── 工具条 ── */
-  .toolbar{display:flex;gap:var(--s2);flex-wrap:wrap;align-items:center;margin-bottom:var(--s4)}
-  .toolbar input[type=text]{flex:1;min-width:12rem;max-width:24rem}
-  .stat{font-family:var(--serif);font-size:.82rem;color:var(--paper-dim);letter-spacing:.06em;margin-left:auto}
-  .stat b{color:var(--glow);font-weight:600}
+  .toolbar{
+    display:flex;gap:var(--s2);flex-wrap:wrap;align-items:center;
+    margin:var(--s4) 0 var(--s3);
+  }
+  .toolbar input[type=text]{flex:1 1 14rem;max-width:22rem}
+  .stat{font-size:var(--fz-xs);color:var(--paper-dim);margin-left:auto;font-variant-numeric:tabular-nums}
+  .stat b{color:var(--paper);font-weight:600;font-family:var(--mono)}
 
-  /* ── 书列表 ── */
+  /* ── 书列表：一张真正的表（等宽数字，右对齐的大小与日期） ── */
+  .tablewrap{overflow-x:auto;-webkit-overflow-scrolling:touch}
   table{width:100%;border-collapse:collapse;font-size:.88rem}
-  th,td{text-align:left;padding:.6rem .5rem;border-bottom:1px solid var(--line-soft);vertical-align:middle}
-  th{font-family:var(--serif);font-weight:400;font-size:.78rem;letter-spacing:.08em;color:var(--paper-dim)}
-  tr:hover td{background:rgba(255,180,77,.04)}
-  td.name{word-break:break-word;max-width:22rem}
-  td.name .t{font-family:var(--serif)}
-  td.name .a{color:var(--paper-dim);font-size:.78rem}
-  /* 格式标签：方角（--r1），与全站方正语汇一致。
-     胶囊是 badge 的默认形状，但这里它不承担「可点」的暗示。 */
-  .pill{display:inline-block;font-family:var(--mono);font-size:.68rem;letter-spacing:.04em;
-    padding:.1rem .4rem;border-radius:var(--r1);border:1px solid var(--line-soft);color:var(--glow)}
-  .muted{color:var(--paper-dim);font-size:.78rem;font-family:var(--mono)}
-  .rowsel{width:1.5rem}
-  input[type=checkbox]{width:1rem;height:1rem;accent-color:var(--glow);cursor:pointer}
+  th,td{text-align:left;padding:.55rem .5rem .55rem 0;border-bottom:1px solid var(--rule);vertical-align:top}
+  th{
+    font-family:var(--serif);font-weight:400;font-size:.76rem;
+    letter-spacing:.1em;color:var(--paper-faint);
+    border-bottom-color:var(--rule-strong);
+  }
+  td.muted,th.num{ text-align:right;font-variant-numeric:tabular-nums;font-family:var(--mono);font-size:.74rem }
+  th.num{font-family:var(--serif);letter-spacing:.1em}
+  tr:hover td{background:var(--wash)}
+  td.name{min-width:12rem}
+  td.name .t{font-family:var(--serif);font-size:.96rem;line-height:1.4;word-break:break-word}
+  td.name .a{color:var(--paper-dim);font-size:var(--fz-xs)}
+  td.name .muted{text-align:left;color:var(--paper-faint);font-size:.7rem;word-break:break-all}
+  /* 格式标签：方角小字，不是胶囊 */
+  .pill{
+    display:inline-block;font-family:var(--mono);font-size:.68rem;
+    letter-spacing:.04em;padding:0 .3rem;border-radius:var(--r1);
+    border:1px solid var(--rule-strong);color:var(--paper-dim);
+  }
+  .rowsel{width:2rem;padding-right:0}
+  input[type=checkbox]{
+    width:15px;height:15px;accent-color:var(--brass);cursor:pointer;
+    margin-top:.25rem;
+  }
+  .hide{display:none!important}
 
-  .danger{border-color:var(--er)!important;color:var(--er)!important}
-  .danger:hover{background:rgba(255,138,122,.1)!important}
-  .toast{margin-top:var(--s3);padding:var(--s3) var(--s4);border-radius:var(--r2);font-size:.86rem;display:none}
-  .toast.show{display:block;animation:up .3s var(--ease) forwards}
-  .toast.ok{background:rgba(125,201,143,.12);border-left:2px solid var(--ok);color:var(--ok)}
+  /* ── 行内编辑 ── */
+  .edit-a{
+    width:100%;margin-top:2px;font-size:var(--fz-xs);
+    background:transparent;color:var(--paper-dim);
+    border:0;border-bottom:1px solid transparent;border-radius:0;
+    padding:1px 0;
+  }
+  .edit-a:hover{border-bottom-color:var(--rule-strong)}
+  .edit-a:focus{outline:none;color:var(--paper);border-bottom-color:var(--brass)}
+  .edit-a::placeholder{color:var(--paper-faint)}
+  .edit-k{
+    font-size:var(--fz-xs);padding:1px 2px;border-radius:var(--r1);
+    background:transparent;color:var(--paper-dim);
+    border:1px solid var(--rule-strong);cursor:pointer;
+  }
+  .edit-k:hover{border-color:var(--edge);color:var(--paper)}
+  .edit-k:focus-visible{outline:2px solid var(--brass);outline-offset:2px}
+
+  /* ── 提示条 ── */
+  .toast{
+    margin-top:var(--s3);padding:var(--s2) var(--s3);
+    border-left:2px solid var(--rule-strong);
+    font-size:var(--fz-sm);display:none;line-height:1.7;
+  }
+  .toast.show{display:block}
+  .toast.ok{border-left-color:var(--jade-deep);color:var(--jade);background:rgba(143,179,164,.06)}
+  .toast.err{border-left-color:rgba(239,139,124,.55);color:var(--er);background:rgba(239,139,124,.06)}
   /* 保存提示：浮在底部，不把列表顶下去 */
   #toast2{
     position:fixed;left:50%;bottom:1.2rem;transform:translateX(-50%);
-    margin:0;padding:.5rem .9rem;font-size:.8rem;z-index:50;
-    background:rgba(125,201,143,.16);border:1px solid rgba(125,201,143,.45);color:var(--ok);
-    backdrop-filter:blur(6px);
+    margin:0;padding:.45rem .8rem;font-size:var(--fz-xs);z-index:50;
+    border:1px solid var(--jade-deep);border-left-width:1px;
+    background:#121a16;color:var(--jade);
   }
-  #toast2.err{background:rgba(255,138,122,.16);border-color:rgba(255,138,122,.5);color:var(--er)}
+  #toast2.err{border-color:rgba(239,139,124,.5);color:var(--er)}
 
-  /* ── 行内编辑（作者 / 类型）── */
-  .edit-a{
-    width:100%;margin-top:.25rem;font-size:.78rem;
-    background:rgba(0,0,0,.35);color:var(--paper);
-    border:1px solid var(--line-soft);border-radius:var(--r1);
-    padding:.2rem .4rem;
+  /* ── 空状态（theme 的 .empty） ── */
+  .empty span{font-size:var(--fz-sm)}
+
+  @media (max-width:700px){
+    /* 手机上隐藏「大小 / 日期」两列 —— 它们是补充信息 */
+    th:nth-child(4),td:nth-child(4),th:nth-child(5),td:nth-child(5),
+    th:nth-child(6),td:nth-child(6){display:none}
+    td.name{min-width:0}
   }
-  .edit-a::placeholder{color:var(--paper-dim);opacity:.75}
-  .edit-a:focus,.edit-k:focus{outline:2px solid var(--glow);outline-offset:1px}
-  .edit-k{
-    font-size:.76rem;padding:.2rem .3rem;border-radius:var(--r1);
-    background:rgba(0,0,0,.35);color:var(--paper);border:1px solid var(--line-soft);
-  }
-  .toast.err{background:rgba(255,138,122,.12);border-left:2px solid var(--er);color:var(--er)}
-  .hide{display:none!important}
-  .empty{padding:var(--s7) var(--s4);text-align:center;color:var(--paper-dim);
-    border:1px dashed var(--line);border-radius:var(--r3)}
-  @media (max-width:640px){
-    th:nth-child(3),td:nth-child(3),th:nth-child(4),td:nth-child(4){display:none}
-    td.name{max-width:none}
+  @media (max-width:480px){
+    th:nth-child(3),td:nth-child(3){display:none}
   }
 </style></head>
 <body>
 <div class="wrap">
 
-  <div class="bar-head reveal" style="animation-delay:.03s">
+  <div class="bar-head">
     <span class="mk"><a href="/">we·books</a></span>
-    <a class="back" href="/">← 回到书库</a>
+    <a class="back" href="/">回到书库</a>
   </div>
 
-  <h1 class="reveal" style="animation-delay:.06s">管理后台</h1>
+  <h1>管理后台</h1>
 
   <!-- 未登录 -->
-  <section class="login reveal" id="loginBox" style="animation-delay:.1s">
-    <p>请输入管理口令（<code>ADMIN_TOKEN</code>）。口令只保存在本标签页，关闭即失效，不会写入 Cookie。</p>
+  <section class="login" id="loginBox">
+    <p>粘贴部署时设的 <code>ADMIN_TOKEN</code>。口令只存在这个标签页里，<b>关掉就没了</b>，不会写进 Cookie，所以不存在「被别人从 cookie 里读走」这回事。</p>
     <label for="tok">管理口令</label>
     <input type="password" id="tok" autocomplete="current-password" placeholder="粘贴 ADMIN_TOKEN">
-    <div style="margin-top:var(--s4)">
-      <button class="btn btn-primary" id="loginBtn">进入</button>
-    </div>
+    <button class="btn btn-primary" id="loginBtn" style="margin-top:var(--s4)">进入</button>
     <div class="toast" id="loginMsg"></div>
   </section>
 
   <!-- 已登录 -->
   <section id="panel" class="hide">
-    <h2 style="font-family:var(--serif);font-weight:400;font-size:1rem;letter-spacing:.08em;
-               color:var(--paper-dim);margin-bottom:var(--s3)">安全防护状态</h2>
+    <h2 class="h2" style="margin-top:0">安全防护状态<span class="note">每一条都能在 wrangler 里改成「开」</span></h2>
     <div class="sec" id="secGrid"></div>
 
     <div class="toolbar">
@@ -152,8 +198,7 @@ ${themeCss()}
     <div id="listWrap"><div class="empty">加载中…</div></div>
 
     <!-- 求书看板：谁在求什么，书到了就标记划掉 -->
-    <h2 style="font-family:var(--serif);font-weight:400;font-size:1rem;letter-spacing:.08em;
-               color:var(--paper-dim);margin:var(--s4) 0 var(--s3)">求书看板</h2>
+    <h2 class="h2">求书看板<span class="note">书到了就划掉 —— 清单会同步到公开的求书墙</span></h2>
     <div class="toolbar">
       <select id="reqFilter">
         <option value="all">全部</option>
@@ -167,8 +212,7 @@ ${themeCss()}
     <div id="reqWrap"><div class="empty">加载中…</div></div>
 
     <!-- 上传者榜单：留名的贡献者 -->
-    <h2 style="font-family:var(--serif);font-weight:400;font-size:1rem;letter-spacing:.08em;
-               color:var(--paper-dim);margin:var(--s4) 0 var(--s3)">上传者榜单</h2>
+    <h2 class="h2">上传者榜单<span class="note">谁在往这个书库里放书</span></h2>
     <div id="creditWrap"><div class="empty">加载中…</div></div>
     <div class="toast" id="msg"></div>
     <div class="toast save" id="toast2" role="status" aria-live="polite"></div>

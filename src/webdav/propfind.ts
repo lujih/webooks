@@ -177,6 +177,17 @@ interface ResourceMeta {
   coverUrl?: string | null;
   /** 上传者署名（迁移 0007）；WebDAV 客户端不读这个字段，仅供浏览页用 */
   credit?: string | null;
+  /**
+   * 目录里有多少项 —— **只对集合有效**，而且只在 HTML 渲染时读。
+   *
+   * 为什么值得加：目录页原本只显示「B C D G H K…」，每个字母后面写一个
+   * 「目录」，读者看不出哪一格有书、哪一格是空的。数字从
+   * listBucketTotals(env.DB, ...) 里**本来就已经查出来了**，只是没往上带，
+   * 于是最有用的一列信息被白扔了。
+   *
+   * 不进 PROPFIND 的 XML（renderProps 白名单里没有它），客户端不受影响。
+   */
+  childCount?: number | null;
   format?: string | null;
   /**
    * R2 公开域直链，**仅供浏览页书卡用**。
@@ -382,6 +393,10 @@ export async function collectDavEntries(
         { path: '/', isCollection: true, meta: { displayName: 'webooks' } },
       ];
       if (depth === 0) return entries;
+      // 根目录**不**带本数。五个集合覆盖的是同一批书，全都写「15 本」
+      // 等于什么都没说（而且要为它多查一次 D1，而 PROPFIND / 是客户端
+      // 挂载时打得最频繁的一枪）。真正需要数字的是下一层：
+      // 「按书名」下面的 B/C/D… 各有多少本。
       for (const def of Object.values(COLLECTIONS)) {
         entries.push({
           path: `/${def.segment}/`,
@@ -405,7 +420,8 @@ export async function collectDavEntries(
         entries.push({
           path: `/${col}/${bucketSegment(b.bucket)}/`,
           isCollection: true,
-          meta: { displayName: bucketLabel(b.bucket) },
+          // 数量已经在手上，顺手带上 —— 目录页据此显示「B · 2 本」
+          meta: { displayName: bucketLabel(b.bucket), childCount: b.total },
         });
       }
       return entries;
@@ -440,7 +456,11 @@ export async function collectDavEntries(
               ? `/${col}/${bucketSegment(node.bucket)}/${p}/`
               : `/${col}/${p}/`,
             isCollection: true,
-            meta: { displayName: `第 ${p} 页` },
+            // 最后一页可能不满，按剩余条数算
+            meta: {
+              displayName: `第 ${p} 页`,
+              childCount: Math.max(0, Math.min(cfg.maxEntries, total - (p - 1) * cfg.maxEntries)),
+            },
           });
         }
       }

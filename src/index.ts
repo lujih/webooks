@@ -162,7 +162,9 @@ async function route(request: Request, env: Env): Promise<Response> {
       // 缓存 1 小时。Turnstile 只有被显式打开（UPLOAD_REQUIRE_TURNSTILE=1）
       // 时 siteKey 才非空，届时密钥轮换最多让访客 1 小时内拿到旧 key
       // —— 而打开验证码本来就要配套刷新页面，这个代价可接受。
-      return new Response(uploadHtml(env.TURNSTILE_SITE_KEY ?? ''), {
+      // 传 mountPath：页脚的「进入书库」要指向真实的挂载路径
+      // （DAV_MOUNT 可能是空串 = 根挂载，那时书库根就是 '/'）。
+      return new Response(uploadHtml(env.TURNSTILE_SITE_KEY ?? '', cfg.mountPath), {
         status: 200,
         headers: {
           'content-type': 'text/html; charset=utf-8',

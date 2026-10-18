@@ -1,12 +1,29 @@
 /**
- * 浏览器目录页（GET /dav/**）—— 「深夜图书馆」书架视图。
+ * 浏览器目录页（GET /dav/**）—— 书目视图。
  *
- * 上一版是裸 <ul> + 浅色主题，与首页完全割裂。这一版：
- *   · 复用 lib/theme 的设计 token，与首页/上传页同一套语言
- *   · 面包屑导航（每段可点，回到上级/首页）
- *   · 文件卡片显示真实 EPUB 封面（有封面时）+ 书名 + 作者 + 格式 + 大小
- *   · 集合卡片用「抽屉」形态（书脊 + 名称 + 数量暗示）
- *   · 空状态、分页导航、键盘可达、对比度达标
+ * ── 这一版为什么是「列表」而不是「卡片网格」 ──
+ *
+ * 上一版把目录和书都渲染成同一种 300px 卡片：同样的 1px 琥珀边框、
+ * 同样的渐变底、同样的内边距。结果是 15 本书 = 15 个一模一样的方框，
+ * 眼睛无法在页面上停留 —— 没有主次，也就没有信息。
+ *
+ * 现在按**真实的信息结构**分成两种形态：
+ *
+ *   · 子目录 → 目录索引（编号 + 名称 + 说明），和首页同一套语汇。
+ *     它们少（通常 3~9 条），是导航，不该占用和书一样的视觉权重。
+ *
+ *   · 书     → 书目行。左：封面或首字；中：书名 + 作者；右：格式与大小，
+ *              等宽、右对齐成列。署名退成一个极小的标记，贴在作者后面 ——
+ *              它是「谁传的」，不是作品信息，不该出现在视觉主体里。
+ *
+ * 右对齐的单据式数字列（格式 · 大小）是这一页的身份：它像一本印刷目录，
+ * 而不是一个卡片瀑布。
+ *
+ * ⚠️ 以下两处 class 与属性顺序被测试锁死，改动会让测试变红：
+ *   · <a class="card bookcard" href="${bookHref}"
+ *   · <a class="card shelfcard" href="${davHref}"
+ *   · bookHref 的三元写法 e.meta.downloadUrl ? esc(...) : davHref
+ *   它们承载的是「书卡直连 R2，省一次 Worker 请求」这个预算约束。
  *
  * 注意：这是给人看的 HTML。WebDAV 客户端走 PROPFIND，不解析这里。
  */
@@ -15,7 +32,7 @@ import type { Entry } from './webdav/propfind';
 import { themeCss } from './lib/theme';
 import { encodeHref } from './lib/xml';
 
-/** 格式 → 中文短标（不用 emoji，用文字/矢量） */
+/** 格式 → 中文短标（不用 emoji，用文字） */
 const FORMAT_LABEL: Record<string, string> = {
   epub: 'EPUB', pdf: 'PDF', mobi: 'MOBI', azw3: 'AZW3', txt: 'TXT',
   cbz: 'CBZ', cbr: 'CBR', fb2: 'FB2', djvu: 'DJVU', m4b: 'M4B', mp3: 'MP3',
@@ -106,68 +123,90 @@ export function renderBrowsePage(
   const collections = children.filter((e) => e.isCollection);
   const files = children.filter((e) => !e.isCollection);
 
-  const gridOf = (list: Entry[]): string =>
-    list
-      .map((e, i) => {
-        // 服务器上的规范路径：百分号编码（路径段是中文，且文件名可能含 #
-        // 之类会截断 URL 的字符）。目录卡与回退分支都用它。
-        const davHref = esc(`${mountPath}${encodeHref(e.path, e.isCollection)}`);
-        const delay = `calc(.05s + ${i} * .035s)`;
-        if (e.isCollection) {
-          const label = e.meta.displayName.replace(/\/$/, '');
-          return `
-      <a class="card shelfcard" href="${davHref}" style="animation-delay:${delay}">
-        <span class="shelfmark" aria-hidden="true">
-          <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M3 7a2 2 0 0 1 2-2h3.6a2 2 0 0 1 1.6.8l.8 1.2H19a2 2 0 0 1 2 2v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg>
-        </span>
-        <span class="cbody">
-          <span class="ctitle">${esc(label)}</span>
-          <span class="cmeta">目录</span>
-        </span>
+  /** 子目录：目录索引行（编号 + 名称 + 「目录」）。 */
+  const collectionsHtml = collections
+    .map((e, i) => {
+      const davHref = esc(`${mountPath}${encodeHref(e.path, e.isCollection)}`);
+      const label = e.meta.displayName.replace(/\/$/, '');
+      const n = String(i + 1).padStart(2, '0');
+      // 右侧写「几本」而不是「目录」：
+      // 每个子目录后面都跟着同一个词「目录」，等于什么都没说 ——
+      // 而读者真正想知道的是「这一格里有几本书，值不值得点开」。
+      // childCount 由 collectDavEntries 从 buckets 表直接带上来，
+      // 不额外查询。缺席时（旧缓存）退回「目录」。
+      // ⚠️ 「没有本数」和「零本」是两件不同的事，不能都渲染成「空」。
+      //   根目录的五个集合刻意不带 childCount（算法要额外查一次 D1，
+      //   而 PROPFIND / 是客户端挂载时打得最频繁的一枪），
+      //   若把 undefined 当 0 显示，就会把「全部藏书」谎报成空的。
+      const cc = e.meta.childCount;
+      const meta = typeof cc !== 'number'
+        ? ''
+        : cc > 0
+          ? `<span class="cn">${cc}</span><span class="cu">本</span>`
+          : `<span class="cu">空</span>`;
+      return `
+      <a class="card shelfcard" href="${davHref}">
+        <span class="sn" aria-hidden="true">${n}</span>
+        <span class="ctitle">${esc(label)}</span>
+        <span class="cmeta">${meta}</span>
       </a>`;
-        }
-        // 书卡直接指向 R2 公开域：点一次下载不再消耗一次 Worker 请求。
-        // 这是免费套餐（10 万次/天）下最值钱的一处优化 —— 每次点击原本
-        // 都要经过 Worker 拿一个 302，而那个 302 还带 no-store，缓存不上。
-        //
-        // ⚠️ 不能想当然：downloadUrl 缺席时必须回退到 /dav 路径。
-        // 直接渲染 `href="${e.meta.downloadUrl}"` 会在 undefined 时产出
-        // `href="undefined"` —— 一个相对路径，点击后跳到 /dav/undefined，
-        // 比慢一点糟得多。目录卡永远走 /dav（它必须由 Worker 生成 HTML）。
-        const bookHref = e.meta.downloadUrl
-          ? esc(e.meta.downloadUrl)
-          : davHref;
-        const cover = e.meta.coverUrl
-          ? `<img src="${esc(e.meta.coverUrl)}" alt="" loading="lazy" decoding="async">`
-          : `<span class="nocover">${esc(FORMAT_LABEL[e.meta.format ?? ''] ?? (e.meta.format ?? '').toUpperCase() ?? '书')}</span>`;
-        const fmt = FORMAT_LABEL[e.meta.format ?? ''] ?? (e.meta.format ?? '').toUpperCase();
-        const size = formatSize(e.meta.contentLength ?? 0);
-        const author = e.meta.author ? `<span class="cauthor">${esc(e.meta.author)}</span>` : '';
-        // 署名：留名上传的显示真实名字，其余显示「雷锋」（服务端已归一，
-        // 这里只做兜底 —— 数据可能是迁移前的老行，credit 为 null）
-        const creditName = e.meta.credit || '雷锋';
-        const credit = `<span class="ccredit" title="上传：${esc(creditName)}">${esc(creditName)}</span>`;
-        return `
-      <a class="card bookcard" href="${bookHref}" style="animation-delay:${delay}" title="${esc(e.meta.displayName)}">
+    })
+    .join('\n');
+
+  /** 书：书目行。左封面，中书名/作者/署名，右格式与大小。 */
+  const filesHtml = files
+    .map((e) => {
+      // 服务器上的规范路径：百分号编码（路径段是中文，且文件名可能含 #
+      // 之类会截断 URL 的字符）。回退分支用它。
+      const davHref = esc(`${mountPath}${encodeHref(e.path, e.isCollection)}`);
+      // 书卡直接指向 R2 公开域：点一次下载不再消耗一次 Worker 请求。
+      // 这是免费套餐（10 万次/天）下最值钱的一处优化 —— 每次点击原本
+      // 都要经过 Worker 拿一个 302，而那个 302 还带 no-store，缓存不上。
+      //
+      // ⚠️ 不能想当然：downloadUrl 缺席时必须回退到 /dav 路径。
+      // 直接渲染 href="${e.meta.downloadUrl}" 会在 undefined 时产出
+      // href="undefined" —— 一个相对路径，点击后跳到 /dav/undefined，
+      // 比慢一点糟得多。目录卡永远走 /dav（它必须由 Worker 生成 HTML）。
+      const bookHref = e.meta.downloadUrl
+        ? esc(e.meta.downloadUrl)
+        : davHref;
+      const fmt = FORMAT_LABEL[e.meta.format ?? ''] ?? (e.meta.format ?? '').toUpperCase();
+      const size = formatSize(e.meta.contentLength ?? 0);
+      // 封面缺席时不留灰方块（那是「图挂了」的样子），也不写格式字母 ——
+      // 格式在右列已经写清楚了，左边再写一遍「E」只是把一个空盒子填满。
+      // 这里放**书名的第一个字**：它是这一行唯一还没被重复表达的信息。
+      const initial = Array.from(e.meta.displayName.trim())[0] ?? '书';
+      const cover = e.meta.coverUrl
+        ? `<img src="${esc(e.meta.coverUrl)}" alt="" loading="lazy" decoding="async">`
+        : `<span class="mk2" aria-hidden="true">${esc(initial)}</span>`;
+      // 作者与署名合成一行：署名是「谁传的」，附在作者后面，不占独立一行。
+      const byline = e.meta.author
+        ? `<span class="cauthor">${esc(e.meta.author)}</span>`
+        : '';
+      const creditName = e.meta.credit || '雷锋';
+      // ⚠️ 作者和上传者是同一个人时（上传时顺手填了自己的名字），
+      //   渲染成「刘慈欣 · 刘慈欣」是纯噪音 —— 三体的那一行正是如此。
+      //   同名就只留作者，不重复。
+      const credit = byline && creditName === e.meta.author
+        ? ''
+        : `<span class="ccredit" title="上传：${esc(creditName)}">${esc(creditName)}</span>`;
+      return `
+      <a class="card bookcard" href="${bookHref}" title="${esc(e.meta.displayName)}">
         <span class="cover">${cover}</span>
         <span class="cbody">
           <span class="ctitle">${esc(e.meta.displayName)}</span>
-          ${author}
-          ${credit}
-          <span class="cmeta"><b class="fmt">${esc(fmt)}</b> · ${size}</span>
+          <span class="cline">${byline}${credit}</span>
         </span>
+        <span class="cend"><b class="fmt">${esc(fmt)}</b><span class="csize">${size}</span></span>
       </a>`;
-      })
-      .join('\n');
+    })
+    .join('\n');
 
   const hasAny = children.length > 0;
   const empty = `
     <div class="empty">
-      <div class="emptymark" aria-hidden="true">
-        <svg viewBox="0 0 24 24" width="34" height="34" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"><path d="M4 4h7a3 3 0 0 1 3 3v13a2.5 2.5 0 0 0-2.5-2.5H4z"/><path d="M20 4h-3a3 3 0 0 0-3 3v13a2.5 2.5 0 0 1 2.5-2.5H20z"/></svg>
-      </div>
-      <p class="emptytitle">这一格还空着</p>
-      <p class="emptysub">还没有书被放到这里。</p>
+      <b>这一格还空着</b>
+      <span>还没有书被放到这里。第一本可以由你来放。</span>
       <a class="btn btn-primary" href="/upload">上架一本</a>
     </div>`;
 
@@ -180,133 +219,184 @@ export function renderBrowsePage(
 <style>
 ${themeCss()}
   /* ── 页头 ── */
-  .bar-head{display:flex;align-items:baseline;gap:var(--s3);flex-wrap:wrap;margin-bottom:var(--s2)}
-  .mk{font-family:var(--serif);font-size:1.05rem;letter-spacing:.3em;color:var(--glow)}
-  .mk a{color:inherit;text-decoration:none}
-  .count{margin-left:auto;font-size:.78rem;color:var(--paper-dim);font-family:var(--serif);letter-spacing:.08em}
-  h1{
-    font-family:var(--serif);font-weight:400;
-    font-size:clamp(1.5rem,4vw,2.1rem);letter-spacing:.03em;
-    word-break:break-word;margin-bottom:var(--s5);
+  .count{
+    margin-left:auto;font-size:var(--fz-sm);color:var(--paper-dim);
+    font-variant-numeric:tabular-nums;
   }
 
-  /* ── 卡片网格 ── */
-  .grid{
-    display:grid;gap:var(--s3);
-    grid-template-columns:repeat(auto-fill,minmax(300px,1fr));
+  /* ── 两种视图 ── */
+  .sec{margin-top:var(--s6)}
+  .sec-head{
+    display:flex;align-items:baseline;gap:var(--s3);
+    padding-bottom:var(--s2);border-bottom:1px solid var(--rule-strong);
   }
-  .card{
-    display:flex;align-items:center;gap:var(--s3);
-    min-height:76px;padding:var(--s3);
-    background:linear-gradient(160deg,var(--ink-2) 0%,#120f0c 100%);
-    /* 卡片本身是链接（交互元素），边框必须满足 WCAG 1.4.11 的 3:1 */
-    border:1px solid var(--line);border-radius:var(--r2);
+  .sec-head h2{
+    font-family:var(--serif);font-weight:400;font-size:.95rem;
+    letter-spacing:.12em;color:var(--paper-dim);
+  }
+
+  /* ── 子目录：目录索引 ──
+     单字母/单页的格子很少（按书名 13 个字母），一条一行会把页面拉成
+     一页空表格。多列排布后它读起来像**索引页**，而不是数据集。
+     auto-fill + minmax：列数随宽度走，13 条在桌面上排成 4 列 4 行。 */
+  .dirs{
+    display:grid;
+    /* auto-fit 而不是 auto-fill：只有 2 个条目时（「按类型」就是
+       漫画 + 电子书两条），auto-fill 会保留两列空轨道，把两条挤在
+       左半边；auto-fit 把空轨道收掉，两条各占一半，读起来是一张表。 */
+    grid-template-columns:repeat(auto-fit,minmax(15rem,1fr));
+    column-gap:var(--s6);
+    border-bottom:1px solid var(--rule);
+  }
+  .shelfcard{
+    display:grid;grid-template-columns:2.4rem minmax(0,1fr) auto;
+    align-items:baseline;gap:var(--s4);
+    padding:.62rem var(--s2);
+    border-bottom:1px solid var(--rule);
     color:var(--paper);text-decoration:none;
-    position:relative;overflow:hidden;
-    opacity:0;transform:translateY(12px);
-    animation:up .5s var(--ease) forwards;
-    transition:transform var(--dur) var(--ease),border-color var(--dur) var(--ease),
-               background var(--dur) var(--ease);
-    /* 触控目标远超 44px */
+    transition:background var(--dur) var(--ease),box-shadow var(--dur) var(--ease),
+               border-bottom-color var(--dur) var(--ease);
   }
-  .card::before{ /* 烛光扫过 */
-    content:"";position:absolute;inset:0;pointer-events:none;
-    background:linear-gradient(105deg,transparent 32%,rgba(255,190,90,.09) 50%,transparent 68%);
-    transform:translateX(-130%);transition:transform .65s var(--ease);
-  }
-  .card:hover,.card:focus-visible{
-    transform:translateY(-2px);border-color:var(--glow);
-    background:linear-gradient(160deg,var(--ink-3) 0%,#161209 100%);
+  .shelfcard:hover,.shelfcard:focus-visible{
+    background:var(--wash);border-bottom-color:var(--edge-warm);
+    box-shadow:inset 2px 0 0 var(--brass);
     text-decoration:none;color:var(--paper);
   }
-  .card:hover::before,.card:focus-visible::before{transform:translateX(130%)}
-
-  /* 目录卡 */
-  .shelfmark{
-    flex:0 0 auto;width:44px;height:56px;border-radius:var(--r1) var(--r2) var(--r2) var(--r1);
-    background:linear-gradient(90deg,#3a2e1f 0%,#5a4326 55%,#3a2e1f 100%);
-    display:flex;align-items:center;justify-content:center;color:var(--glow);
-    box-shadow:inset -3px 0 6px rgba(0,0,0,.5),2px 3px 8px rgba(0,0,0,.35);
-    border-left:2px solid rgba(255,180,77,.45);
+  .sn{
+    font-family:var(--mono);font-size:.72rem;color:var(--paper-faint);
+    font-variant-numeric:tabular-nums;
   }
+  .shelfcard:hover .sn{color:var(--brass)}
+  .shelfcard .ctitle{font-family:var(--serif);font-size:1.05rem;letter-spacing:.05em}
+  .shelfcard .cmeta{
+    display:inline-flex;align-items:baseline;gap:.15em;
+    font-family:var(--mono);font-size:.72rem;color:var(--paper-faint);
+    letter-spacing:.06em;
+  }
+  /* 本数是这一行唯一的信息，用纸色而不是灰 —— 灰到看不见就等于没写 */
+  .shelfcard .cn{color:var(--paper-dim);font-variant-numeric:tabular-nums}
+  .shelfcard .cu{font-size:.68rem;color:var(--paper-faint)}
 
-  /* 书卡封面 */
+  /* ── 书：书目行 ──
+     三列：封面 / 主体 / 右对齐的数字列。
+     行与行之间只有一条纸色细线，没有边框、没有卡片底 ——
+     15 本书排下来是一页目录，不是 15 个方框。 */
+  .books{display:block;border-top:1px solid var(--rule)}
+  .bookcard{
+    display:grid;grid-template-columns:auto minmax(0,1fr) auto;
+    align-items:center;gap:var(--s4);
+    padding:var(--s3) var(--s2);
+    border-bottom:1px solid var(--rule);
+    color:var(--paper);text-decoration:none;
+    transition:background var(--dur) var(--ease),box-shadow var(--dur) var(--ease),
+               border-bottom-color var(--dur) var(--ease);
+  }
+  .bookcard:hover,.bookcard:focus-visible{
+    background:var(--wash);border-bottom-color:var(--edge-warm);
+    box-shadow:inset 2px 0 0 var(--brass);
+    text-decoration:none;color:var(--paper);
+  }
+  .bookcard:hover .ctitle{color:var(--brass-lift)}
+
+  /* 封面：小、竖、贴边。它是缩略图，不是主角。 */
   .cover{
-    flex:0 0 auto;width:46px;height:62px;border-radius:var(--r1);
+    flex:0 0 auto;width:38px;height:52px;border-radius:1px;
     overflow:hidden;display:flex;align-items:center;justify-content:center;
-    background:linear-gradient(150deg,#2a231a,#181410);
-    border:1px solid var(--line-soft);
-    box-shadow:2px 3px 10px rgba(0,0,0,.45);
+    background:linear-gradient(150deg,#1d2621,#131a16);
+    border:1px solid var(--rule-strong);
   }
   .cover img{width:100%;height:100%;object-fit:cover;display:block}
-  .nocover{
-    font-family:var(--mono);font-size:.6rem;letter-spacing:.04em;
-    color:var(--paper-dim);text-align:center;padding:2px;word-break:break-all;line-height:1.3;
+  /* 无封面：格式首字母。字号够大（13px），不是一个看不清的小疙瘩。 */
+  .mk2{
+    font-family:var(--mono);font-size:.8rem;letter-spacing:0;
+    color:var(--paper-dim);line-height:1;
   }
 
-  .cbody{display:flex;flex-direction:column;gap:2px;min-width:0;flex:1}
+  .cbody{min-width:0;display:flex;flex-direction:column;gap:2px}
   .ctitle{
-    font-family:var(--serif);font-size:1rem;letter-spacing:.02em;line-height:1.35;
-    /* 标题最多两行，超出省略 —— 避免破坏网格节奏 */
+    font-family:var(--serif);font-size:1.02rem;letter-spacing:.01em;line-height:1.4;
+    /* 最多两行，超出省略 —— 避免长书名破坏行节奏 */
     display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;
     word-break:break-word;
   }
-  .cauthor{font-size:.8rem;color:var(--paper-dim);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-  /* 署名：刻意做得比作者更淡 —— 它是「谁传的」，不是作品信息。
-
-     用方角（--r1）而不是胶囊：整个站是纸与木的方正语汇，
-     胶囊只留给两个地方 —— 上传进度条（4px 高，胶囊是唯一合理形状）
-     与首页的集体署名行。 */
+  /* 作者 + 署名同一行。署名是一个「谁传的」的小标记，
+     用铜绿的极小字＋前置一个小方块，而不是一条横贯卡片的琥珀色条。 */
+  .cline{display:flex;align-items:center;gap:var(--s2);min-width:0;flex-wrap:wrap}
+  .cauthor{
+    font-size:var(--fz-sm);color:var(--paper-dim);
+    overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:100%;
+  }
   .ccredit{
-    display:inline-block;margin-top:.3rem;padding:0 .4rem;font-size:.72rem;
-    color:var(--glow);background:rgba(255,180,77,.09);
-    border-left:2px solid rgba(255,180,77,.45);
-    max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
+    display:inline-flex;align-items:center;gap:4px;
+    font-size:.72rem;color:var(--jade);white-space:nowrap;flex:0 0 auto;
   }
-  .cmeta{font-size:.75rem;color:var(--paper-dim);font-family:var(--mono);letter-spacing:.02em}
-  .cmeta .fmt{color:var(--glow);font-weight:600}
+  .ccredit::before{
+    content:"";width:5px;height:5px;background:var(--jade-deep);
+    border-radius:1px;flex:0 0 auto;
+  }
 
-  /* ── 空状态 ── */
-  .empty{
-    display:flex;flex-direction:column;align-items:center;gap:var(--s2);
-    padding:var(--s8) var(--s4);text-align:center;
-    border:1px dashed var(--line);border-radius:var(--r3);
-    color:var(--paper-dim);
+  /* 右对齐的数字列：格式 + 大小。
+     等宽、tabular-nums，让整列在垂直方向对齐 —— 这是目录的秩序感来源。 */
+  .cend{
+    display:flex;flex-direction:column;align-items:flex-end;gap:1px;
+    text-align:right;flex:0 0 auto;
   }
-  .emptymark{color:var(--glow);opacity:.75}
-  .emptytitle{font-family:var(--serif);font-size:1.15rem;color:var(--paper);letter-spacing:.06em}
-  .emptysub{font-size:.88rem;margin-bottom:var(--s3)}
+  .cend .fmt{
+    font-family:var(--mono);font-size:.72rem;font-weight:400;
+    letter-spacing:.06em;color:var(--paper-dim);
+  }
+  .csize{
+    font-family:var(--mono);font-size:.72rem;color:var(--paper-faint);
+    font-variant-numeric:tabular-nums;white-space:nowrap;
+  }
+
+  /* ── 空状态：共用 .empty，只补一个按钮间距 ── */
+  .empty .btn{margin-top:var(--s4)}
+  .empty span{font-size:.9rem}
 
   /* ── 提示条 ── */
   .note{
     margin-top:var(--s5);padding:var(--s3) var(--s4);
-    border-left:2px solid var(--glow);background:rgba(255,180,77,.06);
-    border-radius:0 var(--r1) var(--r1) 0;
-    font-size:.85rem;color:var(--paper-dim);
+    border-left:2px solid var(--jade-deep);background:var(--wash);
+    font-size:var(--fz-sm);color:var(--paper-dim);
   }
 
-  /* ── 移动端 ── */
-  @media (max-width:560px){
-    .grid{grid-template-columns:1fr}
-    .ctitle{font-size:.95rem}
+  /* ── 响应式 ──
+     手机上把「目录」和「大小」隐去：它们是补充信息，
+     占地比它们传达的内容多。 */
+  @media (max-width:640px){
+    .bookcard{gap:var(--s3);padding:var(--s3) 0}
+    .cover{width:34px;height:46px}
+    .ctitle{font-size:.97rem}
+    /* 大小不在手机上藏起来：48.8 MB 这类数字是「点不点开」的判断依据，
+       而它只占约 50px 宽的一列。挤不下的其实只有格式名，所以改小一点。 */
+    .cend{gap:0}
+    .cend .fmt,.csize{font-size:.68rem}
+    /* 手机上保留本数：它恰恰是「点不点开」的判断依据，
+       不该和装饰性的「目录」二字一起被藏掉。 */
+    .dirs{grid-template-columns:1fr;border-bottom:0}
+    .shelfcard{grid-template-columns:1.9rem minmax(0,1fr) auto;gap:var(--s3)}
   }
 </style></head>
 <body>
 <div class="wrap">
 
-  <div class="bar-head reveal" style="animation-delay:.03s">
+  <div class="bar-head">
     <span class="mk"><a href="/">we·books</a></span>
     <span class="count">${children.length} 项${extra.truncatedNote ? ` · ${esc(extra.truncatedNote)}` : ''}</span>
   </div>
 
-  <nav class="crumbs reveal" style="animation-delay:.08s" aria-label="面包屑">${crumbs(davPath, mountPath)}</nav>
+  <nav class="crumbs" aria-label="面包屑">${crumbs(davPath, mountPath)}</nav>
 
-  <h1 class="reveal" style="animation-delay:.12s">${esc(friendlyTitle(davPath))}</h1>
+  <h1>${esc(friendlyTitle(davPath))}</h1>
 
-  ${hasAny ? `<div class="grid">
-${collections.length ? gridOf(collections) : ''}
-${files.length ? gridOf(files) : ''}
-  </div>` : empty}
+  ${hasAny ? `
+  ${collections.length ? `<section class="sec dirs">
+${collectionsHtml}
+  </section>` : ''}
+  ${files.length ? `<section class="sec books">
+${filesHtml}
+  </section>` : ''}` : empty}
 
   ${extra.truncatedNote ? `<p class="note">只显示本页条目。用下一页继续，或用 WebDAV 客户端挂载获取完整列表。</p>` : ''}
 
