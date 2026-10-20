@@ -61,6 +61,38 @@ export async function listBucketTotals(
   return results ?? [];
 }
 
+/**
+ * 每个集合有多少个非空桶 —— **一条** GROUP BY 查询。
+ *
+ * 用于书库根目录：五个入口如果都不带信息，读者无法判断哪一格值得点开。
+ * 而它们带的不是「总册数」（五个集合覆盖同一批书，全都写「15 本」
+ * 等于什么都没说），是**分法的粒度**：
+ *   按书名 → 13 个字母桶，按作者 → 10 个，按类型 → 2 种，按格式 → 4 种。
+ * 「13 个字母」和「2 种类型」是完全不同的信息，而且正是
+ * 「哪一格有货」这个判断所需要的。
+ *
+ * buckets 表行数 ≤ 28，这条查询与已有的 listBucketTotals 同量级。
+ */
+export async function listBucketCounts(
+  db: D1Database,
+): Promise<Record<string, number>> {
+  // recent 集合只有一个 all 桶（COUNT(*) = 1），但它的「1」
+  // 应该是**总册数** —— 最近收录不按桶分，直接列书。
+  // SUM(total) 对分桶集合是无意义的（13 个字母桶加起来还是 15），
+  // 所以这里两者都取：分桶集合用桶数，recent 用总数。
+  const { results } = await db
+    .prepare(
+      `SELECT collection, COUNT(*) AS n, SUM(total) AS total FROM buckets
+        WHERE total > 0 GROUP BY collection`,
+    )
+    .all<{ collection: string; n: number; total: number }>();
+  const out: Record<string, number> = {};
+  for (const r of results ?? []) {
+    out[r.collection] = r.collection === 'recent' ? r.total : r.n;
+  }
+  return out;
+}
+
 export async function getBucketTotal(
   db: D1Database,
   collection: CollectionId,

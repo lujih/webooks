@@ -44,16 +44,18 @@ ${themeCss()}
   .ask{border-top:1px solid var(--rule-strong);padding-top:var(--s4);margin:var(--s6) 0 var(--s8)}
   form{
     display:grid;gap:var(--s3) var(--s4);align-items:end;
-    grid-template-columns:minmax(0,1.7fr) minmax(0,1.1fr) auto;
+    grid-template-columns:minmax(0,1.6fr) minmax(0,1fr) auto;
   }
-  .field{display:flex;flex-direction:column;gap:var(--s1);min-width:0}
+  /* label 与输入框之间 4px 太紧：标签几乎贴在输入线上。
+     8px 才读得出「这是上面那个框的标签」。 */
+  .field{display:flex;flex-direction:column;gap:8px;min-width:0}
   label{font-size:var(--fz-sm);color:var(--paper-dim);letter-spacing:.04em}
   /* 不写「（必填）」「（不知道可以不填）」这类括号补充 ——
      前者由 required 属性表达，后者用「可留空」三个字更轻。 */
   .opt{color:var(--paper-faint)}
   input[type=text]{
     width:100%;min-height:44px;padding:.5rem 0;
-    font:inherit;font-size:1rem;color:var(--paper);
+    font:inherit;font-size:var(--fz-md);color:var(--paper);
     background:transparent;border:0;border-radius:0;
     border-bottom:1px solid var(--edge);
     transition:border-bottom-color var(--dur) var(--ease);
@@ -62,7 +64,9 @@ ${themeCss()}
   input[type=text]:focus{outline:none;border-bottom-color:var(--brass)}
   /* 键盘焦点必须有可见形态，不能只改下划线颜色 */
   input[type=text]:focus-visible{outline:2px solid var(--brass);outline-offset:4px}
-  form .btn{align-self:end}
+  /* 按钮底与输入线的底对齐（align-items:end 已做），
+     再加一点右边距，让它不贴着「作者」那条下划线的末端。 */
+  form .btn{align-self:end;margin-bottom:0;margin-right:var(--s2)}
 
   /* ── 消息 ── */
   .msg{margin-top:var(--s3);font-size:var(--fz-sm);line-height:1.7;min-height:1.4em}
@@ -76,7 +80,7 @@ ${themeCss()}
     padding-bottom:var(--s2);border-bottom:1px solid var(--rule-strong);
   }
   .wall-head h2{
-    font-family:var(--serif);font-weight:400;font-size:.95rem;
+    font-family:var(--serif);font-weight:400;font-size:var(--fz-sm);
     letter-spacing:.12em;color:var(--paper-dim);
   }
   .count{font-size:var(--fz-xs);color:var(--paper-faint);font-variant-numeric:tabular-nums}
@@ -101,21 +105,24 @@ ${themeCss()}
     padding:.66rem 0;border-bottom:1px solid var(--rule);
   }
   .rn{
-    font-family:var(--mono);font-size:.72rem;color:var(--paper-faint);
+    font-family:var(--mono);font-size:var(--fz-micro);color:var(--paper-faint);
     font-variant-numeric:tabular-nums;letter-spacing:.04em;
   }
   .rmain{min-width:0}
   /* 书名：衬线，与书库里的书名同族 */
-  .rtitle{font-family:var(--serif);font-size:1.02rem;letter-spacing:.01em;color:var(--paper);line-height:1.45;word-break:break-word}
+  .rtitle{font-family:var(--serif);font-size:var(--fz-md);letter-spacing:.01em;color:var(--paper);line-height:1.45;word-break:break-word}
   /* 作者是补充信息，用次要色，不加「· 」前缀（那是 meta 串的模板腔） */
   .rauthor{font-size:var(--fz-sm);color:var(--paper-dim);margin-left:var(--s2)}
   .rwhen{
-    font-family:var(--mono);font-size:.72rem;color:var(--paper-faint);
+    font-family:var(--mono);font-size:var(--fz-micro);color:var(--paper-faint);
     white-space:nowrap;font-variant-numeric:tabular-nums;
   }
-  /* 「N 人求」是这一行里唯一值得被注意的信息 —— 也是全页唯一的黄铜数字 */
+  /* 「N 人求」是这一行里唯一值得被注意的信息 ——
+     但它是**数据**，不是交互，所以用铜绿（--jade）而不是黄铜。
+     7 个黄铜数字排成一列，等于整页有 7 个平级的声音在喊；
+     而黄铜在本设计里只留给「挂上去」按钮和 hover 态。 */
   .rhits{
-    font-family:var(--mono);font-size:.78rem;color:var(--brass);
+    font-family:var(--mono);font-size:var(--fz-xs);color:var(--jade);
     white-space:nowrap;min-width:4.6em;text-align:right;
     font-variant-numeric:tabular-nums;
   }
@@ -150,8 +157,7 @@ ${themeCss()}
 
   <h1>找不到想看的书</h1>
   <p class="lede">
-    写下书名，它会出现在下面的清单里。有人手上有这本就会来上传 ——
-    上架之后管理员会把它从清单里划掉。同一本书合并成一条，求的人越多越靠前。
+    写下书名，它会出现在下面的清单里。有人手上有这本就会来上传。
   </p>
 
   <section class="ask">

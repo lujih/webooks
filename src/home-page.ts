@@ -43,21 +43,20 @@ export function indexHtml(mountPath: string, r2PublicBase: string | null): strin
   // 所以想让它们显示中文，路径本身就必须是中文。
   const seg = (id: CollectionId) => encodeURIComponent(collectionSegment(id));
   const shelves = [
-    { path: `${mount}${seg('recent')}/`, title: '最近收录', sub: '新上架的书，按时间倒序', icon: '新' },
-    { path: `${mount}${seg('type')}/`, title: '按类型', sub: '电子书 / 漫画', icon: '类' },
-    { path: `${mount}${seg('title')}/`, title: '按书名', sub: '中文按拼音首字母，英文按字母', icon: '名' },
-    { path: `${mount}${seg('author')}/`, title: '按作者', sub: '同一个作者的书挨在一起', icon: '著' },
-    { path: `${mount}${seg('format')}/`, title: '按格式', sub: 'EPUB / PDF / CBZ…', icon: '式' },
+    { path: `${mount}${seg('recent')}/`, title: '最近收录', sub: '新上架的书，按时间倒序' },
+    { path: `${mount}${seg('type')}/`, title: '按类型', sub: '电子书 / 漫画' },
+    { path: `${mount}${seg('title')}/`, title: '按书名', sub: '中文按拼音，英文按字母' },
+    { path: `${mount}${seg('author')}/`, title: '按作者', sub: '同一作者的书放在一起' },
+    { path: `${mount}${seg('format')}/`, title: '按格式', sub: 'EPUB / PDF / CBZ…' },
   ];
   const shelfHtml = shelves
     .map((s, i) => {
       // 编号是目录页的真实语汇（01…05），不是装饰性序号。
-      // 汉字索引（新/类/名/著/式）保留在可访问名里，供屏幕阅读器与快速扫读。
       const n = String(i + 1).padStart(2, '0');
       return `
   <a class="shelf" href="${s.path}" title="${esc(s.title)}">
     <span class="sn" aria-hidden="true">${n}</span>
-    <span class="st">${esc(s.title)}<span class="sg" aria-hidden="true">${s.icon}</span></span>
+    <span class="st">${esc(s.title)}</span>
     <span class="ss">${esc(s.sub)}</span>
   </a>`;
     })
@@ -83,13 +82,18 @@ ${themeCss()}
   .hero h1{
     font-family:var(--serif);font-weight:400;
     font-size:var(--fz-hero);line-height:1.16;letter-spacing:.01em;
-    color:var(--paper);max-width:20ch;
+    color:var(--paper);
   }
+  /* 两段各自成行，断点在语义边界上（修饰语 / 名词）。
+     原来是一个硬编码的 <br>：文案一改，断点就落在错的地方；
+     而 max-width:20ch 对中文是无效的（1ch=36.6px，而 10 个汉字只要 576px，
+     约束根本没起作用）。 */
+  .hero h1 span{display:block}
   /* 引言里的 <b> 不是「给一个词上色」那种模板腔 ——
      它标的是这句话里唯一的硬信息（不用注册、不用等审核）。 */
   .hero p{
     margin-top:var(--s5);max-width:36rem;
-    color:var(--paper-dim);font-size:1rem;line-height:1.95;
+    color:var(--paper-dim);font-size:var(--fz-md);line-height:1.95;
   }
   .hero p b{color:var(--paper);font-weight:600}
 
@@ -120,11 +124,19 @@ ${themeCss()}
     grid-column:1/-1;
     font-size:var(--fz-xs);color:var(--paper-dim);letter-spacing:.16em;
   }
+  /* 书名是这张卡上唯一可点的东西 —— 实测高度 29px，低于 44px 的触控目标。
+     撑到 44px 用 padding（不用 min-height，否则会破坏 baseline 对齐）。 */
+  /* 书名是**纸色**，不是黄铜。
+     它在 /dav/最近收录/ 里是普通的纸色行内书名 —— 同一个字在两页
+     两种颜色两种字号，读者会以为它被特别标记了。它唯一的特别之处是
+     「刚上架」，而那件事由上沿那道 2px 暖边承担，字色不必重复。
+     字号也收一档（--fz-lg），让 h1 → section h2 → 行内书名三级递减。 */
   .freshtitle{
-    font-family:var(--serif);font-size:1.32rem;letter-spacing:.01em;
-    line-height:1.35;word-break:break-word;min-width:0;
+    display:inline-flex;align-items:center;min-height:44px;
+    font-family:var(--serif);font-size:var(--fz-lg);letter-spacing:.01em;
+    line-height:1.4;word-break:break-word;min-width:0;color:var(--paper);
   }
-  .fresh:hover .freshtitle{color:var(--brass-lift)}
+  .fresh:hover .freshtitle{color:var(--paper)}
   .freshmeta{
     font-size:var(--fz-sm);color:var(--paper-dim);
     font-variant-numeric:tabular-nums;white-space:nowrap;
@@ -142,7 +154,7 @@ ${themeCss()}
     margin-bottom:0;
   }
   .sec-head h2{
-    font-family:var(--serif);font-weight:400;font-size:1.06rem;
+    font-family:var(--serif);font-weight:400;font-size:var(--fz-md);
     letter-spacing:.1em;color:var(--paper);
   }
   .sec-note{font-size:var(--fz-sm);color:var(--paper-dim);margin-left:auto}
@@ -166,17 +178,11 @@ ${themeCss()}
     text-decoration:none;color:var(--paper);
   }
   .sn{
-    font-family:var(--mono);font-size:.72rem;color:var(--paper-faint);
+    font-family:var(--mono);font-size:var(--fz-micro);color:var(--paper-faint);
     font-variant-numeric:tabular-nums;transition:color var(--dur) var(--ease);
   }
   .shelf:hover .sn{color:var(--brass)}
-  .st{font-family:var(--serif);font-size:1.06rem;letter-spacing:.05em;white-space:nowrap}
-  /* 汉字索引：只在大屏出现，且做得很小 —— 它是个提示，不是图标 */
-  .sg{
-    font-size:.74rem;color:var(--paper-faint);margin-left:.6em;
-    letter-spacing:0;transition:color var(--dur) var(--ease);
-  }
-  .shelf:hover .sg{color:var(--jade)}
+  .st{font-family:var(--serif);font-size:var(--fz-md);letter-spacing:.05em;white-space:nowrap}
   .ss{
     font-size:var(--fz-sm);color:var(--paper-dim);
     text-align:right;justify-self:end;min-width:0;
@@ -188,11 +194,17 @@ ${themeCss()}
   .roll-list{
     list-style:none;display:grid;
     /* auto-fit：名字少时会撑满整行，不会在右边留一段空白 */
-    grid-template-columns:repeat(auto-fit,minmax(11rem,1fr));
+    grid-template-columns:repeat(auto-fit,minmax(12rem,1fr));
     border-bottom:1px solid var(--rule);
   }
+  /* 每一格是两列：名字 + 本数。
+     之前是 flex + ml:auto，格子宽度随名字长短变化 ——
+     「Mira 2 本」和「林小满 2 本」的数字落在不同位置，
+     几行拼起来读成一串挤在一起的字。
+     固定两列后，本数在每一格里都右对齐成一条竖线。 */
   .roll-list li{
-    display:flex;align-items:baseline;gap:var(--s2);
+    display:grid;grid-template-columns:minmax(0,1fr) auto;
+    align-items:baseline;gap:var(--s3);
     padding:.62rem var(--s3) .58rem 0;
     border-bottom:1px solid var(--rule);
     min-width:0;
@@ -212,28 +224,31 @@ ${themeCss()}
   }
   /* 本数：右对齐、等宽数字。琥珀只在这一处出现，因为它是唯一值得看的数字。 */
   .roll-list .n{
-    font-family:var(--mono);font-size:.74rem;color:var(--brass);
-    font-variant-numeric:tabular-nums;white-space:nowrap;margin-left:auto;
+    font-family:var(--mono);font-size:var(--fz-micro);color:var(--brass);
+    font-variant-numeric:tabular-nums;white-space:nowrap;text-align:right;
   }
   /* 集体行：名字与说明之间拉一条点线（借书卡上的引导线） */
   .roll-list li.collective .who{letter-spacing:.18em;flex:0 0 auto}
   .roll-list li.collective .tail{
-    flex:1;min-width:20px;height:1px;align-self:center;
+    flex:0 1 6rem;min-width:16px;height:1px;align-self:center;
     background:repeating-linear-gradient(90deg,var(--rule-strong) 0 3px,transparent 3px 7px);
   }
   .roll-list li.collective .what{
     font-size:var(--fz-sm);color:var(--paper-dim);white-space:nowrap;
   }
+  /* 集体行是 flex（不是两列网格），数字靠 ml:auto 顶到右边 */
+  .roll-list li.collective{display:flex}
   .roll-list li.collective .join{
+    display:inline-flex;align-items:center;min-height:44px;padding:0 var(--s2);
     font-size:var(--fz-sm);color:var(--brass);
-    border-bottom:1px solid var(--edge-warm);padding-bottom:1px;
-    white-space:nowrap;margin-left:var(--s3);
+    border-bottom:1px solid var(--edge-warm);
+    white-space:nowrap;margin-left:var(--s2);
   }
   .roll-list li.collective .join:hover{color:var(--brass-lift);text-decoration:none}
   /* 个人条目的本数退后半步：集体那一条才是重点 */
   .roll-list li.personal .n{color:var(--paper-dim)}
 
-  .roll-empty{padding:var(--s5) 0;font-size:.92rem;color:var(--paper-dim);line-height:1.85}
+  .roll-empty{padding:var(--s5) 0;font-size:var(--fz-sm);color:var(--paper-dim);line-height:1.85}
   .roll-empty a{color:var(--brass)}
 
   /* ── 两种打开方式 ── */
@@ -242,13 +257,13 @@ ${themeCss()}
     counter-increment:step;position:relative;
     padding:var(--s4) 0 var(--s4) 3.2rem;
     border-bottom:1px solid var(--rule);
-    color:var(--paper-dim);font-size:.95rem;line-height:1.85;
+    color:var(--paper-dim);font-size:var(--fz-sm);line-height:1.85;
   }
   .howto li:last-child{border-bottom:0}
   .howto li::before{
     content:counter(step,decimal-leading-zero);
     position:absolute;left:0;top:var(--s4);
-    font-family:var(--mono);font-size:.75rem;color:var(--paper-faint);
+    font-family:var(--mono);font-size:var(--fz-xs);color:var(--paper-faint);
     letter-spacing:.06em;
   }
   .howto li b{color:var(--paper);font-weight:600}
@@ -257,11 +272,16 @@ ${themeCss()}
   /* ── 响应式 ── */
   @media (max-width:720px){
     .hero h1{max-width:none}
+    /* 三个按钮在手机上等宽一行：原来第二个太长，把第三个挤到下一行，
+       三行参差的按钮看起来像没排完。 */
+    .cta{display:grid;grid-template-columns:1fr 1fr;gap:var(--s2)}
+    .cta .btn{width:100%}
+    /* 「进入书库」是第三项，单独占满一行 —— 它是次要动作 */
+    .cta .btn:last-child{grid-column:1/-1}
     .shelf{grid-template-columns:1.9rem minmax(0,1fr);gap:var(--s2) var(--s3);row-gap:0}
     /* 手机上没有横向空间放右对齐的说明，让它掉到第二行、靠左 */
-    .ss{grid-column:2;text-align:left;justify-self:start;font-size:.78rem;padding-bottom:.55rem}
+    .ss{grid-column:2;text-align:left;justify-self:start;font-size:var(--fz-xs);padding-bottom:.55rem}
     .st{white-space:normal}
-    .sg{display:none}
     .fresh{grid-template-columns:1fr}
     .freshmeta{white-space:normal}
     .roll-list{grid-template-columns:1fr 1fr}
@@ -276,16 +296,15 @@ ${themeCss()}
 
   <div class="bar-head">
     <span class="mk"><a href="/">we·books</a></span>
-    <span class="tag">公共电子书库 · 开架免审 · 匿名</span>
+    <span class="tag">公共电子书库</span>
   </div>
 
   <section class="hero">
-    <h1>一间不熄灯的<br>公共书库</h1>
-    <p>任何人随时能放一本书进来，<b>不需要注册，也不用等审核</b>。
-       浏览器直接看，或者用 WebDAV 客户端把它挂成本地盘。</p>
+    <h1><span>一间不熄灯的</span><span>公共书库</span></h1>
+    <p>任何人随时能放一本书进来，<b>不需要注册，也不用等审核</b>。</p>
     <div class="cta">
       <a class="btn btn-primary" href="/upload">上架一本书</a>
-      <a class="btn" href="/requests">找不到想看的？挂个求书</a>
+      <a class="btn" href="/requests">挂个求书</a>
       <a class="btn" href="${mount}">进入书库</a>
     </div>
   </section>
@@ -297,7 +316,6 @@ ${themeCss()}
   <section class="shelves-sec">
     <div class="sec-head">
       <h2>从哪里找</h2>
-      <span class="sec-note">点开任意一条，或用上面的 WebDAV 地址挂载</span>
     </div>
     <nav class="shelves" aria-label="书库入口">
 ${shelfHtml}
@@ -318,8 +336,8 @@ ${shelfHtml}
       <h2>两种打开方式</h2>
     </div>
     <ol>
-      <li><b>浏览器直开</b> —— 点上方的入口，或者在地址栏访问 <code>${esc(mount)}</code>。点书名直接从 R2 下载，不经过本站服务器。</li>
-      <li><b>WebDAV 客户端</b> —— rclone / RaiDrive / Cyberduck 连 <code>${esc(mount)}</code>，完整 Class 2 锁 + MS 扩展，和本地文件夹一样用。</li>
+      <li><b>浏览器直开</b> —— 点上方的入口。书名直接跳 R2 下载，不过本站服务器。</li>
+      <li><b>WebDAV 客户端</b> —— rclone / RaiDrive / Cyberduck 连 <code>${esc(mount)}</code>，当成本地文件夹用。</li>
     </ol>
   </section>
 

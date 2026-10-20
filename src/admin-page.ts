@@ -26,14 +26,19 @@ ${themeCss()}
   /* ── 登录 ──
      不再是一张居中的卡片：口令输入是这个后台唯一的入口动作，
      它应该像一张**登记签收单** —— 一条说明、一行下划线、一颗按钮。 */
-  .login{max-width:30rem;border-top:2px solid var(--brass);padding-top:var(--s4)}
+  /* 线横贯版心，不只画 480px。
+     原来 .login 有 max-width:30rem，暖线只到 480px，而 h1 宽 976px ——
+     那条线读起来像标题下面断掉的半截线。
+     现在把它提到 .login 之外：线 + 标题 + 说明 + 表单，构成一个完整的区。 */
+  .login{border-top:2px solid var(--brass);padding-top:var(--s4)}
+  .login .field{max-width:30rem}
   .login p{color:var(--paper-dim);font-size:var(--fz-sm);line-height:1.8;margin-bottom:var(--s5)}
-  .login code{font-size:.86em}
+  .login code{font-size:var(--fz-micro)}
   .login .field{display:flex;flex-direction:column;gap:var(--s1);margin-bottom:var(--s4)}
   label{font-size:var(--fz-sm);color:var(--paper-dim);letter-spacing:.04em}
   input[type=password],input[type=text]{
     width:100%;min-height:44px;padding:.5rem 0;
-    font:inherit;font-size:1rem;color:var(--paper);
+    font:inherit;font-size:var(--fz-md);color:var(--paper);
     background:transparent;border:0;border-radius:0;
     border-bottom:1px solid var(--edge);
     transition:border-bottom-color var(--dur) var(--ease);
@@ -45,7 +50,7 @@ ${themeCss()}
   /* ── 分段标题 ── */
   .h2{
     display:flex;align-items:baseline;gap:var(--s3);flex-wrap:wrap;
-    font-family:var(--serif);font-weight:400;font-size:.95rem;
+    font-family:var(--serif);font-weight:400;font-size:var(--fz-sm);
     letter-spacing:.12em;color:var(--paper-dim);
     margin:var(--s7) 0 0;padding-bottom:var(--s2);
     border-bottom:1px solid var(--rule-strong);
@@ -68,7 +73,7 @@ ${themeCss()}
   .dot2.ok{background:var(--jade);box-shadow:0 0 0 3px rgba(143,179,164,.14)}
   .dot2.no{background:var(--er);box-shadow:0 0 0 3px rgba(239,139,124,.16);animation:flicker 1.8s ease-in-out infinite}
   .sectext{display:flex;align-items:baseline;gap:var(--s3);flex-wrap:wrap;min-width:0}
-  .sectitle{font-family:var(--serif);font-size:.95rem;letter-spacing:.02em;color:var(--paper)}
+  .sectitle{font-family:var(--serif);font-size:var(--fz-sm);letter-spacing:.02em;color:var(--paper)}
   .sechint{font-size:var(--fz-xs);color:var(--paper-dim);line-height:1.7;word-break:break-word;flex:1 1 14rem}
 
   /* ── 工具条 ── */
@@ -82,23 +87,23 @@ ${themeCss()}
 
   /* ── 书列表：一张真正的表（等宽数字，右对齐的大小与日期） ── */
   .tablewrap{overflow-x:auto;-webkit-overflow-scrolling:touch}
-  table{width:100%;border-collapse:collapse;font-size:.88rem}
+  table{width:100%;border-collapse:collapse;font-size:var(--fz-sm)}
   th,td{text-align:left;padding:.55rem .5rem .55rem 0;border-bottom:1px solid var(--rule);vertical-align:top}
   th{
-    font-family:var(--serif);font-weight:400;font-size:.76rem;
+    font-family:var(--serif);font-weight:400;font-size:var(--fz-xs);
     letter-spacing:.1em;color:var(--paper-faint);
     border-bottom-color:var(--rule-strong);
   }
-  td.muted,th.num{ text-align:right;font-variant-numeric:tabular-nums;font-family:var(--mono);font-size:.74rem }
+  td.muted,th.num{ text-align:right;font-variant-numeric:tabular-nums;font-family:var(--mono);font-size:var(--fz-micro) }
   th.num{font-family:var(--serif);letter-spacing:.1em}
   tr:hover td{background:var(--wash)}
   td.name{min-width:12rem}
-  td.name .t{font-family:var(--serif);font-size:.96rem;line-height:1.4;word-break:break-word}
+  td.name .t{font-family:var(--serif);font-size:var(--fz-md);line-height:1.4;word-break:break-word}
   td.name .a{color:var(--paper-dim);font-size:var(--fz-xs)}
-  td.name .muted{text-align:left;color:var(--paper-faint);font-size:.7rem;word-break:break-all}
+  td.name .muted{text-align:left;color:var(--paper-faint);font-size:var(--fz-micro);word-break:break-all}
   /* 格式标签：方角小字，不是胶囊 */
   .pill{
-    display:inline-block;font-family:var(--mono);font-size:.68rem;
+    display:inline-block;font-family:var(--mono);font-size:var(--fz-micro);
     letter-spacing:.04em;padding:0 .3rem;border-radius:var(--r1);
     border:1px solid var(--rule-strong);color:var(--paper-dim);
   }
@@ -170,7 +175,7 @@ ${themeCss()}
 
   <!-- 未登录 -->
   <section class="login" id="loginBox">
-    <p>粘贴部署时设的 <code>ADMIN_TOKEN</code>。口令只存在这个标签页里，<b>关掉就没了</b>，不会写进 Cookie，所以不存在「被别人从 cookie 里读走」这回事。</p>
+    <p>粘贴部署时设的 <code>ADMIN_TOKEN</code>。口令只存在这个标签页里，关掉就没了。</p>
     <label for="tok">管理口令</label>
     <input type="password" id="tok" autocomplete="current-password" placeholder="粘贴 ADMIN_TOKEN">
     <button class="btn btn-primary" id="loginBtn" style="margin-top:var(--s4)">进入</button>
@@ -385,7 +390,7 @@ function markBtn(r, status, label) {
   //    会被 HTML 解析器当成真的闭合标签，导致后面的 JS 全变成正文。
   //    （踩过一次：pages-syntax.test.ts 报 "Unexpected end of input"。）
   const payload = JSON.stringify({ status: status, bookId: r.fulfilledBookId || null });
-  return '<button class="btn" style="padding:3px 9px;font-size:.78rem" data-rid="'
+  return '<button class="btn" style="padding:3px 9px;font-size:var(--fz-xs)" data-rid="'
     + esc(r.id) + '" data-payload="' + esc(payload) + '">' + label + '</button> ';
 }
 
@@ -418,7 +423,7 @@ async function loadCredits() {
   const rows = data.contributors.map(function (c) {
     return '<tr><td>' + esc(c.name) + '</td><td>' + c.books + ' 本</td></tr>';
   }).join('');
-  wrap.innerHTML = '<p style="font-size:.82rem;color:var(--paper-dim);margin:0 0 var(--s2)">'
+  wrap.innerHTML = '<p style="font-size:var(--fz-xs);color:var(--paper-dim);margin:0 0 var(--s2)">'
     + '共 ' + data.totalBooks + ' 本，其中 ' + data.namedContributors + ' 本有署名上传'
     + '</p><table><thead><tr><th>上传者</th><th>贡献</th></tr></thead><tbody>'
     + rows + '</tbody></table>';

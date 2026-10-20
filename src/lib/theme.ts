@@ -80,12 +80,20 @@ export function themeCss(): string {
     --sans:-apple-system,BlinkMacSystemFont,"PingFang SC","Hiragino Sans GB","Noto Sans CJK SC","Source Han Sans SC","Microsoft YaHei","Segoe UI",Roboto,sans-serif;
     --mono:ui-monospace,"SF Mono",Menlo,Consolas,"Liberation Mono","DejaVu Sans Mono",monospace;
 
-    /* ── 字号 ── */
-    --fz-xs:.75rem;
-    --fz-sm:.85rem;
-    --fz-md:1rem;
-    --fz-lg:1.2rem;
-    --fz-title:clamp(1.55rem,3.6vw,2.05rem);
+    /* ── 字号 ──
+       刻意用 px 而不是 rem：rem 会跟着 body 的 font-size 缩放，而
+       移动端把 body 调到 15px —— 于是 0.72rem 的小字在手机上缩到
+       10.9px。实测（见 docs/frontend-design.md）小标签成片掉到 11px 上下，
+       那是「靠小字营造精致」，不是精致。
+
+       px 还带来一个好处：下限是**写死的**。12px 是这条站能接受的最小字，
+       任何需要更小的地方都不该用字解决。 */
+    --fz-micro:12px;   /* 硬下限：序号、格式、大小、署名 */
+    --fz-xs:12.5px;   /* 辅助说明 */
+    --fz-sm:13.5px;   /* 次要正文 */
+    --fz-md:15px;     /* 列表行正文 */
+    --fz-lg:18px;     /* 强调 */
+    --fz-title:clamp(1.6rem,3.6vw,2.05rem);
     --fz-hero:clamp(2.3rem,5.6vw,3.6rem);
 
     /* ── 间距（4px 基准） ── */
@@ -113,6 +121,13 @@ export function themeCss(): string {
 
   html{scroll-behavior:smooth;-webkit-text-size-adjust:100%}
   @media (prefers-reduced-motion:reduce){html{scroll-behavior:auto}}
+
+  /* 中文排版：避免末行只剩一两个字的孤字。
+     实测上传页「只接受电子书与漫画格式。」在 390px 上末行只有「式。」两字
+     （28px 宽）—— 那是断行算法的结果，不是排版者的意图。
+     pretty 让浏览器在段落里重新找断点；balance 用在标题上。 */
+  p,li,dd{text-wrap:pretty}
+  h1,h2,h3,.hero h1{text-wrap:balance}
 
   body{
     min-height:100vh;
@@ -177,26 +192,45 @@ export function themeCss(): string {
      ⚠️ 这些元素的「下划线」一律用 text-decoration，**不能用 border-bottom**。
         它们为了凑够 44px 触控高度被拉成了高盒子，而 border 画在盒子的下边缘 ——
         于是下划线会飘在文字下方二十来像素的地方，看起来像页面上散落的破折号。
-        text-decoration 附着在文字上，盒子多高都不影响。 */
+        text-decoration 附着在文字上，盒子多高都不影响。
 
-  /* ── 代码 ── */
+     ⚠️ 这条规则**曾经整段丢失**：注释还在，声明没了，于是页脚链接
+        实测只有 20px 高（.site-foot a h=20），37 个小目标原样回归。
+        注释不会让规则生效 —— 改这里时务必确认下面这行还在。 */
+  .site-foot a,.crumbs a,.back,.mk a{
+    display:inline-flex;align-items:center;min-height:44px;box-sizing:content-box;
+  }
+  /* 高度够了（44px），但「首页」两个字只有 26px 宽 ——
+     横向 26px 的目标在手机上很难点中。给个最小宽度。 */
+  .site-foot a,.crumbs a{min-width:44px;justify-content:center}
+
+  /* ── 代码 ──
+     用 px 不用 em：em 跟着父级字号缩放，父级一缩 code 就掉到 11px 上下
+     （实测 /dav/ 与 ADMIN_TOKEN 都在 11.6~11.9px）。 */
   code{
-    font-family:var(--mono);font-size:.88em;
+    font-family:var(--mono);font-size:var(--fz-micro);
     background:var(--wash);color:var(--brass);
     padding:.1em .4em;border-radius:var(--r1);
     word-break:break-all;
   }
   pre{
-    font-family:var(--mono);font-size:.85rem;line-height:1.6;
+    font-family:var(--mono);font-size:var(--fz-sm);line-height:1.6;
     background:rgba(0,0,0,.35);border:1px solid var(--rule);
     border-radius:var(--r2);padding:var(--s4);overflow-x:auto;
   }
   pre code{background:none;color:var(--paper);padding:0}
 
   /* ── 版心 ──
-     64rem：桌面 1440 下不再是一片靠左的窄栏，
-     同时单行文字仍不超过约 44 个汉字，读起来不累。 */
-  .wrap{position:relative;z-index:1;max-width:64rem;margin:0 auto;padding:var(--s7) var(--s5) var(--s6)}
+     52rem，全站唯一一档。
+
+     原来是两档：首页/上传/后台 64rem，浏览页/求书墙 52rem。后果是
+     从首页点「进入书库」，同一个站名从 x=232 跳到 x=328 ——
+     整页内容在翻页时位移 96px。整站是一本书，版心不能中途换档。
+
+     64rem 那档也不是更好：1024px 的行放「书名 + 作者 + 格式 + 大小」，
+     右对齐的数字列被推到 x=976，视线要横跨整屏才能把书名和大小对上。
+     52rem 才是一张目录该有的宽度。 */
+  .wrap{position:relative;z-index:1;max-width:52rem;margin:0 auto;padding:var(--s7) var(--s5) var(--s6)}
 
   /* ── 页头（五页共用，别再各写一套） ── */
   .bar-head{
@@ -205,7 +239,7 @@ export function themeCss(): string {
     margin-bottom:var(--s7);
   }
   /* 站名：小字 + 大字距。这是招牌，不是标题，所以它比 h1 小得多。 */
-  .mk{font-family:var(--serif);font-size:.95rem;letter-spacing:.34em;color:var(--paper)}
+  .mk{font-family:var(--serif);font-size:var(--fz-sm);letter-spacing:.34em;color:var(--paper)}
   .mk a{color:inherit;text-decoration:none}
   .mk a:hover{color:var(--brass);text-decoration:none}
   .tag{font-size:var(--fz-sm);color:var(--paper-dim);letter-spacing:.02em}
@@ -224,7 +258,7 @@ export function themeCss(): string {
     word-break:break-word;
   }
   .lede{
-    max-width:40rem;color:var(--paper-dim);font-size:.95rem;line-height:1.9;
+    max-width:40rem;color:var(--paper-dim);font-size:var(--fz-sm);line-height:1.9;
   }
   .lede b{color:var(--paper);font-weight:600}
 
@@ -232,7 +266,7 @@ export function themeCss(): string {
   .btn{
     display:inline-flex;align-items:center;justify-content:center;gap:var(--s2);
     min-height:44px;padding:.62rem 1.1rem;
-    font-family:var(--sans);font-size:.95rem;letter-spacing:.02em;
+    font-family:var(--sans);font-size:var(--fz-sm);letter-spacing:.02em;
     border-radius:var(--r1);border:1px solid var(--edge);
     background:transparent;color:var(--paper);
     cursor:pointer;text-decoration:none;
@@ -287,11 +321,14 @@ export function themeCss(): string {
   .crumbs .sep{color:var(--paper-faint);user-select:none}
   .crumbs .here{color:var(--paper)}
 
-  /* ── 空状态（五页共用） ── */
+  /* ── 空状态（五页共用） ──
+     只有一条顶线（承接上一段的分隔），不画底线 ——
+     上下都画线会在版心两端各留一道孤零零的短横，像没画完。
+     空的东西不需要框住，留白就够了。 */
   .empty{
     display:flex;flex-direction:column;align-items:center;gap:var(--s2);
-    padding:var(--s8) var(--s4);text-align:center;
-    border-top:1px solid var(--rule);border-bottom:1px solid var(--rule);
+    padding:var(--s8) var(--s4) var(--s7);text-align:center;
+    border-top:1px solid var(--rule);
     color:var(--paper-dim);
   }
   .empty b{font-family:var(--serif);font-weight:400;font-size:1.1rem;color:var(--paper);letter-spacing:.04em}
@@ -302,11 +339,14 @@ export function themeCss(): string {
     *{transition-duration:.01ms!important}
   }
 
-  /* ── 响应式 ── */
+  /* ── 响应式 ──
+     ⚠️ 这里**不能**再缩 body 的 font-size。字号已全部改成 px 之后，
+        缩 body 只剩下一个副作用：让所有 em/rem 单位的旧规则继续变小 ——
+        而那正是把小字压到 11px 的原因。手机端要更紧凑，靠间距调整，
+        不靠缩小文字。 */
   @media (max-width:640px){
     .wrap{padding:var(--s5) var(--s4) var(--s6)}
     .bar-head{margin-bottom:var(--s5)}
-    body{font-size:15px}
   }
   `;
 }

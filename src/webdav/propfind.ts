@@ -26,7 +26,14 @@ import {
   type CollectionId,
   type DavNode,
 } from '../lib/collections';
-import { findBookByLeaf, getBucketTotal, listBooks, listBucketTotals, type BookRow } from '../lib/db';
+import {
+  findBookByLeaf,
+  getBucketTotal,
+  listBooks,
+  listBucketCounts,
+  listBucketTotals,
+  type BookRow,
+} from '../lib/db';
 import { httpDate, isoDate, multistatusResponse } from '../lib/http';
 import { encodeR2Key } from '../lib/r2';
 import { davError, davResponse, encodeHref, escapeXml, extractTagNames, multistatus, readDavBody } from '../lib/xml';
@@ -188,6 +195,11 @@ interface ResourceMeta {
    * 不进 PROPFIND 的 XML（renderProps 白名单里没有它），客户端不受影响。
    */
   childCount?: number | null;
+  /**
+   * childCount 的单位词 —— 「13 **个**字母」「2 **种**类型」。
+   * 空串表示这个集合不按桶分（最近收录直接列书）。
+   */
+  childUnit?: string;
   format?: string | null;
   /**
    * R2 公开域直链，**仅供浏览页书卡用**。
@@ -393,15 +405,23 @@ export async function collectDavEntries(
         { path: '/', isCollection: true, meta: { displayName: 'webooks' } },
       ];
       if (depth === 0) return entries;
-      // 根目录**不**带本数。五个集合覆盖的是同一批书，全都写「15 本」
-      // 等于什么都没说（而且要为它多查一次 D1，而 PROPFIND / 是客户端
-      // 挂载时打得最频繁的一枪）。真正需要数字的是下一层：
-      // 「按书名」下面的 B/C/D… 各有多少本。
+      // 根目录带**桶数**（不是总册数）：按书名 13 个字母桶、按类型 2 种、
+      // 按格式 4 种…… 五个集合覆盖同一批书，写「15 本」等于什么都没说；
+      // 写「13 个字母」才是判断「哪一格有货」需要的信息。
+      // 一次 GROUP BY 查询（buckets 表 ≤ 28 行），与 listBucketTotals 同量级。
+      const bucketCounts = await listBucketCounts(env.DB);
       for (const def of Object.values(COLLECTIONS)) {
+        const n = bucketCounts[def.id];
         entries.push({
           path: `/${def.segment}/`,
           isCollection: true,
-          meta: { displayName: def.label },
+          meta: {
+            displayName: def.label,
+            childCount: n === undefined ? null : n,
+            // 「13 个字母」「2 种类型」「15 本」—— recent 直接列书，
+            // 它的 childCount 是总册数，单位是「本」
+            childUnit: def.id === 'recent' ? '本' : def.id === 'type' ? '种' : '个',
+          },
         });
       }
       return entries;

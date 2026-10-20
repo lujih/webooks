@@ -21,18 +21,12 @@ import { themeCss } from './lib/theme';
 export function uploadHtml(turnstileSiteKey: string | null, mountPath = '/dav'): string {
   // accept 用归一化后的格式列表；浏览器据此过滤文件选择框
   const accept = ALLOWED_UPLOAD_FORMATS.map((f) => `.${f}`).join(',');
-  // 格式逐个列成小块，而不是拼成一句逗号汤 —— 后者在手机上会折成三行，
-  // 没人会去读。
-  //
-  // 但 22 个方块平铺是一堵墙：读者看不出「EPUB 和 CBT 不是一类东西」。
-  // 按电子书 / 漫画分成两行，每行一句话说得清 —— 这正是这两个数组
-  // 在 lib/collections 里被分开定义的原因，之前只是没用上。
-  const chipRow = (label: string, formats: readonly string[]): string =>
-    `<div class="fmtrow"><span class="fmtkind">${label}</span><span class="fmtlist">` +
-    formats.map((f) => `<span>${f.toUpperCase()}</span>`).join('') +
-    '</span></div>';
-  const formatChips =
-    chipRow('电子书', EBOOK_FORMATS) + chipRow('漫画', COMIC_FORMATS);
+  // 格式：主格式在前（EPUB / PDF / CBZ 是绝大多数），其余弱色跟着。
+  // 22 个格式全列出来是信息过载 —— 访客要的是「我这种行不行」，
+  // 不是一张格式表。完整白名单在 accept 属性与后端校验里。
+  const formatMain = EBOOK_FORMATS.slice(0, 3).concat(COMIC_FORMATS.slice(0, 1))
+    .map((f) => f.toUpperCase()).join(' / ');
+  const formatMore = '等 ' + ALLOWED_UPLOAD_FORMATS.length + ' 种';
   // 页脚「进入书库」：指向书库根目录。mountPath 可以是空串（根挂载），
   // 那样书库根就是站点根 '/', 否则是 '/dav/'。两种都要正确。
   const mountHref = mountPath === '' ? '/' : `${mountPath}/`;
@@ -46,38 +40,57 @@ export function uploadHtml(turnstileSiteKey: string | null, mountPath = '/dav'):
 ${themeCss()}
 
   /* ── 页头（theme 里的 .bar-head / .mk / .back / h1 直接用，不再各写一套） ── */
-  .sub{color:var(--paper-dim);font-size:.95rem;line-height:1.9;max-width:40rem;margin-bottom:var(--s6)}
+  .sub{color:var(--paper-dim);font-size:var(--fz-sm);line-height:1.9;max-width:40rem;margin-bottom:var(--s6)}
   .sub b{color:var(--paper);font-weight:600}
 
   /* ── 拖放区 ──
      不是一个大虚线框：先用一条实线起头，标题写在左上，
      说明在下面，右端是「选择文件」这个动作。虚线只画在真正
      「把东西丢进来」的那块区域上，把它压到下方一行高的窄条里。 */
-  .dropwrap{border-top:2px solid var(--brass);background:var(--wash-warm)}
+  /* 不用整块底色：深色底会让人把这块读成「一个容器」，
+     而它其实只是一块可点的区域。改成一条暖色顶线 + 一条底线，
+     里面是纸。 */
+  /* 底色只铺到标题那一行，说明文字落在纸面上 ——
+     深色块在说明文字下方断掉，那块深色就成了一个无意义的形状。
+     底边不画线：下一段 .meta 的顶线就是它的收口（两条线不叠）。 */
+  .dropwrap{
+    border-top:2px solid var(--brass);
+    background:linear-gradient(180deg,var(--wash-warm) 0%,transparent 100%);
+    padding-bottom:var(--s2);
+  }
   #drop{
     display:grid;grid-template-columns:minmax(0,1fr) auto;
     align-items:center;gap:var(--s4) var(--s5);
-    padding:var(--s5) var(--s5) var(--s5) var(--s4);
+    padding:var(--s5) var(--s5) var(--s4) var(--s4);
     cursor:pointer;
   }
   #drop:hover{background:rgba(220,168,95,.1)}
   #drop.drag,#drop.over{background:rgba(220,168,95,.16)}
   #drop:focus-visible{outline:2px solid var(--brass);outline-offset:-3px}
   .droptitle{
-    font-family:var(--serif);font-size:1.18rem;letter-spacing:.03em;
+    font-family:var(--serif);font-size:var(--fz-lg);letter-spacing:.03em;
     color:var(--paper);line-height:1.5;
   }
   .droptitle em{font-style:normal;color:var(--brass);border-bottom:1px solid var(--edge-warm)}
-  .dropsub{grid-column:1/-1;font-size:var(--fz-sm);color:var(--paper-dim);line-height:1.7}
+  /* 两句各自成行：句号处正是语义边界。
+     之前是一整段让浏览器自己断，结果 390px 上末行只剩「式。」两个字
+     （28px 宽）—— text-wrap: pretty 在当前 Chromium 不生效，手动断句更可靠。 */
+  .dropsub{
+    grid-column:1/-1;font-size:var(--fz-sm);color:var(--paper-dim);line-height:1.7;
+    margin-top:calc(-1 * var(--s2));
+    display:flex;flex-direction:column;gap:.1rem;
+  }
   /* 「选择文件」是这一页唯一的主按钮，所以它是唯一的实心黄铜 */
   .droppick{
     display:inline-flex;align-items:center;justify-content:center;gap:var(--s2);
     min-height:44px;padding:.6rem 1.2rem;
-    font-size:.95rem;font-weight:600;white-space:nowrap;
+    font:inherit;font-size:var(--fz-sm);font-weight:600;white-space:nowrap;
     background:var(--brass);color:#0b100e;
     border:1px solid var(--brass);border-radius:var(--r1);
+    cursor:pointer;
     transition:background var(--dur) var(--ease),border-color var(--dur) var(--ease);
   }
+  .droppick:focus-visible{outline:2px solid var(--brass-lift);outline-offset:3px}
   #drop:hover .droppick{background:var(--brass-lift);border-color:var(--brass-lift)}
   .dropmark{display:none}
   input[type=file]{display:none}
@@ -95,7 +108,7 @@ ${themeCss()}
   .field .tip{font-size:var(--fz-xs);color:var(--paper-faint)}
   #credit{
     width:100%;min-height:44px;padding:.5rem 0;
-    font:inherit;font-size:1rem;color:var(--paper);
+    font:inherit;font-size:var(--fz-md);color:var(--paper);
     background:transparent;border:0;border-radius:0;
     border-bottom:1px solid var(--edge);
     transition:border-bottom-color var(--dur) var(--ease);
@@ -104,21 +117,22 @@ ${themeCss()}
   #credit:focus{outline:none;border-bottom-color:var(--brass)}
   #credit:focus-visible{outline:2px solid var(--brass);outline-offset:4px}
 
-  /* ── 接受格式：列出格式，而不是一句逗号汤 ──
-     每个格式一个小块，等宽、方角。它读起来像一份清单，而不是一段话。 */
-  .fmtrow{display:grid;grid-template-columns:3.4rem minmax(0,1fr);gap:var(--s3);align-items:baseline}
-  .fmtrow+.fmtrow{margin-top:var(--s2)}
-  /* nowrap：3 个汉字在 3.4rem 里刚好放得下，别再被挤成竖排 */
-  .fmtkind{font-size:var(--fz-xs);color:var(--paper-faint);letter-spacing:.02em;white-space:nowrap}
-  .fmtlist{display:flex;flex-wrap:wrap;gap:4px}
-  /* 不用描边框：16 个方块并排、每个都有一圈边，远看会连成一个大方框，
-     而框里的内容并没有被框起来的意思。改成极淡的底色块 ——
-     它在深底上是一个小小的「一档」，不会连成墙。 */
-  .fmtlist span{
-    font-family:var(--mono);font-size:.68rem;letter-spacing:.04em;
-    padding:1px 5px;color:var(--paper-dim);background:var(--wash);
-  }
+  /* ── 接受格式 ──
+     上一版是 16 个小方块。那是全页最碎的元素，而且它和「留个名」
+     并排 —— 两件附注抢了同等的视觉权重。
+     现在收成一行：主格式在前，完整清单在后面以弱色跟着。
+     格式是**约束**，不是需要读的内容。 */
   .fmtlabel{font-size:var(--fz-sm);color:var(--paper-dim);letter-spacing:.04em}
+  /* 标签与值同一行内连着，值和「等 N 种」之间只差一点点 */
+  .fmtline{display:flex;align-items:baseline;gap:.5rem;flex-wrap:wrap}
+  .fmtmain{
+    font-family:var(--mono);font-size:var(--fz-xs);color:var(--paper-dim);
+    letter-spacing:.03em;
+  }
+  .fmtmore{
+    font-family:var(--mono);font-size:var(--fz-micro);color:var(--paper-faint);
+    letter-spacing:.03em;margin-left:.5em;
+  }
 
   /* ── 队列 ── */
   #queueWrap{margin-top:var(--s7);display:none}
@@ -127,7 +141,7 @@ ${themeCss()}
     display:flex;align-items:baseline;gap:var(--s3);flex-wrap:wrap;
     padding-bottom:var(--s2);border-bottom:1px solid var(--rule-strong);
   }
-  .qhead .qt{font-family:var(--serif);font-size:.95rem;letter-spacing:.12em;color:var(--paper-dim)}
+  .qhead .qt{font-family:var(--serif);font-size:var(--fz-sm);letter-spacing:.12em;color:var(--paper-dim)}
   .qhead .qs{font-size:var(--fz-xs);color:var(--paper-faint);margin-left:auto;font-variant-numeric:tabular-nums}
   /* 总进度：一条细线，不是一根胶囊。走黄铜。 */
   .qbar{height:2px;background:var(--rule);overflow:hidden;margin-bottom:var(--s4)}
@@ -142,7 +156,7 @@ ${themeCss()}
   .qmark{
     width:1.5rem;height:1.5rem;flex:0 0 auto;margin-top:1px;
     display:flex;align-items:center;justify-content:center;
-    font-family:var(--mono);font-size:.7rem;
+    font-family:var(--mono);font-size:var(--fz-micro);
     color:var(--paper-faint);border:1px solid var(--rule-strong);border-radius:var(--r1);
   }
   li.qi.uploading .qmark{border-color:var(--brass);color:var(--brass)}
@@ -150,8 +164,8 @@ ${themeCss()}
   li.qi.error .qmark{border-color:rgba(239,139,124,.5);color:var(--er)}
   li.qi.skip{opacity:.55}
   .qbody{min-width:0;display:flex;flex-direction:column;gap:1px}
-  .qname{font-size:.94rem;word-break:break-all;line-height:1.45}
-  .qsub{font-family:var(--mono);font-size:.72rem;color:var(--paper-dim);line-height:1.6;word-break:break-word}
+  .qname{font-size:var(--fz-sm);word-break:break-all;line-height:1.45}
+  .qsub{font-family:var(--mono);font-size:var(--fz-micro);color:var(--paper-dim);line-height:1.6;word-break:break-word}
   .qsub.err{color:var(--er)}
   .qsub.ok{color:var(--jade)}
   /* 单文件进度：1px 细线，不再是一条会撑宽的胶囊 */
@@ -214,8 +228,12 @@ ${themeCss()}
   <div class="dropwrap">
     <div id="drop" role="button" tabindex="0" aria-label="选择要上传的书籍文件，可多选">
       <div class="droptitle">把书拖到这里，或 <em id="pick">从电脑里选</em></div>
-      <span class="droppick" aria-hidden="true">选择文件</span>
-      <div class="dropsub">支持一次多选、连续拖入。只接受电子书与漫画格式。</div>
+      <!-- 真 <button>：原来这是个 <span aria-hidden="true"> ——
+           全页唯一看起来像按钮的东西读屏完全听不到，键盘也走不到。
+           #drop 本身是 role="button" 的整块区域，Enter/Space 也能开文件框，
+           但里面这个视觉主角必须是可聚焦的真按钮。 -->
+      <button class="droppick" type="button" id="pickbtn">选择文件</button>
+      <div class="dropsub"><span>支持一次多选、连续拖入。</span><span>只接受电子书与漫画格式。</span></div>
       <input type="file" id="file" multiple accept="${accept}">
     </div>
   </div>
@@ -236,7 +254,10 @@ ${themeCss()}
     </div>
     <div class="field">
       <span class="fmtlabel">接受格式</span>
-      <div class="fmtlist">${formatChips}</div>
+      <span class="fmtline">
+        <span class="fmtmain">${formatMain}</span>
+        <span class="fmtmore">${formatMore}</span>
+      </span>
     </div>
   </div>
 
@@ -313,6 +334,8 @@ drop.addEventListener('keydown', (e) => {
   if (e.key === 'Enter' || e.key === ' ' || e.key === 'Spacebar') { e.preventDefault(); fileInput.click(); }
 });
 $('pick').onclick = (e) => { e.stopPropagation(); fileInput.click(); };
+// 真按钮：stopPropagation 防止 #drop 的 onclick 重复触发（fileInput.click() 两次）
+$('pickbtn').onclick = (e) => { e.stopPropagation(); fileInput.click(); };
 $('addmore').onclick = () => fileInput.click();
 
 ['dragenter','dragover'].forEach(ev => drop.addEventListener(ev, e => { e.preventDefault(); drop.classList.add('drag','over'); }));

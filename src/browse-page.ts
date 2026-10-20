@@ -123,29 +123,39 @@ export function renderBrowsePage(
   const collections = children.filter((e) => e.isCollection);
   const files = children.filter((e) => !e.isCollection);
 
-  /** 子目录：目录索引行（编号 + 名称 + 「目录」）。 */
+  /** 是否书库根目录 —— 根目录只有 5 个固定入口，用专属网格排布。 */
+  const isRoot = davPath === '/' || davPath === '';
+  /** 子目录：目录索引行（编号 + 名称 + 计数）。 */
   const collectionsHtml = collections
     .map((e, i) => {
       const davHref = esc(`${mountPath}${encodeHref(e.path, e.isCollection)}`);
       const label = e.meta.displayName.replace(/\/$/, '');
-      const n = String(i + 1).padStart(2, '0');
+      // 编号按**字母表**算，不是表格序列号。
+      // 之前是 01…13 的出现顺序（B=01, G=04）—— 这与「按书名 / 按拼音」
+      // 直接矛盾：按字母表 B 应该是 02，而 G 是 07。
+      // 读者扫一眼就知道这是哪一格，而不是「第几个有货的格子」。
+      const letter = label.trim().charCodeAt(0);
+      const n = letter >= 65 && letter <= 90
+        ? String(letter - 64).padStart(2, '0')
+        : String(i + 1).padStart(2, '0');
       // 右侧写「几本」而不是「目录」：
       // 每个子目录后面都跟着同一个词「目录」，等于什么都没说 ——
       // 而读者真正想知道的是「这一格里有几本书，值不值得点开」。
       // childCount 由 collectDavEntries 从 buckets 表直接带上来，
       // 不额外查询。缺席时（旧缓存）退回「目录」。
       // ⚠️ 「没有本数」和「零本」是两件不同的事，不能都渲染成「空」。
-      //   根目录的五个集合刻意不带 childCount（算法要额外查一次 D1，
-      //   而 PROPFIND / 是客户端挂载时打得最频繁的一枪），
-      //   若把 undefined 当 0 显示，就会把「全部藏书」谎报成空的。
+      //   根目录的五个集合带的是**桶数**（13 个字母 / 2 种类型），
+      //   由 propfind 的 listBucketCounts 一次 GROUP BY 带上来；
+      //   单位词在 childUnit 里（个 / 种 / 空）。
       const cc = e.meta.childCount;
+      const unit = e.meta.childUnit ?? '本';
       const meta = typeof cc !== 'number'
         ? ''
         : cc > 0
-          ? `<span class="cn">${cc}</span><span class="cu">本</span>`
+          ? `<span class="cn">${cc}</span><span class="cu">${esc(unit)}</span>`
           : `<span class="cu">空</span>`;
       return `
-      <a class="card shelfcard" href="${davHref}">
+      <a class="card shelfcard" href="${davHref}"${isRoot ? ' data-root="1"' : ''}>
         <span class="sn" aria-hidden="true">${n}</span>
         <span class="ctitle">${esc(label)}</span>
         <span class="cmeta">${meta}</span>
@@ -231,7 +241,7 @@ ${themeCss()}
     padding-bottom:var(--s2);border-bottom:1px solid var(--rule-strong);
   }
   .sec-head h2{
-    font-family:var(--serif);font-weight:400;font-size:.95rem;
+    font-family:var(--serif);font-weight:400;font-size:var(--fz-sm);
     letter-spacing:.12em;color:var(--paper-dim);
   }
 
@@ -239,19 +249,28 @@ ${themeCss()}
      单字母/单页的格子很少（按书名 13 个字母），一条一行会把页面拉成
      一页空表格。多列排布后它读起来像**索引页**，而不是数据集。
      auto-fill + minmax：列数随宽度走，13 条在桌面上排成 4 列 4 行。 */
+  /* 用 flex 而不是 grid 来排布字母格。
+     grid 的 auto-fit 在条目少于轨道数时会留下一条 0px 的空轨道 ——
+     而 column-gap 照旧生效，右列凭空少 32px（实测 /dav/按类型/：
+     376px 376px 0px）。flex-wrap 没有空轨道这回事。 */
   .dirs{
-    display:grid;
-    /* auto-fit 而不是 auto-fill：只有 2 个条目时（「按类型」就是
-       漫画 + 电子书两条），auto-fill 会保留两列空轨道，把两条挤在
-       左半边；auto-fit 把空轨道收掉，两条各占一半，读起来是一张表。 */
-    grid-template-columns:repeat(auto-fit,minmax(15rem,1fr));
-    column-gap:var(--s6);
-    border-bottom:1px solid var(--rule);
+    display:flex;flex-wrap:wrap;
+    gap:0 var(--s6);
+    /* 不在容器上画收口线：条目数为奇数时，空槽位下面会悬着一段线，
+       像没画完。每个格子自己带 border-bottom，最后一行没有线就是没有。 */
   }
   .shelfcard{
-    display:grid;grid-template-columns:2.4rem minmax(0,1fr) auto;
+    /* 三列固定宽度：编号 / 字母 / 本数。
+       之前第三列是 auto，每格的本数落在各自格子右端 ——
+       13 个数字横向错开，读不成一列。固定宽度后本数成一条竖线。 */
+    display:grid;grid-template-columns:2.4rem minmax(0,1fr) 3.5rem;
     align-items:baseline;gap:var(--s4);
-    padding:.62rem var(--s2);
+    /* flex item：吃满一行时撑满，剩两个时各占一半 */
+    flex:1 1 15rem;
+    /* min-height 而不是加 padding：目录行的高度由基线对齐算出
+       （10px padding + 22px 内容 = 42px），加 padding 凑出来的 44px
+       会在行数变化时漂。min-height 是下限，内容多高都不会更矮。 */
+    min-height:44px;padding:var(--s2);
     border-bottom:1px solid var(--rule);
     color:var(--paper);text-decoration:none;
     transition:background var(--dur) var(--ease),box-shadow var(--dur) var(--ease),
@@ -263,19 +282,25 @@ ${themeCss()}
     text-decoration:none;color:var(--paper);
   }
   .sn{
-    font-family:var(--mono);font-size:.72rem;color:var(--paper-faint);
+    font-family:var(--mono);font-size:var(--fz-micro);color:var(--paper-faint);
     font-variant-numeric:tabular-nums;
   }
   .shelfcard:hover .sn{color:var(--brass)}
-  .shelfcard .ctitle{font-family:var(--serif);font-size:1.05rem;letter-spacing:.05em}
+  /* 根目录的 5 个入口用两列固定网格：
+     flex 在「5 个条目分 2 行」时右缘参差（第一行 3 格、第二行 2 格，
+     flex-grow 撑出的宽度不同，数字列对不齐）。
+     根目录条目数固定（COLLECTIONS 定义），可以锁定两列，
+     「13 个 / 10 个 / 2 种 / 4 个 / 15 本」成两条整齐的竖线。 */
+  .dirs .shelfcard[data-root]{flex:0 0 calc(50% - var(--s6)/2)}
+  .shelfcard .ctitle{font-family:var(--serif);font-size:var(--fz-md);letter-spacing:.05em}
   .shelfcard .cmeta{
-    display:inline-flex;align-items:baseline;gap:.15em;
-    font-family:var(--mono);font-size:.72rem;color:var(--paper-faint);
+    display:inline-flex;align-items:baseline;justify-content:flex-end;gap:.15em;
+    font-family:var(--mono);font-size:var(--fz-micro);color:var(--paper-faint);
     letter-spacing:.06em;
   }
   /* 本数是这一行唯一的信息，用纸色而不是灰 —— 灰到看不见就等于没写 */
   .shelfcard .cn{color:var(--paper-dim);font-variant-numeric:tabular-nums}
-  .shelfcard .cu{font-size:.68rem;color:var(--paper-faint)}
+  .shelfcard .cu{font-size:var(--fz-micro);color:var(--paper-faint)}
 
   /* ── 书：书目行 ──
      三列：封面 / 主体 / 右对齐的数字列。
@@ -308,13 +333,13 @@ ${themeCss()}
   .cover img{width:100%;height:100%;object-fit:cover;display:block}
   /* 无封面：格式首字母。字号够大（13px），不是一个看不清的小疙瘩。 */
   .mk2{
-    font-family:var(--mono);font-size:.8rem;letter-spacing:0;
+    font-family:var(--mono);font-size:var(--fz-xs);letter-spacing:0;
     color:var(--paper-dim);line-height:1;
   }
 
   .cbody{min-width:0;display:flex;flex-direction:column;gap:2px}
   .ctitle{
-    font-family:var(--serif);font-size:1.02rem;letter-spacing:.01em;line-height:1.4;
+    font-family:var(--serif);font-size:var(--fz-md);letter-spacing:.01em;line-height:1.4;
     /* 最多两行，超出省略 —— 避免长书名破坏行节奏 */
     display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;
     word-break:break-word;
@@ -328,7 +353,7 @@ ${themeCss()}
   }
   .ccredit{
     display:inline-flex;align-items:center;gap:4px;
-    font-size:.72rem;color:var(--jade);white-space:nowrap;flex:0 0 auto;
+    font-size:var(--fz-micro);color:var(--jade);white-space:nowrap;flex:0 0 auto;
   }
   .ccredit::before{
     content:"";width:5px;height:5px;background:var(--jade-deep);
@@ -342,17 +367,17 @@ ${themeCss()}
     text-align:right;flex:0 0 auto;
   }
   .cend .fmt{
-    font-family:var(--mono);font-size:.72rem;font-weight:400;
+    font-family:var(--mono);font-size:var(--fz-micro);font-weight:400;
     letter-spacing:.06em;color:var(--paper-dim);
   }
   .csize{
-    font-family:var(--mono);font-size:.72rem;color:var(--paper-faint);
+    font-family:var(--mono);font-size:var(--fz-micro);color:var(--paper-faint);
     font-variant-numeric:tabular-nums;white-space:nowrap;
   }
 
   /* ── 空状态：共用 .empty，只补一个按钮间距 ── */
   .empty .btn{margin-top:var(--s4)}
-  .empty span{font-size:.9rem}
+  .empty span{font-size:var(--fz-sm)}
 
   /* ── 提示条 ── */
   .note{
@@ -367,15 +392,15 @@ ${themeCss()}
   @media (max-width:640px){
     .bookcard{gap:var(--s3);padding:var(--s3) 0}
     .cover{width:34px;height:46px}
-    .ctitle{font-size:.97rem}
+    .ctitle{font-size:var(--fz-md)}
     /* 大小不在手机上藏起来：48.8 MB 这类数字是「点不点开」的判断依据，
        而它只占约 50px 宽的一列。挤不下的其实只有格式名，所以改小一点。 */
     .cend{gap:0}
-    .cend .fmt,.csize{font-size:.68rem}
+    .cend .fmt,.csize{font-size:var(--fz-micro)}
     /* 手机上保留本数：它恰恰是「点不点开」的判断依据，
        不该和装饰性的「目录」二字一起被藏掉。 */
     .dirs{grid-template-columns:1fr;border-bottom:0}
-    .shelfcard{grid-template-columns:1.9rem minmax(0,1fr) auto;gap:var(--s3)}
+    .shelfcard{grid-template-columns:1.9rem minmax(0,1fr) 3.2rem;gap:var(--s3)}
   }
 </style></head>
 <body>
