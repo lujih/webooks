@@ -57,7 +57,17 @@ function parseArgs(argv) {
     browse: 300,        // 每天"浏览几个目录 + 下几本书"的会话数
     mounts: 20,         // 每天新挂载 WebDAV 的会话数
     syncs: 2,           // 每天全库 rclone 同步次数
-    pageViews: 300,     // 每天网页目录页浏览
+    // 每天首页访问数。**首页每次访问是 2 次 Worker 请求**（见 homeRequests）。
+    //
+    // 依据：首页是站点的入口（src/index.ts 注释自称「流量最大的入口」），
+    // 而 `browse` 数的是"进了几个目录"的会话 —— 一次浏览会话几乎必然先落到
+    // 首页。所以默认取与 browse 同值，即**假设每个浏览会话以一次首页访问开始**。
+    // 这是**假设，不是实测**：本机无 CF 凭据，拿不到线上真实首页计数。
+    // 有控制台数据时用 `--home-views <次数>` 覆盖。
+    homeViews: 300,
+    // 每次页面浏览**可能**触发的 Speed Brain 预取数（悬停/按下同源链接）。
+    // 默认 0：拿不到线上真实计数，不猜。见下方 prefetch 那段长注释。
+    prefetchPerPageView: 0,
     // ── PROPFIND 条目缓存命中率（只减免 D1 行读，不减免请求）─────────────
     //
     // 2026-10-16 本地 `wrangler dev --port 8840` 实测。观测点是响应头
@@ -140,7 +150,8 @@ function main() {
   const { directories } = treeShape(a.books);
 
   // ── 每次操作的请求成本 ────────────────────────────────────────────────
-  // 浏览会话：进 4 个目录 + 下 3 本书。
+  // 浏览会话：进 **2 个目录页** + 下 3 本书。（首页那 2 次不在这里，由
+  // homeRequests 单独记账 —— 这是本文件曾经数错的地方，见下。）
   //
   // 下载那 3 次**不花 Worker 请求**：浏览页的书卡 href 现在是 R2 直链
   // （`${r2PublicBase}/${encodeR2Key(book.r2_key)}`），点击直接落到 R2，
@@ -153,10 +164,25 @@ function main() {
   //     那部分算在 mountRequests / syncRequests 里；
   //   · R2 的 Class B 计数照旧 —— 它在 downloadsPerDay 那一行单独记。
   //
-  // 所以这一栏从 `4 + 3` 变成 `4`。这不是乐观假设，是「请求不再经过
-  // Worker」的直接推论 —— 与 pageViewRequests 那条不同，那条是纠错
-  // （曾经以为缓存能省、其实省不了），这条是真的少了一次调用。
-  const browseRequests = 4;
+  // 这一栏是 **2**，不是 4。
+  //
+  // ⚠️ 曾经是 `4`，注释还写着「一次浏览会话进 4 个目录」—— **那是错的**，
+  //    而且错得很有害。实测（2026-10-18，真 Chromium + Worker 计数器）
+  //    一次完整会话 = 4 次请求，但构成是：
+  //        首页 2 次（GET / + GET /api/credits） + 目录页 2 次（按书名/ → S/） + 点书 0
+  //    所以 4 里有一半是**首页**。而本文件后来又补了 `homeViews × homeRequests`
+  //    显式记首页 —— 默认 `homeViews = browse = 300` 时，首页被**记了两遍**
+  //    （1,200 里含 600 首页 + 再单记 600 = 1,800，多算 600 次/天）。
+  //    这与「模型说 16%、现实打满」同一类：不是数字偏一点，是一件事数了两次。
+  //
+  //    现在把 4 拆干净：目录页那 2 次归这里（`handleGet` 每个目录页 1 次
+  //    `collectDavEntries` + `renderHtmlIndex`），首页那 2 次归 `homeRequests`。
+  //    每个常量都能指认一个源码实体，不再有混合量纲。
+  //
+  //    `4 + 3 → 2` 里去掉的 3 是下载（书卡已改 R2 直链，不进 Worker）。
+  //    这不是乐观假设，是「请求不再经过 Worker」的直接推论 —— 与
+  //    pageViewRequests 那条不同，那条是纠错（曾经以为缓存能省、其实省不了）。
+  const browseRequests = 2;
   // 挂载：客户端列目录树。rclone 有 dir-cache 时只走一遍；Finder 会反复重发
   const mountRequests = 2 * directories;
   // 全库同步：每个目录 1 次 PROPFIND + 每本书 1 次 GET
@@ -167,6 +193,29 @@ function main() {
   // 请求只体现在 browseRequests 上。
   // 真正能让这一项归零的是让 rclone 走 R2 的 S3 端点（见结论处的提示）。
   const syncRequests = directories + a.books;
+  // ── 网页页面浏览：一个量纲，一份计数 ──────────────────────────────────
+  //
+  // ⚠️ 这里曾经有**两个**参数在数同一件事：
+  //   · `browse` × `browseRequests` —— 一次浏览会话进的目录页数
+  //   · `pageViews` × `pageViewRequests(=1)` —— "每天网页目录页浏览"
+  // 两者乘的都是「目录页 GET」，量纲完全相同。默认值下
+  // 300×4 + 300×1 = **1,500 次目录页浏览/天**，而站点上目录页 GET 只有
+  // 一种操作 —— 那多出来的 300 次是凭空算的（占当时总量的 1.9%）。
+  //
+  // 更糟的是它让 P2 变成了结构错误：`implicitPerPageView`（浏览器自动发的
+  // 隐式请求，比如当年的 /favicon.ico）只乘了 pageViews 那 300，而 browse
+  // 那一路的目录页浏览**同样**会触发隐式请求。当年 favicon 恰恰是每次
+  // 页面浏览一次 —— 谁把 implicitPerPageView 设回 1，browse 那一路立刻
+  // 低估好几倍（当时是 4 倍）。
+  //
+  // 所以 `pageViews` 参数**已删除**（与 `cdPageViewHitRate` 的处理一致：
+  // 继续保留就会有人传一个没有对应实体的数字，现在传
+  // `--page-views` 会**报未知参数并退出 2**）。
+  //
+  // 页面浏览总数只有一个来源：browse 会话数 × 每次会话的目录页数。
+  // 想表达"有人直接点分享链接进来、不构成浏览会话"，就把 browse 调高 ——
+  // 因为那件事和"浏览会话"在计费上是同一件事，都是 1 次目录页 GET。
+  //
   // 网页目录页：**1 次请求，一次都不少**。
   //
   // 这里原本写的是 `1 - a.cdPageViewHitRate`（假设 80% 被 CDN 缓存）。
@@ -186,6 +235,9 @@ function main() {
   // 保留它就会有人继续传一个「假装能省请求」的数字，而现在是**报未知参数退出**。
   const pageViewRequests = 1;
 
+  /** 页面浏览总数：唯一的量纲来源，隐式请求与预取都乘它，别再新开计数。 */
+  const pageViewCount = a.browse * browseRequests * pageViewRequests;
+
   // ── 每次网页浏览**附带**的隐式请求 ──────────────────────────────────────
   //
   // 这一项是为一个真实事故加的：模型一直报「只用 16%」，而站点**真的**
@@ -197,10 +249,64 @@ function main() {
   // 而那个路径以前不存在 —— **每次页面浏览都白花一次请求**换回 404。
   // 现在它是 public/favicon.ico，由静态资源层应答（free and unlimited）。
   //
+  // ⚠️ 乘数修正（结构错，不是数字错）：
+  // 它以前写成 `a.pageViews * (pageViewRequests + implicitPerPageView)`，
+  // 只乘了 pageViews 那 300。但隐式请求是**每次页面浏览**都发一次，
+  // 而 browse 那 1,200 次同样是页面浏览 —— 当年 favicon 恰恰是每页一次。
+  // 也就是说：谁把 implicitPerPageView 设回 1，browse 那一路立刻低估 4 倍，
+  // 而模型还会一本正经地报出一个偏小的百分比。
+  // 现在乘的是 `pageViewCount`（页面浏览总数），不是其中一部分。
+  //
   // 保留这个参数而不是删掉，是为了让「加一个页面级资源」时有个明确的
   // 记账位置：**凡是浏览器会自动请求、又必须经过 Worker 的东西，都算在这里**。
   // 数字一旦不为 0，上面那句「只用 16%」就自动跟着变诚实。
   const implicitPerPageView = a.implicitPerPageView;
+  const implicitRequests = pageViewCount * implicitPerPageView;
+
+  // ── Speed Brain 预取：一个显式的记账位（默认 0，不猜）──────────────────
+  //
+  // 线上**每个** Worker 响应都带 `speculation-rules: "/cdn-cgi/speculation"`。
+  // 那份规则实测为：
+  //   {"tag":"cf-speed-brain","prefetch":[{"eagerness":"conservative",
+  //     "source":"document","where":{"and":[{"href_matches":"/*",
+  //     "relative_to":"document"}]}}]}
+  // 触发条件：**按下（pointerdown）**，不是悬停。实测（2026-10-18，真 Chromium）：
+  //   · 悬停 1.5s            → **+0**（`conservative` 规则不因悬停触发）
+  //   · pointerdown（未松开） → +1  GET /dav/…
+  //   · 按下→松开完成点击     → **与导航合并，不额外计**（同一次计数）
+  //   · 按下后拖走/选字/中键  → +1 = **纯浪费**
+  // 所以净增量只来自**放弃的点击**，而本参数乘的是「页面浏览总数」——
+  // 两者**不同构**。真要估准，该乘的是「每天落在集合卡上的 pointerdown 数 ×
+  // 放弃率」，不是页面浏览数。保持乘 pageViewCount 是为了先占住记账位；
+  // 直接填一个非零值会**系统性高估**，填之前请先想清这一点。
+  //
+  // `a5107a5` 把浏览页**书卡**改成 R2 直链之后，划过书卡不再计费；
+  // 但**集合卡（shelfcard）的 href 仍是 `/dav/…`**（线上实测「按书名」页
+  // 有 11 张 shelfcard）—— 按下它们仍会打到 Worker。
+  //
+  // 怎么在浏览器里观察：DevTools → Network 面板，在集合卡上**按下鼠标但不松开**，
+  // 看是否多出一次 `/dav/...` 请求（类型可能显示为 `prefetch`/`other`）。
+  // 注意：**悬停看不到任何东西** —— 照「悬停」去观测会得到假阴性。
+  //
+  // 为什么默认 0：本机没有 CF 凭据，拿不到线上真实预取计数，**不猜** ——
+  // 与 `bots`、`homeViews` 同一个立场。这是**记录位置**，不是已知数字。
+  const prefetchPerPageView = a.prefetchPerPageView;
+  const prefetchRequests = pageViewCount * prefetchPerPageView;
+
+  // ── 首页：一次访问 = **2 次** Worker 请求 ────────────────────────────────
+  //
+  // 首页在模型里**完全没有记过账**（`grep 首页 scripts/budget.mjs` 曾经零命中），
+  // 而 src/index.ts 的注释自称它是「流量最大的入口」。实际请求是：
+  //   1. `GET /`            → Worker 渲染 HTML（cache-control: public, max-age=3600）
+  //   2. `GET /api/credits` → 前端 fetch 拿活书脊+榜单
+  //                           （src/home-page.ts，max-age=600）
+  // 两次都是 Worker 请求：Cache API 命中照样跑 Worker（见上面那段），
+  // 所以 1 和 2 各算一次，不能因为带了 cache-control 就折扣。
+  //
+  // 来历：`859268c` 用「首页零 D1 读」换来了「请求数 1→2」。在
+  // 100,000 请求/天是硬停瓶颈、D1 行读只占 13.7% 的前提下，
+  // **这个交换方向是对的** —— 但它必须显式记账，否则模型又会偏小。
+  const homeRequests = 2;
 
   // ── 未建模流量 ─────────────────────────────────────────────────────────
   //
@@ -223,7 +329,9 @@ function main() {
     a.browse * browseRequests +
     a.mounts * mountRequests +
     a.syncs * syncRequests +
-    a.pageViews * (pageViewRequests + implicitPerPageView) +
+    implicitRequests + // 每次页面浏览附带的隐式请求（现在为 0，见上方注释）
+    prefetchRequests + // Speed Brain 预取（现在为 0，见上方注释）
+    a.homeViews * homeRequests + // 首页：GET / + GET /api/credits
     a.uploadsPerDay + // 上传各 1 次
     a.bots; // 未建模流量：爬虫 / 扫描器 / 探测（见下方说明）
 
@@ -245,11 +353,16 @@ function main() {
   //    实测对照（同一路径连打 3 次）：
   //      GET      → 三次都**没有** `x-dav-cache` 响应头（缓存路径压根没走）
   //      PROPFIND → MISS, HIT, HIT
-  //    所以浏览那 4 次是**每次都读 D1** 的，命中率救不了它。改之前
+  //    所以浏览那几个目录页**每次都读 D1**，命中率救不了它。改之前
   //    `propfindCount = a.browse * 4 + …` 再整体乘 (1 - 0.9)，等于把
   //    90% 的浏览页 D1 读取凭空抹掉了 —— 这与「模型说 16%、现实打满」
   //    是同一类错误：让唯一真正走缓存的路径替别的路径背了折扣。
-  const browseReads = a.browse * 4; // 浏览页 GET：不走条目缓存，100% 读 D1
+  //
+  // ⚠️ 这里**必须**复用 browseRequests，不能再写死 4。写死 4 是第二次
+  //    同一个量纲两处计数：`browseRequests` 改成 2 之后，这里若还是 4，
+  //    请求数降了、D1 行读却照旧按 4 算 —— 一张表里的两行互相矛盾，
+  //    而且没人会发现（它们离得很远）。
+  const browseReads = a.browse * browseRequests; // 浏览页 GET：不走条目缓存，100% 读 D1
   //
   // 挂载那一路用 (1 - cacheHitRate)：实测场景 D 的形状就是「每个目录先列
   // 一次（MISS，读 D1）、同一会话里再列一次（HIT）」= 50%，而
@@ -325,7 +438,38 @@ function main() {
   console.log('='.repeat(74));
   console.log(`书库规模        ${a.books.toLocaleString('en-US')} 本 · ${a.avgBookMb} MB/本 · ${storageGb.toFixed(2)} GB`);
   console.log(`目录总数        ${directories} 个（设计上限 200，${directories <= 200 ? '✅ 合规' : '❌ 超标'}）`);
-  console.log(`每日用量        ${a.browse} 次浏览 · ${a.mounts} 次挂载 · ${a.syncs} 次全库同步 · ${a.pageViews} 次网页浏览 · ${a.uploadsPerDay} 次上传`);
+  console.log(
+    `每日用量        ${a.browse} 次浏览（每次 ${browseRequests} 个目录页）`
+    + ` · ${a.homeViews} 次首页（每次 ${homeRequests} 次请求）`
+    + ` · ${a.mounts} 次挂载 · ${a.syncs} 次全库同步 · ${a.uploadsPerDay} 次上传`,
+  );
+  console.log(
+    `目录页浏览      ${pageViewCount.toLocaleString('en-US')} 次/天`
+    + `（= ${a.browse} 次浏览 × ${browseRequests} 个目录页；`
+    + `一个量纲一处计数，没有第二个 pageViews 参数）`,
+  );
+  if (implicitPerPageView === 0) {
+    console.log(
+      '隐式请求        0 次/天（favicon 已由静态资源层应答，不跑 Worker）',
+    );
+  } else {
+    console.log(
+      `隐式请求        ${implicitRequests.toLocaleString('en-US')} 次/天`
+      + `（= ${pageViewCount.toLocaleString('en-US')} 次页面浏览 × ${implicitPerPageView}）`,
+    );
+  }
+  if (prefetchPerPageView === 0) {
+    console.log(
+      'Speed Brain 预取 0 次/天（未估算 —— 集合卡仍是 /dav，划过会打 Worker；'
+      + '用 --prefetch-per-page-view 填）',
+    );
+  } else {
+    console.log(
+      `Speed Brain 预取 ${prefetchRequests.toLocaleString('en-US')} 次/天`
+      + `（= ${pageViewCount.toLocaleString('en-US')} 次页面浏览 × ${prefetchPerPageView}；`
+      + '划到 /dav 链接才算，书卡已是直链）',
+    );
+  }
   console.log(
     `PROPFIND 缓存命中率 挂载会话 ${(a.cacheHitRate * 100).toFixed(0)}%`
     + ` / 跨目录遍历 ${(a.cacheHitRateTraversal * 100).toFixed(0)}%`

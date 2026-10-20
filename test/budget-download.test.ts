@@ -32,13 +32,27 @@ describe('预算模型：浏览页下载已改直链，记账要跟上', () => {
     expect(VERIFY.length, 'verify-deploy.mjs 没读到').toBeGreaterThan(1000);
   });
 
-  it('浏览会话的请求成本是 4（不是 4 + 3）', () => {
+  it('浏览会话的请求成本是 2（不是 4，也不是 4 + 3）', () => {
     // 书卡直链 R2 之后，点开一本书不再经过 Worker。
     // 曾经的写法是 `const browseRequests = 4 + 3;`（进 4 个目录 + 下 3 本书）。
     expect(BUDGET, 'browseRequests 又变回把下载也算成 Worker 请求了').not.toMatch(
       /const browseRequests = 4 \+ 3;/,
     );
-    expect(BUDGET).toMatch(/const browseRequests = 4;/);
+    // 也不能回到 4：实测一次会话 = 4 次请求，但其中 **2 次是首页**
+    // （GET / + GET /api/credits，由 homeRequests 单独记）。4 会把首页藏进来，
+    // 于是 homeViews 再记一遍 → 首页被数了两次。
+    expect(BUDGET, 'browseRequests 又变回 4 了 —— 那 4 里有 2 次是首页').not.toMatch(
+      /const browseRequests = 4;/,
+    );
+    expect(BUDGET).toMatch(/const browseRequests = 2;/);
+  });
+
+  it('D1 行读必须复用 browseRequests，不许再写死 4', () => {
+    // 同一个量纲两处计数：browseRequests 改 2 之后 browseReads 若还写着 4，
+    // 请求数降了、D1 行读照旧，两行互相矛盾且相隔很远，没人会发现。
+    expect(BUDGET, 'browseReads 又把目录页数写死了').toMatch(
+      /const browseReads = a\.browse \* browseRequests;/,
+    );
   });
 
   it('全库同步仍要算每本书一次请求（WebDAV 的 GET 302 没有变）', () => {
@@ -418,14 +432,14 @@ describe('预算模型：缓存命中率与 D1 行写必须是实测值', () => 
     expect(BUDGET, '没写明挂载会话的形状（每目录列两次 → 50%）').toMatch(/50%/);
   });
 
-  it('浏览页那 4 次不许乘任何命中率（它压根不查条目缓存）', () => {
+  it('浏览页那几次不许乘任何命中率（它压根不查条目缓存）', () => {
     // 这是那轮实测最值钱的一条：浏览页走 `GET /dav/<目录>/`，而
     // handleGet 直接 collectDavEntries() 现算，全仓库只有
     // src/webdav/propfind.ts 会 cache.match(entriesCacheKey(...))。
     // 三路分解之前是 `propfindCount = a.browse * 4 + …` 整体乘
     // (1 - 0.9)，等于把 90% 的浏览页 D1 读取凭空抹掉。
     expect(BUDGET, 'browseReads 又被乘上命中率了').toMatch(
-      /const browseReads = a\.browse \* 4;/,
+      /const browseReads = a\.browse \* browseRequests;/,
     );
     expect(BUDGET, '旧的「一锅端」写法又回来了').not.toMatch(
       /const cacheMisses = propfindCount \* \(1 - a\.cacheHitRate\);/,
@@ -454,5 +468,144 @@ describe('预算模型：缓存命中率与 D1 行写必须是实测值', () => 
     expect(BUDGET, '没写明新桶首见的 27 行').toMatch(/27 行/);
     expect(BUDGET, '没写明稳态的 22 行').toMatch(/22 行/);
     expect(BUDGET, '没写明覆盖上传的 21 行').toMatch(/21 行/);
+  });
+});
+
+/**
+ * 2026-10-17 那轮「记账结构失真」的守卫。
+ *
+ * 背景：上一轮把**数字**换成了实测值（命中率、行写），但**结构**还是错的 ——
+ * 一个量纲被数了两次、隐式请求挂错了乘数、一个真实存在的入口压根没进模型。
+ * 数值错会让人算错，结构错则会让人**根本没机会算对**：参数名字摆在那儿，
+ * 谁也不知道该填哪个、又该乘谁。
+ *
+ * 这里钉的是四件事：
+ *   P1 `browse` 与 `pageViews` 重复计算同一种目录页 GET → 只留一个量纲
+ *   P2 `implicitPerPageView` 只乘了 pageViews 那一路 → 必须乘页面浏览总数
+ *   P3 首页 `GET /` + `GET /api/credits` 两次请求没进模型 → 显式记账
+ *   P4 Speed Brain 预取没有记账位 → 有位置、默认 0、写清怎么观测
+ */
+describe('预算模型：页面浏览只能数一次，且每个乘数都要挂对', () => {
+  /**
+   * 去掉注释后的源码。
+   *
+   * 必须这么做：`pageViews` 这个名字在**解释历史错误的注释里**仍然出现
+   * （「它以前写成 `a.pageViews * …`」），直接对全文断言 `not.toMatch`
+   * 会被注释命中 —— 那种守卫会在「注释写得越清楚越红」的方向上失效。
+   */
+  const CODE = BUDGET.split('\n')
+    .filter((line) => !/^\s*(\/\/|\*|\/\*)/.test(line))
+    .map((line) => line.replace(/\s+\/\/.*$/, ''))
+    .join('\n');
+
+  /** 取某个 `const name = …;` 赋值的右值（到第一个分号为止）。 */
+  const valueOf = (name: string): string => {
+    const start = CODE.indexOf(`const ${name} =`);
+    if (start < 0) return '';
+    const from = start + `const ${name} =`.length;
+    return CODE.slice(from, CODE.indexOf(';', from));
+  };
+
+  it('P1 只保留一个目录页浏览量纲：pageViews 参数已删除', () => {
+    // 以前 defaults 里同时有 browse(×4) 与 pageViews(×1)，乘的都是
+    // 「目录页 GET」。默认值下凭空多算 300 次/天。
+    expect(CODE, 'pageViews 参数又回到 defaults 里了 —— 它和 browse 数的是同一件事').not.toMatch(
+      /\bpageViews\s*:/,
+    );
+    // 整个代码里不许再出现 a.pageViews（属性访问；注释已在 CODE 里被剥掉）。
+    expect(CODE, '又有人开始用 a.pageViews 了').not.toMatch(/a\.pageViews/);
+    // 删掉参数还不够 —— 还得有**唯一**的那个量纲定义。
+    expect(CODE, '页面浏览总数 pageViewCount 没了').toMatch(
+      /const pageViewCount = a\.browse \* browseRequests \* pageViewRequests;/,
+    );
+  });
+
+  it('P1 requestsPerDay 里目录页那一路只出现一次', () => {
+    // 结构判据：数目录页 GET 的项只能有一个来源。
+    // 老写法是 `a.browse * browseRequests + a.pageViews * (...)` —— 两项。
+    const sum = valueOf('requestsPerDay');
+    expect(sum, 'requestsPerDay 取不到').not.toBe('');
+    const browseTerms = sum.match(/a\.browse\s*\*/g) ?? [];
+    expect(
+      browseTerms.length,
+      `requestsPerDay 里 a.browse 出现 ${browseTerms.length} 次 —— 只该有 1 次（页面浏览那一路）`,
+    ).toBe(1);
+  });
+
+  it('P1b 求和式必须精确等于这 7 项（防止「同一件事数两遍」无声复活）', () => {
+    // ⚠️ 为什么要这条：上面 P1 只数 `a.browse` 出现**次数**，(m) 把
+    //    `a.browse * browseRequests` 改成 `a.browse * 2 * browseRequests`
+    //    —— 仍然只出现 1 次、仍然全绿，但请求数凭空翻倍。
+    //
+    //    更打脸的是 (p)：把 `a.homeViews * homeRequests` 写**两遍**，
+    //    P3 那条 `toMatch(/a\.homeViews \* homeRequests/)` 也只查「存在」，
+    //    照样绿 —— 而「同一件事数两遍」恰恰是本轮要修的那个缺陷。
+    //    用整体精确比对，这两类都没有藏身处。
+    //
+    //    代价：以后**故意**增加一项时这条会红。那正是它该做的 ——
+    //    加项的人必须来这里改一次，顺便想清楚「这是不是又一个重复计数」。
+    const flat = valueOf('requestsPerDay').replace(/\s+/g, ' ').trim();
+    expect(flat, 'requestsPerDay 的构成变了 —— 请确认不是重复计数，再同步这条守卫').toBe(
+      'a.browse * browseRequests + '
+      + 'a.mounts * mountRequests + '
+      + 'a.syncs * syncRequests + '
+      + 'implicitRequests + '
+      + 'prefetchRequests + '
+      + 'a.homeViews * homeRequests + '
+      + 'a.uploadsPerDay + '
+      + 'a.bots',
+    );
+  });
+
+  it('P2 隐式请求必须乘页面浏览总数，不许只乘其中一部分', () => {
+    // 老写法：`a.pageViews * (pageViewRequests + implicitPerPageView)`
+    // —— 只乘了 pageViews 那 300，而 browse 那 1,200 次同样是页面浏览。
+    // 当年 favicon 恰恰是每页一次：谁把 implicitPerPageView 设回 1，
+    // browse 那一路立刻低估 4 倍，而模型会一本正经地报出一个偏小的百分比。
+    expect(CODE, 'implicitRequests 没挂在 pageViewCount 上').toMatch(
+      /const implicitRequests = pageViewCount \* implicitPerPageView;/,
+    );
+    // 它必须真的进 requestsPerDay，否则乘对了也没用。
+    expect(valueOf('requestsPerDay'), 'implicitRequests 没进 requestsPerDay').toMatch(
+      /\bimplicitRequests\b/,
+    );
+  });
+
+  it('P3 首页两次请求必须显式记账（GET / 与 GET /api/credits）', () => {
+    // 首页在模型里曾经零命中，而 src/index.ts 自称它是「流量最大的入口」。
+    expect(CODE, '没有 homeViews 参数').toMatch(/\bhomeViews\s*:/);
+    expect(CODE, '没有 homeRequests 常量').toMatch(/const homeRequests = 2;/);
+    expect(CODE, '首页请求没进 requestsPerDay').toMatch(
+      /a\.homeViews \* homeRequests/,
+    );
+    // 2 这个数字必须能被读者复核：两个 GET 各自是什么。
+    expect(BUDGET, '没写清首页那 2 次请求分别是什么').toMatch(/\/api\/credits/);
+    expect(BUDGET, '没写明首页是 2 次 Worker 请求').toMatch(/2 次/);
+  });
+
+  it('P4 Speed Brain 预取有记账位、默认 0、且写清了怎么观测', () => {
+    // 线上每个 Worker 响应都带 speculation-rules；划过 /dav 链接会打 Worker。
+    // 默认 0（没数据不猜），但位置必须在 —— 否则以后没人知道该填哪儿。
+    expect(CODE, '没有 prefetchPerPageView 参数').toMatch(/\bprefetchPerPageView\s*:/);
+    // ⚠️ 必须查「进没进 requestsPerDay」，不能只查名字存在 —— 变异测试
+    //    实测过：把 `prefetchRequests +` 从求和式里删掉，只查名字的写法
+    //    依然全绿（定义还在），等于守卫是装饰。
+    expect(valueOf('requestsPerDay'), '预取那一路没进 requestsPerDay').toMatch(
+      /\bprefetchRequests\b/,
+    );
+    expect(CODE, '预取必须按页面浏览总数算，别另开乘数').toMatch(
+      /const prefetchRequests = pageViewCount \* prefetchPerPageView;/,
+    );
+    // 得让人能自己验：靠 speculation-rules + 悬停集合卡。
+    expect(BUDGET, '没提 speculation-rules').toMatch(/speculation-rules/);
+    expect(BUDGET, '没提预取只对 /dav 链接计费（书卡已是直链）').toMatch(/集合卡|shelfcard/);
+  });
+
+  it('P3/P4 的默认值都是 0 或可解释的假设，不许悄悄塞一个大数', () => {
+    // homeViews 默认取与 browse 同值（假设每个浏览会话从首页开始），
+    // 这是明写出来的**假设**；prefetchPerPageView 则必须是 0。
+    expect(CODE, 'prefetchPerPageView 默认值不是 0 了').toMatch(/prefetchPerPageView: 0,/);
+    expect(CODE, 'homeViews 默认值变了 —— 它应有明确依据').toMatch(/homeViews: 300,/);
+    expect(BUDGET, '没说清 homeViews 是假设还是实测').toMatch(/假设/);
   });
 });
