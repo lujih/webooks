@@ -28,7 +28,7 @@ import {
 import { methodNotAllowed, shortId, textResponse } from '../lib/http';
 import { safeContentTypeFor, deriveMetadata, sanitiseLeafName } from '../lib/metadata';
 import { encodeR2Key, r2HttpMetadata } from '../lib/r2';
-import { checkPreconditions } from '../lib/preconditions';
+import { checkPreconditions, type ConditionResult } from '../lib/preconditions';
 import { parseEpub, coverExtFor, PARSE_SIZE_CAP, type EpubMeta } from '../lib/epub';
 import { sniffKindFromBucket } from '../lib/kind-sniff';
 import { bookCacheTargets, purgeEntries } from '../lib/cache';
@@ -119,13 +119,13 @@ export async function handleDav(
   switch (method) {
     case 'GET':
     case 'HEAD':
-      return handleGet(env, cfg, node, davPath, method === 'HEAD');
+      return handleGet(request, env, cfg, node, davPath, method === 'HEAD');
     case 'PUT':
       return handleLockedWrite(request, () => handlePut(request, env, node, davPath, cfg), env, lockKey);
     case 'DELETE':
       // 删除是破坏性操作：需要共享口令。读与新增保持匿名。
       if (!hasWriteToken(request, cfg.writeToken)) return unauthorizedResponse();
-      return handleLockedWrite(request, () => handleDelete(env, node, davPath), env, lockKey);
+      return handleLockedWrite(request, () => handleDelete(request, env, node, davPath), env, lockKey);
     case 'MKCOL':
       return handleMkcol(request, env, node, davPath);
     case 'MOVE':
@@ -776,9 +776,54 @@ function formatBytes(n: number): string {
   return `${(n / 1024 / 1024 / 1024).toFixed(2)} GB`;
 }
 
+/**
+ * 本服务对外公布的**强 ETag**（含引号）。
+ *
+ * ⚠️ `etag ?? id` 这个回退是**既有行为**，不是本任务引入的：HEAD（:799）、
+ *   PROPFIND 的 bookEntry（propfind.ts:373）、以及 PUT/COPY 的响应头都这么写。
+ *   本次把 PUT/DELETE 的条件求值**对齐到同一个表达式**，而不是各写一份 ——
+ *   否则会出现「客户端 HEAD 拿到 `"<id>"`，PUT 却因服务端拿不到 etag 而拒绝」
+ *   的死循环：同步客户端会永远传不上去，报错还完全看不懂。
+ *
+ * ⚠️ 但必须如实记下它的边界（见报告，不在本任务范围）：`id` 回退**不是**
+ *   内容派生的验证器，违反 §8.8.3.1 的精神（表示变了 ETag 就该变）。
+ *   它只出现在 `etag IS NULL` 的存量行上（迁移前写入 / COPY 新建的路径），
+ *   一旦有人覆盖写入，upsertBook 会写入 R2 的 etag，回退自然消失。
+ *   真正的修法是在 COPY / 存量回填里补 etag，而不是在这里假装它是强验证器。
+ */
+function bookStrongEtag(book: { etag: string | null; id: string }): string {
+  return `"${book.etag ?? book.id}"`;
+}
+
+/**
+ * 条件请求失败的统一出口（RFC 9110 §13.2.2）。
+ *
+ * 为什么要收成一个函数：304 与 412 的**响应形状完全不同** ——
+ *   412 有正文（人读的原因，见本文件对 401/415 的一贯做法）；
+ *   304 **必须没有正文**（§15.4.5 末尾：a 304 response … cannot contain
+ *   content），并且 MUST 带上 200 响应会带的 ETag / Cache-Control
+ *   （§15.4.5 第一段）。两件事混在调用点写，迟早在 304 里漏掉 ETag，
+ *   客户端于是拿不到能续期的验证器，下次仍发全量请求 —— 缓存永远不生效。
+ */
+function preconditionFailureResponse(
+  result: Extract<ConditionResult, { ok: false }>,
+  validators: { etag?: string; lastModified?: string; cacheControl?: string } = {},
+): Response {
+  if (result.status === 304) {
+    const headers: Record<string, string> = {};
+    if (validators.etag) headers.etag = validators.etag;
+    if (validators.lastModified) headers['last-modified'] = validators.lastModified;
+    if (validators.cacheControl) headers['cache-control'] = validators.cacheControl;
+    return new Response(null, { status: 304, headers });
+  }
+  // 412：写方法（PUT/DELETE）与 GET/HEAD 上的 If-Match 失败都走这里
+  return textResponse(412, `Precondition Failed: ${result.reason}`, { allow: ALLOW });
+}
+
 // ── 读 ──────────────────────────────────────────────────────────────────
 
 async function handleGet(
+  request: Request,
   env: Env,
   cfg: Settings,
   node: DavNode,
@@ -787,22 +832,66 @@ async function handleGet(
 ): Promise<Response> {
   if (node.kind === 'leaf') {
     const book = await findBookByLeaf(env.DB, node.leafName);
+    // §13.2.1：预条件只在「去掉条件头也不会是非 2xx」时才求值。
+    // 404 属于常规检查，必须先做 —— 否则一个不存在的路径带
+    // `If-None-Match: *` 会被判 304/412，客户端会以为资源还在。
     if (!book) return textResponse(404, 'Not Found');
 
+    const etag = bookStrongEtag(book);
+    const lastModified = new Date(book.updated_at).toUTCString();
+
     if (headOnly) {
+      // HEAD 与 GET 的预条件语义必须一致：§13.2.1 说「**发**条件 HEAD 没意义」，
+      // 但**收到**了就必须按 GET 的规则求值 —— 否则同一资源上
+      // `GET` 与 `HEAD` 会对同一个 If-None-Match 给出不同答案，缓存链路错乱。
+      //
+      // 304 在 HEAD 上是真正可用的：HEAD 的 200 本来就只有元数据，
+      // 但 304 允许 CDN / 代理复用它而不刷新对象，省掉一次逐跳传输。
+      const precondition = checkPreconditions({
+        method: 'HEAD',
+        headers: request.headers,
+        current: { exists: true, etag, lastModified: book.updated_at },
+      });
+      if (!precondition.ok) {
+        // 304 必须带 ETag / Cache-Control（§15.4.5 第一段），否则客户端
+        // 拿不到能续期的验证器，下次仍发全量请求 —— 缓存等于没生效。
+        // cache-control 与 GET/HEAD 的 200 保持同一语义（这里用 no-cache：
+        // 叶子元数据会随覆盖上传变化，必须每次用验证器复核）。
+        return preconditionFailureResponse(precondition, {
+          etag,
+          lastModified,
+          cacheControl: 'no-cache',
+        });
+      }
       // HEAD 直接回元数据，省掉客户端为了拿大小而多跑一次重定向
       return new Response(null, {
         status: 200,
         headers: {
           'content-length': String(book.size),
           'content-type': book.content_type,
-          etag: `"${book.etag ?? book.id}"`,
-          'last-modified': new Date(book.updated_at).toUTCString(),
+          etag,
+          'last-modified': lastModified,
           'accept-ranges': 'bytes',
         },
       });
     }
 
+    // ⚠️ GET leaf **刻意不求值预条件**，这是 §13.2.1 的要求，不是漏做：
+    //   「A server MUST ignore all received preconditions if its response to
+    //     the same request without those conditions … would have been a
+    //     status code other than a 2xx or 412.」
+    //   这里的无条件响应是 **302**（不是 2xx），所以规范要求**忽略**
+    //   If-None-Match / If-Modified-Since 并直接重定向。
+    //   反过来做（在 302 边界上造 304）会把「换了个地址」伪装成「没变化」，
+    //   客户端会继续用旧 URL 的缓存，而字节其实来自 R2 直链。
+    //
+    //   §13.2.2 步 5（Range + If-Range）同样不在这里做：字节不经过 Worker，
+    //   范围语义由 R2 自定义域终结（见下方 302 的注释）。
+    //
+    //   将来若要真正支持 leaf 的 304，唯一正确的做法是让 GET 也回 200 +
+    //   ETag（即字节流经 Worker），那是产品级取舍（CPU/带宽/100MB 上限），
+    //   不在本任务范围。
+    //
     // 关键：302 跳到 R2 公开自定义域。
     // 下载字节完全不过 Worker —— 不占 CPU/内存，也不会被 100MB 请求体上限卡住；
     // R2 出网本来就免费，还能被 CDN 缓存。
@@ -821,12 +910,23 @@ async function handleGet(
   const entries = await collectDavEntries(node, 1, env, cfg);
   if (!entries) return textResponse(404, 'Not Found');
 
+  // ⚠️ 目录的 304：**未实现**，而且不是「忘了」——
+  //   目录 HTML 是 D1 派生视图，entries 里**没有**一个能代表「这个集合本身」
+  //   的修改时间：root/nav 的条目全是合成的，list 的条目时间只覆盖当前页。
+  //   唯一现成的目录 ETag 是 propfind.ts 的 collectionEtag()，但它：
+  //     · 只活在 PROPFIND 的 207 渲染路径里，未导出；
+  //     · 对 root/nav 会退化成 `1970-01-01` 的合成值（stabiliseEntryTimes）；
+  //     · 输入是**当前页**的条目，翻页后同一集合会给出不同 ETag。
+  //   拿它当 Last-Modified/ETag 回 304，等于伪造一个「内容没变」的断言，
+  //   客户端会长期看到过期目录（新增的书永不出现）—— 比不做 304 更糟。
+  //   要真做，得先有「集合的 lastModified = max(成员 mtime)」这条数据，
+  //   属于 D1 schema 变更，不在本任务范围。
   const headers = {
     'content-type': 'text/html; charset=utf-8',
     'cache-control': 'public, max-age=300',
   };
   if (headOnly) return new Response(null, { status: 200, headers });
-  // 传「解码后」的路径：否则面包屑/标题会显示 %E6%8C%89…，
+  // 传「解码后」的路径：否则面包屑/标题会显示 %E6%8C%89%E4%B9%A6%E5%90%8D/，
   // 而且与 entry.path（解码后的节点路径）比较会不相等，导致自己也被列成子项。
   return new Response(renderHtmlIndex(decodeDavPath(davPath), entries, cfg.mountPath), {
     status: 200,
@@ -950,12 +1050,54 @@ async function handlePut(request: Request, env: Env, node: DavNode, davPath: str
   // D1 里单独存一份 Content-Type：语义同上（upsertBook 的 contentType 列）。
   const contentType = httpMetadata.contentType ?? safeContentTypeFor(leafName);
 
-  // 条件请求（RFC 9110 §13.1）：在**写入之前**判定，否则会把别人的书覆盖掉。
-  // 同步客户端依赖 If-None-Match: * 做到「仅新建、不覆盖」，服务端必须配合。
-  const currentEtag = existing?.etag ? `"${existing.etag}"` : null;
-  const precondition = checkPreconditions(request.headers, currentEtag);
+  // ── 条件请求（RFC 9110 §13）：必须在**写入之前**判定 ────────────────
+  //
+  // 否则会把别人的书覆盖掉。同步客户端依赖 If-Match / If-None-Match: *
+  // 做到「只在版本对得上时覆盖 / 仅新建不覆盖」，服务端必须配合。
+  //
+  // 位置也是规范的一部分（§13.2.1）：上面的 405/400/415/411/401/413 都是
+  // 「常规检查」，必须**先于**预条件 —— 一个格式非法的 PUT 带再漂亮的
+  // If-Match 也不该回 412，那会让客户端以为「换个 ETag 就能传」。
+  //
+  // ⚠️ `exists` 必须来自 `existing !== null`，**不能**用 `etag !== null` 顶替。
+  //   旧实现写的是 `existing?.etag ? ... : null`，于是 etag 为 NULL 的存量行
+  //   （迁移前写入 / COPY 出来的目标行）会被当成「资源不存在」，双向出错：
+  //     · `If-Match: *` → 明明在却 412；
+  //     · `If-None-Match: *` → 本该 412 却放行，而上面的 401 判定又因
+  //       onlyIfAbsent 跳过了口令 → **零凭据覆盖他人书籍**。
+  //   这就是为什么 CurrentRepresentation 把 exists 与 etag 拆成两个字段。
+  //
+  // ETag 侧用的是 bookStrongEtag()（`etag ?? id`），与 HEAD / PROPFIND 对外
+  // 公布的**同一个表达式** —— 客户端从 HEAD 拿到的值必须能通过这里的强比较，
+  // 否则同步客户端会陷入「永远 412」且毫无线索。
+  const precondition = checkPreconditions({
+    method: 'PUT',
+    headers: request.headers,
+    current: {
+      exists: existing !== null,
+      etag: existing ? bookStrongEtag(existing) : null,
+      // IUS 需要「资源最后修改时间」：books.updated_at 由 upsertBook 写入
+      // （`new Date().toISOString()`），语义确实是「这一行最后一次被写入」，
+      // 不是 ISBN、也不是出版日期。它能支撑 IUS，但有两个已知边界：
+      //   ① 毫秒精度 vs Last-Modified 只有秒 —— toEpochSeconds() 两侧都截断，
+      //      否则 304 永不出现（细节见 lib/preconditions.ts）；
+      //   ② 它随**任何**行更新而变（含管理员改标题 / rebucket），所以 IUS 的
+      //      「未修改」是「元数据未变」，比 ETag 的「字节未变」更粗 ——
+      //      这正是 §13.1.4 把 If-Match 列为更精确验证器的原因。
+      lastModified: existing?.updated_at ?? null,
+    },
+  });
   if (!precondition.ok) {
-    return textResponse(412, `Precondition Failed: ${precondition.reason}`, { allow: ALLOW });
+    // PUT 永远不该得到 304：304 只属于 GET/HEAD（§13.2.2 步 3/4 的明文）。
+    // 但如果调用方传错 method，这里按 412 收口比按 304 更安全 ——
+    // 304 会让客户端误以为「写入成功了，内容没变」。
+    // 该断言不会被触发（method 硬编码为 'PUT'），是防将来改动时静默出错。
+    if (precondition.status !== 412) {
+      console.error('[preconditions] PUT 意外要求 304，按 412 收口', precondition.reason);
+    }
+    return preconditionFailureResponse(
+      precondition.status === 412 ? precondition : { ...precondition, status: 412 },
+    );
   }
 
   // ── 读 body 的策略（避免撑爆 128MB isolate）──────────────────────────
@@ -1101,11 +1243,48 @@ async function handlePut(request: Request, env: Env, node: DavNode, davPath: str
   return new Response(null, { status: existing ? 204 : 201, headers });
 }
 
-async function handleDelete(env: Env, node: DavNode, davPath: string): Promise<Response> {
+async function handleDelete(request: Request, env: Env, node: DavNode, davPath: string): Promise<Response> {
   // 叶子：删单本
   if (node.kind === 'leaf') {
     const book = await findBookByLeaf(env.DB, node.leafName);
+    // §13.2.1：404 是常规检查，先于预条件。不带条件删除一个不存在的路径
+    // 本来就是 404，此时若因 If-None-Match: * 回 412/304，「资源是否存在」
+    // 这个问题就有两个互相矛盾的答案。
     if (!book) return textResponse(404, 'Not Found');
+
+    // ── 条件请求（RFC 9110 §13.2.2）：DELETE 是状态变更方法 ────────────
+    //
+    // 修复前 handleDelete **完全没有**条件检查（审计 🟠-3 只提了 PUT，
+    // 但 DELETE 的暴露面更大：同步客户端删文件前的 If-Match 版本校验
+    // 被整条忽略，于是「客户端 A 删它以为的旧版本」实际会删掉客户端 B
+    // 刚覆盖上去的新版本，且双方都不知道）。
+    //
+    // 失败一律 412：§13.2.2 步 3 只给 **GET/HEAD** 304 的待遇，DELETE 属于
+    // 「other methods」。注意 DELETE 也可能带 If-None-Match（虽然罕见）：
+    //   · `If-None-Match: *`（「只在不存在时删」）在资源存在时**命中**，
+    //     条件为假 → 412。这是规范的直译，不是特例。
+    //   · `If-None-Match: "<etag>"` 命中当前 ETag → 412。
+    //   · `If-Match: "<etag>"` 不匹配 → 412；带 `W/` 前缀也 → 412（强比较）。
+    //
+    // If-Unmodified-Since 用 book.updated_at（语义见 handlePut 那段长注释）。
+    const precondition = checkPreconditions({
+      method: 'DELETE',
+      headers: request.headers,
+      current: {
+        exists: true,
+        etag: bookStrongEtag(book),
+        lastModified: book.updated_at,
+      },
+    });
+    if (!precondition.ok) {
+      // DELETE 同样不该得到 304；status 硬约束为 412，理由同 handlePut。
+      if (precondition.status !== 412) {
+        console.error('[preconditions] DELETE 意外要求 304，按 412 收口', precondition.reason);
+      }
+      return preconditionFailureResponse(
+        precondition.status === 412 ? precondition : { ...precondition, status: 412 },
+      );
+    }
 
     await env.BUCKET.delete(book.r2_key);
     if (book.cover_key) await env.BUCKET.delete(book.cover_key);
@@ -1169,6 +1348,58 @@ async function handleDelete(env: Env, node: DavNode, davPath: string): Promise<R
   if (node.kind === 'nav' || node.kind === 'list') {
     const bucket = node.kind === 'list' ? node.bucket : '';
     const collection = node.collection;
+
+    // ── 条件请求（RFC 9110 §13.2.2）：集合 DELETE 同样是状态变更 ────────
+    //
+    // 这里只能给出**部分**求值，而且必须把边界写清楚，否则就是假声明：
+    //
+    //   · `If-Match: *`      → 通过（集合存在）。这是唯一能给出确定答案的
+    //                          If-Match 形态，因为 `*` 只看存在性。
+    //   · `If-Match: "etag"` → **412（fail closed）**。集合没有「自己的」ETag：
+    //                          PROPFIND 207 里那个 dirEtag 是**整个响应**共享
+    //                          的一个值（handlePropfind 里 `const dirEtag =
+    //                          collectionEtag(entries)` 对响应里每个集合条目
+    //                          复用），对 root/nav 还会退化成 1970 合成值。
+    //                          拿它当集合验证器去比对，会让「集合内容变了没」
+    //                          这个问题得到一个**错误但看起来权威**的答案。
+    //                          DELETE 是破坏性操作，猜错方向的代价是删掉
+    //                          别人的数据，所以这里选择拒绝而不是放行。
+    //                          真正的修法需要「集合的 lastModified / ETag」
+    //                          这条数据（D1 schema 变更），不在本任务范围。
+    //   · `If-Unmodified-Since` → **忽略**（§13.1.4 MUST ignore：资源没有可用
+    //                          的修改时间）。集合没有 mtime 列；用「成员最大
+    //                          mtime」需要额外一次按桶 COUNT/MAX 查询，且
+    //                          root/nav 的成员是派生桶、不是书。
+    //   · `If-None-Match: *` → **412**（集合存在 → 条件为假 → 非 GET/HEAD
+    //                          方法 → 412）。「只在不存在时删」在集合上必然失败，
+    //                          这是规范直译。
+    //   · 显式列出的 If-None-Match 标签 → 无法弱比较（没有 ETag）→ 条件为真、
+    //                          放行。这是 §13.1.2 求值第 3 条「Otherwise, the
+    //                          condition is true」的结果，不是漏判。
+    //
+    // 注意「集合不存在」的情形不在这里：root 走下面的 405，nav/list 节点
+    // 是派生出来的、必定存在（否则 resolveNode 会给别的 kind）。
+    const collectionPrecondition = checkPreconditions({
+      method: 'DELETE',
+      headers: request.headers,
+      current: { exists: true, etag: null, lastModified: null },
+    });
+    if (!collectionPrecondition.ok) {
+      // 集合 DELETE 的失败只可能是 412（没有 304 分支：method 不是 GET/HEAD）。
+      // 保留下面的收口是为了与叶子路径一致，将来改 method 时不会静默出错。
+      if (collectionPrecondition.status !== 412) {
+        console.error(
+          '[preconditions] 集合 DELETE 意外要求 304，按 412 收口',
+          collectionPrecondition.reason,
+        );
+      }
+      return preconditionFailureResponse(
+        collectionPrecondition.status === 412
+          ? collectionPrecondition
+          : { ...collectionPrecondition, status: 412 },
+      );
+    }
+
 
     // ── 成员锁检查：必须在删除**之前**（RFC 4918 §9.6 + §7）──────────
     //

@@ -418,6 +418,39 @@ PUT ... If-Match: W/"9dd4e461268c8034f5c8564e155c67a6"
 
 **建议修法**：把 `checkPreconditions` 改成返回**状态码**而不只是 ok/reason，让 304 与 412 能自然区分；补 `If-Unmodified-Since`（PUT/DELETE 语义，失败 412）与 `If-Modified-Since`（GET/HEAD 语义，失败 304）。GET 走 302 转 R2，这块见 🟡-3。
 
+**进展（2026-10-20，🟠-2 与 🟠-3 已修复）**：`src/lib/preconditions.ts` 重写，
+`checkPreconditions({ method, headers, current })` 现在严格按 §13.2.2 步 1→4 求值：
+
+- **步 1 If-Match**：改为**强比较**（§8.8.3.2）。`If-Match: W/"x"` 对强 ETag `"x"`
+  **不再匹配**（实测 412，修复前是 204）。根因正如本条诊断的 ——「比较函数」被写进了
+  「解析」里：现在 `parseTagList` 只拆语法（保留 weak 标记），强弱由求值时的
+  `strongEqual` / `weakEqual` 决定。
+- **步 2 If-Unmodified-Since**：仅在 If-Match **缺失**时求值，失败 412，用
+  `books.updated_at` 作验证器（语义是该行最后一次写入，不是 ISBN）。
+- **步 3 If-None-Match**：弱比较不变；失败按 §13.2.2 分叉 —— GET/HEAD → **304**，
+  其他方法 → **412**。返回值从 `{ok}` 改为带 `status: 412 | 304`。
+- **步 4 If-Modified-Since**：仅 GET/HEAD **且 If-None-Match 缺失**时求值，失败 304。
+  `isModifiedSince()` 那个从未被调用的死函数已删除。
+- **接入范围**：PUT、DELETE（叶子 + 集合）、HEAD leaf。GET leaf 刻意**不**求值
+  （302 不是 2xx，§13.2.1 要求忽略预条件）。
+
+**踩到并修掉的两个单位坑**（都留了注释，因为很容易再犯）：
+1. `parseHttpDate()` 原本返回**毫秒**，而 `toEpochSeconds()` 返回**秒** —— 两个数字
+   直接比较，等于把秒当毫秒：IUS 永远成立（客户端永远传不上书）、IMS 永远命中
+   （客户端永远拿到 304）。现在全文件 epoch **一律整秒**。
+2. `books.updated_at` 带毫秒、`Last-Modified` 只到秒，不截断会让 304 永不发生。
+
+**顺带修掉的一个真 bug**：旧实现用 `existing?.etag ? … : null` 兼任「资源不存在」，
+于是 **etag 为 NULL 的存量行**（迁移前写入 / COPY 出来的目标行）被判成不存在 ——
+`If-None-Match: *` 本该 412 防误覆盖，却被放行，而且 `handlePut` 的 `onlyIfAbsent`
+会因此**跳过写口令**，等于零凭据覆盖他人书籍。现在 `exists` 与 `etag` 是两个独立
+字段（`CurrentRepresentation`），`*` 只取决于存在性。
+
+**仍未实现（如实记录，不是漏做）**：§13.2.2 步 5（Range/If-Range，字节不经 Worker）；
+`GET /dav/<书>` 的 304（302 边界，见 §13.2.1）；目录集合的 304（没有「集合自身修改
+时间」这条数据，用合成 ETag 回 304 等于伪造「内容没变」）；🟠-1 的完整 `If` 求值器
+（`Not`、`[etag]`、多 resource-tag）仍**未**实现，本条修复不含它。
+
 ### 🟠-4 LOCK 刷新对**不存在的 token** 返回 200 并**新造一把锁**，应为 412
 
 **文件**：[src/webdav/index.ts:190-192](src/webdav/index.ts#L190-L192)、[src/lib/locks.ts:99-125](src/lib/locks.ts#L99-L125)、[src/lib/locks.ts:172](src/lib/locks.ts#L172)

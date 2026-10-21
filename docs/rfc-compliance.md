@@ -93,13 +93,26 @@ webdav.org 的规格清单里被标记为 *obsoleted* 的只有 **RFC 2518**，�
 | §15.7 | `getlastmodified` 用 rfc1123-date | 手写 RFC 1123 格式化 | ✅ |
 | §15.1 | `creationdate` 用 RFC 3339 date-time | `toISOString()` | ✅ |
 | §16 | 预置错误元素 | `supported-lock`、`cannot-modify-protected-property`、`valid-resourcetype` | ✅ |
-| RFC 9110 §13.1 | If-Match / If-None-Match 完整语义 | 弱比较、多值、通配 `*`；**在写入前判定** | ✅ |
-| RFC 9110 §13.1.2 | `If-None-Match: *` 且资源已存在 → 412 | 412 | ✅ |
+| RFC 9110 §13.1 | 条件请求完整语义（If-Match / If-None-Match / IUS / IMS） | §13.2.2 顺序求值；If-Match **强比较**、If-None-Match **弱比较**、多值、通配 `*`；**在写入前判定**；失败区分 412 与 304 | ✅ |
+| RFC 9110 §13.1.2 | `If-None-Match: *` 且资源已存在 → 412 | 412（PUT/DELETE；GET/HEAD 为 304） | ✅ |
+| RFC 9110 §13.1.4 | `If-Unmodified-Since` 失败 → 412 | 412；用 `books.updated_at` 作验证器 | ✅ |
+| RFC 9110 §13.1.3 | `If-Modified-Since` 失败 → 304 | 304（HEAD 支持；GET leaf 见下方说明） | ✅¹ |
+| RFC 9110 §13.2.2 步 5 | Range + If-Range | **未实现**：GET leaf 是 302 到 R2，字节不经 Worker | ⚠️ 边界 |
+| RFC 9110 §13.2.1 | 预条件晚于常规检查 | 404/401/405/415 等先于预条件求值 | ✅ |
 | RFC 9110 §9.3.7 | OPTIONS `*` 服务器级查询 | 支持 | ✅ |
 | RFC 9110 §14.2 | Range 头是建议性的（"only provides advice"） | GET 返回 302 交由 CDN 处理 | ✅ |
 | RFC 9110 §8.6 | 204 不带非零 Content-Length | 遵守 | ✅ |
 | RFC 5789 | PATCH 未实现 → 405 | 405 | ✅ |
 | RFC 5689 §3.1 | 非法 resourcetype → 403 + `valid-resourcetype` | MKCOL 未映射路径时使用 | ✅ |
+
+> ¹ **关于 GET leaf 的 304**：`GET /dav/<书>` 返回 **302** 到 R2 公开域，字节
+> 完全不经过 Worker。§13.2.1 要求「不带条件头本来就**不是 2xx**」时**忽略**预条件
+> —— 302 不是 2xx，所以对 GET leaf **忽略** If-None-Match / If-Modified-Since
+> 才是规范要求的动作，不是漏做。`HEAD /dav/<书>` 是 200 + 元数据，因此**支持**
+> 条件求值并会返回 304。
+> 目录（root/nav/list）的 304 **未实现**：目录 HTML 是 D1 派生视图，没有
+> 「集合本身的修改时间」这条数据，用当前页条目的合成 ETag 回 304 等于伪造
+> 「内容没变」的断言，客户端会长期看不到新书。如实记为边界，不伪造。
 
 ## 有意保留的偏离（不是 bug，是设计取舍）
 

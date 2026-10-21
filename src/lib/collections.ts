@@ -19,6 +19,7 @@
  */
 
 import { pinyinInitial } from './pinyin-table';
+import { contextualInitial } from './pinyin-context';
 
 export const COLLECTION_IDS = ['title', 'author', 'type', 'format', 'recent'] as const;
 export type CollectionId = (typeof COLLECTION_IDS)[number];
@@ -134,6 +135,16 @@ export const LETTER_BUCKETS: readonly string[] = [
  *      按书名/作者浏览等于没有分类。现在「三体」进 S、「末世降临」进 M）
  *   4. 表里查不到（生僻字、日文假名、西里尔等）→ 'other'
  *
+ * 第 3 步的「拼音首字母」是两段式：
+ *   ① 先查 `pinyin-context.ts` 的**多音字上下文表**（人工维护）。
+ *      为什么必须有这一段：`pinyin-table.ts` 只认单字的**默认读音**，
+ *      于是「重庆」按 zhòng 进 Z 桶、「厦门」按 shà 进 S 桶、「单田芳」按
+ *      dān 进 D 桶 —— 全错。而这里的 `input` 是**完整书名/作者名**，
+ *      首字后面就带着上下文（重**庆**、厦**门**、单**田芳**），够用来定读音。
+ *   ② 上下文表没命中（null）才回落 `pinyinInitial(ch)` 的单字默认读音，
+ *      于是绝大多数不含多音字的书行为**完全不变**。
+ *   表本身的边界（表外多音字仍会错）写在该文件头部。
+ *
  * 前导的标点/空白会被跳过：`《三体》` 与 `三体` 归到同一个桶。
  */
 export function letterBucket(input: string | null | undefined): string {
@@ -145,6 +156,10 @@ export function letterBucket(input: string | null | undefined): string {
   if (ch >= 'A' && ch <= 'Z') return ch;
   if (ch >= 'a' && ch <= 'z') return ch.toUpperCase();
   if (ch >= '0' && ch <= '9') return '0-9';
+  // ① 多音字上下文：只看开头能匹配到的词（姓氏/地名/常见词）
+  const contextual = contextualInitial(text);
+  if (contextual) return contextual;
+  // ② 回落：单字默认读音（占绝大多数，行为与以前完全一致）
   const py = pinyinInitial(ch);
   if (py) return py;
   return 'other';
