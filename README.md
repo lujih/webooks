@@ -321,6 +321,23 @@ response-* 覆盖参数（实测无效）。所以三条写入路径（WebDAV PU
 **这是省预算最狠的一招**：rclone 原生支持 S3，直连 R2 端点是 **0 次 Worker 请求**。
 WebDAV 只留给只会讲 WebDAV 的客户端（Finder、Windows 资源管理器、KOReader）。
 
+> ⚠️ **但走 S3 会丢掉文件名（2026-10-21 实测确认，未修）。**
+> R2 里的对象键是 `books/<随机 id>`（如 `books/b01`），**既没有书名也没有扩展名**
+> —— 书名只存在 `Content-Disposition` 头里。而 rclone / aws-cli 走 S3 时，
+> 落盘文件名来自**对象键的 basename**，不读 `Content-Disposition`。
+> 所以 `rclone copy r2:books ./dst` 得到的是 `b01`、`b02`… 一堆没有扩展名、
+> 也无法与书名对应的文件 —— **拉下来打不开，也认不出是哪本书**。
+>
+> 实测（本地 dev + 真 rclone）：浏览页书卡 href 与 WebDAV 的 302 都指向
+> `https://<公开域>/books/b01`，两条路拿到的都是同一个裸键。
+>
+> **现状的取舍**：S3 那条路适合「**只要字节、不要文件名**」的场景
+> （备份、校验、迁移到别处），不适合「拉下来直接读」。
+> 要真正修好，得让对象键本身可读（如 `books/<书名>.epub` 或至少保留扩展名），
+> 那是写入路径的架构改动（会牵动 upload / WebDAV PUT / COPY-MOVE / reindex
+> 四条写入路径与去重语义），**尚未实施** —— 如实记在这里，
+> 而不是让「最狠的一招」听起来毫无代价。
+
 ```bash
 # 推荐：rclone 直连 R2 的 S3 端点（0 次 Worker 请求）
 rclone config create r2 s3 provider=Cloudflare \

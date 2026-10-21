@@ -451,6 +451,17 @@ PUT ... If-Match: W/"9dd4e461268c8034f5c8564e155c67a6"
 时间」这条数据，用合成 ETag 回 304 等于伪造「内容没变」）；🟠-1 的完整 `If` 求值器
 （`Not`、`[etag]`、多 resource-tag）仍**未**实现，本条修复不含它。
 
+> ⚠️ **订正：集合 304 并不省 Worker 请求。** 这里一度把它描述成「热门目录的重复
+> 访问全打 Worker」的解法，那是错的。Cache API 命中时 Worker **照跑**
+> （官方原文：「every request still executes your Worker on the way in」，
+> 见 README 里那张三种机制对比表）。304 省的是**响应体字节**与**客户端渲染**，
+> 不省请求配额 —— 而本站的硬停瓶颈恰恰是请求数。
+>
+> 所以集合 304 的真实价值是：① 少传 HTML（带宽/CPU 更省）；② 符合 §13.1.3 的
+> 缓存语义，让客户端拿到正确的「没变」信号。**它不改善预算**。
+> 若目标是省预算，该做的是让字节与请求少经过 Worker（走 S3、静态资源化），
+> 不是加 304。优先级据此下调：它属于「正确性/体验」，不属于「配额」。
+
 ### 🟠-4 LOCK 刷新对**不存在的 token** 返回 200 并**新造一把锁**，应为 412
 
 **文件**：[src/webdav/index.ts:190-192](src/webdav/index.ts#L190-L192)、[src/lib/locks.ts:99-125](src/lib/locks.ts#L99-L125)、[src/lib/locks.ts:172](src/lib/locks.ts#L172)
