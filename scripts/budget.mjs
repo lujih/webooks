@@ -185,14 +185,40 @@ function main() {
   const browseRequests = 2;
   // 挂载：客户端列目录树。rclone 有 dir-cache 时只走一遍；Finder 会反复重发
   const mountRequests = 2 * directories;
-  // 全库同步：每个目录 1 次 PROPFIND + 每本书 1 次 GET
+  // ── 全库同步：每个目录 1 次 PROPFIND + **每本书 5 次** GET ────────────
   //
-  // 注意这里的 `a.books` **不能**因为「下载已改直链」而删掉：
-  // rclone / Finder 走的是 WebDAV，`GET /dav/<书>` 依然花 1 次 Worker
-  // 请求（302 是 WebDAV 客户端依赖的行为，不能改）。浏览页那条路省下的
-  // 请求只体现在 browseRequests 上。
-  // 真正能让这一项归零的是让 rclone 走 R2 的 S3 端点（见结论处的提示）。
-  const syncRequests = directories + a.books;
+  // ⚠️ 这里的 `5` 是本文件**最后一处量纲错**的修法，也是最贵的一处
+  //    （修前它占默认总量 66%）。原写法是 `directories + a.books`，
+  //    等于假设「每本书在一次全库同步里只被下载一次」—— **不成立**。
+  //
+  //    为什么是 5：一本书在 WebDAV 视图里同时挂在 **5 个集合**下 ——
+  //      按书名/<字母>/、按作者/<字母>/、按类型/<kind>/、按格式/<fmt>/、最近收录/
+  //    这 5 条路径全部指向同一个 R2 对象（同一个 leaf_name），但**对客户端
+  //    而言是 5 个不同的文件**。rclone 按**路径**去重，不是按内容/对象去重，
+  //    所以 sync 时它会老老实实从 5 条路径各下一遍。
+  //
+  //    这不是推测，有两份独立证据：
+  //      ① 源码 `src/lib/cache.ts` 的 `bookCacheTargets()` 里**硬编码**列出
+  //         且只有这 5 条叶子路径（作用是缓存失效，必须穷举，漏一条就是
+  //         脏缓存 bug）。它证明「一本书的规范路径数 = 5」是代码结构的断言。
+  //      ② 实测（2026-10-18，真 rclone v3.67.6）：`rclone sync` 后统计
+  //         GET 次数 = 75，而唯一书名只有 15 本 → 放大 **5.0×**，
+  //         且每本书的路径数分布是 `Counter({5: 15})`，没有一本是 4 或 6。
+  //
+  //    为什么这条特别要紧：它是模型里**唯一随书量线性放大**的一项。
+  //    改前/改后的默认场景（5,000 本）：
+  //        改前  2 × (99 + 5,000)      = 10,198  → 总量 15,378（15.4%）
+  //        改后  2 × (99 + 5×5,000)    = 50,198  → 总量 55,378（55.4%）
+  //    也就是说这一条把结论从「很宽裕」翻成「忙日 3× 会打满」（166%）。
+  //    这正是「模型说 16%、现实打满 10 万」最可能的形态 —— 不是某个小项
+  //    估偏了，而是**最大那一项**的量纲错了 5 倍。
+  //
+  //    注意 `a.books` 依然**不能**因为「下载已改直链」而删掉：rclone / Finder
+  //    走的是 WebDAV，`GET /dav/<书>` 依然花 1 次 Worker 请求（302 是客户端
+  //    依赖的行为）。浏览页那条路省下的请求只体现在 browseRequests 上。
+  //    真正能让这一项归零的是让 rclone 走 R2 的 S3 端点（见结论处提示）。
+  const BOOK_PATH_COPIES_PER_SYNC = 5;
+  const syncRequests = directories + BOOK_PATH_COPIES_PER_SYNC * a.books;
   // ── 网页页面浏览：一个量纲，一份计数 ──────────────────────────────────
   //
   // ⚠️ 这里曾经有**两个**参数在数同一件事：
@@ -371,7 +397,25 @@ function main() {
   // 同步那一路每个键只碰一次，乘不乘都一样 —— 写出来是为了让它显式可见。
   const syncMisses = a.syncs * directories * (1 - a.cacheHitRateTraversal);
   const cacheMisses = browseReads + mountMisses + syncMisses + a.uploadsPerDay;
-  const d1RowsReadPerDay = cacheMisses * (1 + MAX_ENTRIES);
+  // ── WebDAV 叶子 GET 的定点行读 ────────────────────────────────────────
+  //
+  // ⚠️ 这一项**曾经整个漏掉**，而它与上面 `cacheMisses` 的量纲**完全不同**，
+  //    所以不能简单相加再乘 MAX_ENTRIES —— 那会把 1 行读放大成 201 行
+  //    （默认场景下算出来 1,060 万行/天，是正确值的 17 倍，直接把 D1 判成超标）。
+  //
+  //    区别在哪：
+  //      · `cacheMisses` 是 **PROPFIND 列目录** —— 未命中时要拉一页书（≤200 行）
+  //        + 1 行桶计数，所以乘 (1 + MAX_ENTRIES)；
+  //      · 这里 `GET /dav/<书>` 是**单本叶子** —— 它只查
+  //        `findBookByLeaf()`（src/lib/db.ts:148），一条 `WHERE leaf_name = ?`
+  //        的**唯一索引命中**，恰好 **1 行**，跟页大小无关。
+  //
+  //    触发量：全库同步时每本书那 5 条路径各 GET 一次 → 每本 5 行；
+  //    挂载时客户端也会逐个 GET（rclone ls/copy 都走 GET），按每本书 1 次估。
+  //    注意这里**只算叶子 GET**，PROPFIND 那部分已经在 `cacheMisses` 里了，
+  //    不要重复计。
+  const leafGetReads = a.syncs * BOOK_PATH_COPIES_PER_SYNC * a.books + a.mounts * a.books;
+  const d1RowsReadPerDay = cacheMisses * (1 + MAX_ENTRIES) + leafGetReads;
 
   // ── D1 行写入 ─────────────────────────────────────────────────────────
   //
@@ -410,7 +454,16 @@ function main() {
   //   · rclone 全库同步的 `a.books` 次 —— 走 WebDAV，既是 Worker 请求
   //     （记在 syncRequests）也是 R2 Class B。
   // 换句话说：直链省的是**请求配额**，不是 R2 的读操作计数。两本账，别混。
-  const downloadsPerDay = a.browse * 3 + a.syncs * a.books;
+  //
+  // ⚠️ 同步那一路**必须乘同一个 BOOK_PATH_COPIES_PER_SYNC**，不能只修
+  //    requestsPerDay 那一处。一次 `GET /dav/<书>` 是「1 次 Worker 请求
+  //    + 1 次 R2 Class B」的**同一件事的两面**（Worker 回 302，客户端再去
+  //    R2 取字节）。既然它在 Worker 侧被数了 5 次，在 R2 侧就同样是 5 次。
+  //    只改请求数不改 Class B，等于把一本账拆成两半、各记一个数 ——
+  //    这比不改更糟：表里两行会互相矛盾，而且离得很远没人发现。
+  //    （修前 Class B 3.3%，修后 15.3%，差 4.6 倍。）
+  const downloadsPerDay =
+    a.browse * 3 + a.syncs * BOOK_PATH_COPIES_PER_SYNC * a.books;
   const r2ClassAPerMonth = a.uploadsPerDay * 30 * 2; // PutObject + CreateMultipartUpload
   const r2ClassBPerMonth = downloadsPerDay * 30;
 
@@ -549,6 +602,64 @@ function main() {
     console.log(`   按 ${a.peakFactor}× 忙日估算也还有 ${peakHeadroom.toFixed(1)} 倍。`);
     console.log(`   折算约 ${Math.round(a.browse * peakHeadroom).toLocaleString('en-US')} 次浏览/天，`);
     console.log(`   或 ${Math.round(a.mounts * peakHeadroom).toLocaleString('en-US')} 次 WebDAV 挂载/天。`);
+    // ── 书库规模上限（本轮 5× 修正后才真正有意义）───────────────────────
+    //
+    // 修 5× 之前，模型最占的一项是 syncRequests；修完之后它占 **91%**，
+    // 于是「免费层能装多少书」几乎完全由它决定 —— 而它随书量线性增长。
+    // 这是本站最该知道的一个数字：过了这条线，只要有人真跑一次全库同步，
+    // 那天就打满。所以直接算出来给读者看，而不是让人自己反推。
+    //
+    // ⚠️ 为什么用**二分**而不是把 `a.books` 从算式里解出来：
+    //    `directories` 本身是书量的函数（treeShape）。解方程时若把当前
+    //    `directories=99` 当成常量，会得到一个**偏乐观**的答案 ——
+    //    书涨到近 2 万本时目录数会涨到约 190，多出来的 PROPFIND 不能不算。
+    //    这里让 `directories` 随候选书量一起重算，求「令总量刚好 ≤ 10 万
+    //    的**最大**书量」，与模型本身的口径完全一致。
+    //
+    // 口径：**其余参数保持当前命令行给的值**（browse/home/mounts/syncs/
+    // uploads 不变），只变书量。所以它回答的是「在这套用量下」，
+    // 不是绝对上限 —— 同步次数越多，能装的书越少。
+    const requestsAt = (n) => {
+      const shape = treeShape(n);
+      return (
+        a.browse * browseRequests
+        + a.mounts * 2 * shape.directories
+        + a.syncs * (shape.directories + BOOK_PATH_COPIES_PER_SYNC * n)
+        + pageViewCount * implicitPerPageView
+        + pageViewCount * prefetchPerPageView
+        + a.homeViews * homeRequests
+        + a.uploadsPerDay
+        + a.bots
+      );
+    };
+    const perBook = a.syncs * BOOK_PATH_COPIES_PER_SYNC;
+    if (perBook > 0) {
+      // 上界：光 sync 那一路就吃掉全部配额时的书量，再留一倍余量。
+      let lo = 0;
+      let hi = Math.max(1, Math.ceil(FREE.workerRequestsPerDay / perBook) * 2);
+      if (requestsAt(hi) <= FREE.workerRequestsPerDay) {
+        lo = hi; // 连上界都没打满：不给出一个虚假的精确数
+      } else {
+        // 不变式：requestsAt(lo) ≤ 额度 < requestsAt(hi)
+        while (hi - lo > 1) {
+          const mid = Math.floor((lo + hi) / 2);
+          if (requestsAt(mid) <= FREE.workerRequestsPerDay) lo = mid;
+          else hi = mid;
+        }
+      }
+      console.log('');
+      console.log(`   按当前用量（${a.syncs} 次全库同步/天）反推，免费层约能装`);
+      console.log(
+        `   **${lo.toLocaleString('en-US')} 本书** —— 超过它，只要有人真跑一次`
+        + '全库同步，那天就会打满。',
+      );
+      console.log(
+        '   （每本书在一次同步里被 GET '
+        + `${BOOK_PATH_COPIES_PER_SYNC} 次 × ${a.syncs} = ${perBook} 次/天；`
+        + '目录数也已随书量一起重算，不是拿当前的 '
+        + `${directories} 个去糊）`,
+      );
+    }
   } else {
     console.log('');
     console.log('❌ 会超出硬停额度，站点每天都会停摆。');

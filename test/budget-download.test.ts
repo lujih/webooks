@@ -55,23 +55,56 @@ describe('预算模型：浏览页下载已改直链，记账要跟上', () => {
     );
   });
 
-  it('全库同步仍要算每本书一次请求（WebDAV 的 GET 302 没有变）', () => {
+  it('全库同步必须算「每本书 5 条路径」，不是 1 次（WebDAV 的 GET 302 没有变）', () => {
     // 这是本组最重要的一条：直链只省掉**浏览页**那条路。
     // rclone / Finder 走 WebDAV，`GET /dav/<书>` 仍然返回 302
-    // （客户端依赖它），所以每个目录 1 次 PROPFIND + 每本书 1 次 GET 照旧。
+    // （客户端依赖它），所以每个目录 1 次 PROPFIND + 每本书的 GET 照旧。
     //
-    // 如果哪天有人把这里的 `+ a.books` 也删掉（以为「下载已免费」），
-    // 模型会立刻少报掉最大的一项开销 —— 正是上次停摆的形态。
-    expect(BUDGET, 'syncRequests 被当成「下载已免费」而漏算每本书的 GET').toMatch(
-      /const syncRequests = directories \+ a\.books;/,
+    // ⚠️ 但「每本书 1 次」是错的（2026-10-20 修）：一本书同时挂在 5 个集合
+    //    下（按书名/按作者/按类型/按格式/最近收录），5 条路径指向同一对象，
+    //    而 rclone 按**路径**去重 → 同一本书被 GET **5 次**。
+    //    实测放大 5.0×，且每本书路径数分布是 Counter({5: N})。
+    //    源码佐证：src/lib/cache.ts 的 bookCacheTargets() 硬编码这 5 条叶子路径。
+    //
+    // 如果哪天有人把它改回 `directories + a.books`，模型会立刻少报掉
+    // **最大的一项**（占默认总量 91%）—— 正是上次停摆的形态。
+    expect(BUDGET, 'syncRequests 漏掉了「一本书 5 条路径」的放大').toMatch(
+      /const syncRequests = directories \+ BOOK_PATH_COPIES_PER_SYNC \* a\.books;/,
+    );
+    expect(BUDGET, '放大倍数不是 5 了 —— 改之前请重新实测').toMatch(
+      /const BOOK_PATH_COPIES_PER_SYNC = 5;/,
     );
   });
 
   it('必须写明「省的是请求配额，不是 R2 的 Class B 计数」', () => {
     // 两本账不能混：直链省的是 Worker 请求，R2 的 GetObject 照旧计数。
     // 少了这句话，下一个人会把 downloadsPerDay 也一起删掉。
-    expect(BUDGET).toMatch(/downloadsPerDay = a\.browse \* 3 \+ a\.syncs \* a\.books;/);
+    expect(BUDGET).toMatch(
+      /downloadsPerDay =\s*a\.browse \* 3 \+ a\.syncs \* BOOK_PATH_COPIES_PER_SYNC \* a\.books;/,
+    );
     expect(BUDGET, '没有说明直链省的是请求配额而不是 R2 读计数').toMatch(/请求配额/);
+  });
+
+  it('R2 Class B 必须与 Worker 请求同步乘 5，不许只修半本账', () => {
+    // 一次 `GET /dav/<书>` = 1 次 Worker 请求 + 1 次 R2 Class B，是同一件事
+    // 的两面。请求侧数了 5 次，字节侧就必须也是 5 次；只改一边会让表里两行
+    // 互相矛盾，而且它们离得很远，肉眼看不出来。
+    expect(BUDGET, 'downloadsPerDay 没跟上 5× 放大 —— 只修了 Worker 请求那一半').toMatch(
+      /a\.syncs \* BOOK_PATH_COPIES_PER_SYNC \* a\.books/,
+    );
+  });
+
+  it('叶子 GET 的定点行读不能与 PROPFIND 混在一起乘 201', () => {
+    // 这是本轮修 5× 时顺带发现的第三处：`GET /dav/<书>` 会走
+    // findBookByLeaf()（唯一索引，恰好 1 行），它不是「拉一页 200 行」。
+    // 若把它塞进 cacheMisses 再乘 (1 + MAX_ENTRIES)，1 行会被放大成 201 行，
+    // 默认场景算出来超过 1,000 万行/天，直接把 D1 误判为超标。
+    expect(BUDGET, '叶子 GET 行读被混进 cacheMisses 了').toMatch(
+      /const d1RowsReadPerDay = cacheMisses \* \(1 \+ MAX_ENTRIES\) \+ leafGetReads;/,
+    );
+    expect(BUDGET, '没有说明叶子 GET 是 1 行（唯一索引），不是一页').toMatch(
+      /findBookByLeaf/,
+    );
   });
 
   it('文件头不许再写「目录页可被 CDN 缓存，重复浏览不消耗 Worker 请求」', () => {
