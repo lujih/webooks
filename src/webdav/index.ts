@@ -27,7 +27,7 @@ import {
 } from '../lib/db';
 import { methodNotAllowed, shortId, textResponse } from '../lib/http';
 import { safeContentTypeFor, deriveMetadata, sanitiseLeafName } from '../lib/metadata';
-import { encodeR2Key, r2HttpMetadata } from '../lib/r2';
+import { bookObjectKey, encodeR2Key, r2HttpMetadata } from '../lib/r2';
 import { checkPreconditions, type ConditionResult } from '../lib/preconditions';
 import { parseEpub, coverExtFor, PARSE_SIZE_CAP, type EpubMeta } from '../lib/epub';
 import { sniffKindFromBucket } from '../lib/kind-sniff';
@@ -640,15 +640,19 @@ async function handleMoveCopy(
   if (blocked) return blocked;
 
   const targetId = targetBook?.id ?? shortId(8);
-  const targetR2Key = `books/${targetId}`;
+  // 目标 leafName 要参与元数据推导与键生成，所以先算出来（原先在 put 之后才声明）。
+  // 目标扩展名在上面的白名单校验里已经过，这里的 Content-Type 是按**目标**
+  // 名字重新推导的，不是沿用源书 —— 见下方 upsertBook 里的说明。
+  const targetLeafName = sanitiseLeafName(targetLeaf) ?? targetLeaf;
+  // COPY/MOVE 的目标键：targetBook 存在（覆盖式 COPY/MOVE）时沿用它的键，
+  // 理由与 handlePut 完全相同 —— 不要让一次操作留下孤儿对象。
+  // 新建目标时用**目标文件名**生成可读键：MOVE 会改名，键里就该是新名字，
+  // 否则 S3 客户端看到的还是旧标题。
+  const targetR2Key = targetBook?.r2_key ?? bookObjectKey(targetId, targetLeafName);
 
   // R2 对象复制（COPY）或移动（MOVE 先 copy 后删源）
   const sourceObj = await env.BUCKET.get(sourceBook.r2_key);
   if (!sourceObj) return textResponse(404, 'Source object not found in R2', { allow: ALLOW });
-  // 目标 leafName 要参与元数据推导，所以提到 put 之前（原先在 put 之后才声明）。
-  // 目标扩展名在上面的白名单校验里已经过，这里的 Content-Type 是按**目标**
-  // 名字重新推导的，不是沿用源书 —— 见下方 upsertBook 里的说明。
-  const targetLeafName = sanitiseLeafName(targetLeaf) ?? targetLeaf;
   await env.BUCKET.put(targetR2Key, sourceObj.body, {
     httpMetadata: r2HttpMetadata(targetLeafName),
   });
@@ -1041,11 +1045,18 @@ async function handlePut(request: Request, env: Env, node: DavNode, davPath: str
   }
 
   const id = existing?.id ?? shortId(8);
-  const r2Key = `books/${id}`;
+  // ⚠️ 覆盖写入（existing 存在）时**必须沿用旧键**，不能按新格式重算。
+  //    原因：`existing` 是按 leaf_name 查到的，键格式却可能还是**旧格式**
+  //    `books/<id>`（存量对象）。若这里无条件按新格式算，一次普通覆盖上传
+  //    会把对象写到 `books/<id>/<书名>`，而**旧对象仍留在 `books/<id>`** ——
+  //    孤儿对象 + 立刻翻倍的空间占用（一本书 2.5 MB，几千本就是几个 GB）。
+  //    沿用旧键则：存量书继续用旧键（工作正常），新书用新键（S3 可读）。
+  const r2Key = existing?.r2_key ?? bookObjectKey(id, leafName);
   // 安全关键：写入 R2 的 Content-Type **只按扩展名推导**，忽略客户端的声明。
   // R2 对外提供的就是这个值，信任客户端等于允许 text/html 托管（真实漏洞）。
-  // Content-Disposition 同理 —— 对象键是 `books/<随机 id>`，浏览器只能靠
-  // 这个头把文件存成书名。两者统一由 r2HttpMetadata 生成（见 lib/r2.ts）。
+  // Content-Disposition 让**浏览器**把文件存成书名；而对象键里的文件名段
+  // 服务于**走 S3 协议的客户端**（rclone / aws-cli 只看键、不看这个头）。
+  // 两者都要有，见 lib/r2.ts 的 `bookObjectKey` 注释。
   const httpMetadata = r2HttpMetadata(leafName);
   // D1 里单独存一份 Content-Type：语义同上（upsertBook 的 contentType 列）。
   const contentType = httpMetadata.contentType ?? safeContentTypeFor(leafName);

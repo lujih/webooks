@@ -20,7 +20,7 @@ import type { Env } from '../config';
 import { ALLOWED_UPLOAD_FORMATS, isAllowedUploadExt, authorBucket, letterBucket, normaliseFormat } from '../lib/collections';
 import { safeEqual } from '../lib/auth';
 import { deriveMetadata, guessAuthorFromText, safeContentTypeFor, sanitiseLeafName } from '../lib/metadata';
-import { r2HttpMetadata } from '../lib/r2';
+import { bookObjectKey, r2HttpMetadata } from '../lib/r2';
 import { sniffKindFromBucket } from '../lib/kind-sniff';
 import { adjustBuckets, bucketDeltas, bucketIdentityOf, upsertBook, findBookByLeaf
  } from '../lib/db';
@@ -458,7 +458,16 @@ export async function handleUploadComplete(request: Request, env: Env): Promise<
   if (!source) {
     return jsonResponse({ error: 'object-unreadable' }, 404);
   }
-  const bookKey = `books/${shortId(8)}`;
+  // 书籍对象键现在带可读文件名（`books/<id>/<书名>`），见 lib/r2.ts 的
+  // `bookObjectKey` 注释 —— 原因是走 S3 协议的客户端只看键、不看
+  // Content-Disposition，旧键 `books/<id>` 会让它们拿到一堆无法识别的 id。
+  //
+  // ⚠️ id 必须**单独**算出来，不能再用 `bookKey.slice('books/'.length)` 反推：
+  //    新键是两段（`books/<id>/<书名>`），slice 会把 id + 文件名一起切出来，
+  //    于是 id 变成 `xxx/三体.epub`，接着被写进 D1、拼成封面键 `covers/xxx/三体.epub.jpg`
+  //    —— 一切都还「能跑」，但每一行数据都是错的。这是本次改动里最隐蔽的一处。
+  const bookId = shortId(8);
+  const bookKey = bookObjectKey(bookId, safeName);
   const copied = await env.BUCKET.put(bookKey, source.body, {
     httpMetadata,
   });
@@ -490,7 +499,7 @@ export async function handleUploadComplete(request: Request, env: Env): Promise<
             // 扩展名由白名单推导（封面类型只可能来自字节嗅探，见 epub.ts）
             const ext = coverExtFor(coverType);
             if (ext) {
-              coverKey = `covers/${bookKey.slice('books/'.length)}.${ext}`;
+              coverKey = `covers/${bookId}.${ext}`;
               await env.BUCKET.put(coverKey, new Uint8Array(parsed.cover.bytes), {
                 httpMetadata: { contentType: coverType },
               });
@@ -529,7 +538,7 @@ export async function handleUploadComplete(request: Request, env: Env): Promise<
   }
 
   await upsertBook(env.DB, {
-    id: bookKey.slice('books/'.length),
+    id: bookId,
     leafName: safeName,
     title,
     author,

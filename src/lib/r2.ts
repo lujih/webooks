@@ -20,7 +20,7 @@
  * 查询参数（实测无效），所以下载名只能靠写入时的 `contentDisposition`。
  * 反过来说：**已经存在的对象必须重写一次才会带上这个头**。
  */
-import { extensionOf, safeContentTypeFor } from './metadata';
+import { extensionOf, safeContentTypeFor, sanitiseLeafName } from './metadata';
 
 /**
  * 对象键 → URL 路径。
@@ -31,6 +31,59 @@ import { extensionOf, safeContentTypeFor } from './metadata';
  */
 export function encodeR2Key(key: string): string {
   return key.split('/').map((s) => encodeURIComponent(s)).join('/');
+}
+
+/**
+ * 生成书籍对象键：**`books/<id>/<可读文件名>`**。
+ *
+ * ── 为什么要有这段身份（2026-10-21）──────────────────────────────────────
+ *
+ * 原来的键是 `books/<随机 id>`（如 `books/b01`），**既没有书名也没有扩展名**。
+ * 书名只存在 `Content-Disposition` 头里，而那个头只有**浏览器**会读。任何
+ * 走对象存储协议本体的客户端（rclone / aws-cli / s3cmd / Cyberduck 的 S3
+ * 模式）落盘时用的是**键的 basename**，于是拿到一堆 `b01`、`b02` ——
+ * 打不开，也认不出是哪本书。
+ *
+ * 实测对照（本地 D1）：
+ *     书名（WebDAV / Content-Disposition）     旧键 basename
+ *       三体.epub                          →   b01
+ *       灌篮高手 Vol.01.cbz                 →   b04
+ *
+ * 而 README 一直把「走 S3」称为「省预算最狠的一招」（0 次 Worker 请求）。
+ * 一条路被标成最优解却拿不出可用文件，是文档说谎，不是用户的错。
+ *
+ * ── 为什么是「id 目录 + 原名」而不是直接用书名当键 ──────────────────────
+ *
+ * 直接用 `books/<书名>.epub` 会引入三件麻烦事：
+ *   1. **重名**：书库里本来就有「同名不同版本」（`三体.epub` vs `三体(修订版).epub`
+ *      能区分，但 MOVE 到另一集合、或两位作者上传同名书时，键会撞）。
+ *      `leaf_name` 有唯一索引，但对象键换名后并不自动唯一 —— 撞键 = 互相覆盖。
+ *   2. **改名成本**：MOVE/重命名时若键里含书名，就得 copy+delete 整个对象。
+ *   3. **不可控字符**：书名是用户可控的，含 `/` 会多出层级、含 `..` 有路径穿越
+ *      风险（已在下面用 sanitise 挡掉，但键里少放一样不受控的东西总是更稳）。
+ *
+ * 折中方案：`books/<id>/<safeName>` ——
+ *   · **id 段**保证唯一，去重/MOVE/覆盖的语义与以前完全一致（仍然按 id 找）；
+ *   · **文件名段**只负责「人类与 S3 客户端能读懂」，不参与任何查找逻辑；
+ *   · 两者解耦后，将来想改文件名段也不会影响 id 的稳定性。
+ *
+ * ── 安全 ────────────────────────────────────────────────────────────────
+ * `safeName` 经 `sanitiseLeafName()`：`/` 与 `\` 被替换成 `_`、控制字符去掉、
+ * `.` 与 `..` 整名拒绝。所以它永远是**单段**，不会多出层级、不会穿越。
+ * 万一 sanitise 返回 null（空名/纯点），退回 `book` 兜底 —— 宁可键难看，
+ * 也不要一个带 `..` 的键。
+ *
+ * ── 兼容 ────────────────────────────────────────────────────────────────
+ * 键是**存进 D1 的 `r2_key` 列**的（不是从 leaf_name 推导），所以新格式与
+ * 存量 `books/<id>` 可以**共存**：所有读取都走 `book.r2_key`，不做前缀假设。
+ * 不做批量迁移也能正常工作；存量对象只是继续没有可读名。
+ * ⚠️ 想让存量对象也变成可读名，需要一次「copy 到新键 + 删旧键 + 更新 D1」
+ *    的迁移，**目前没有这个端点**（reindex 写的是 `r2Key: object.key`，
+ *    它只发现对象、不重命名对象）。
+ */
+export function bookObjectKey(id: string, leafName: string): string {
+  const safe = sanitiseLeafName(leafName) ?? 'book';
+  return `books/${id}/${safe}`;
 }
 
 /**

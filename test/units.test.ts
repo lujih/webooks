@@ -12,6 +12,7 @@ import {
   resolveNode,
 } from '../src/lib/collections';
 import { deriveMetadata, preferContentType, sanitiseLeafName } from '../src/lib/metadata';
+import { bookObjectKey, encodeR2Key } from '../src/lib/r2';
 import { encodeHref, escapeXml } from '../src/lib/xml';
 import { parsePropfindBody, resolveDepth } from '../src/webdav/propfind';
 import type { Settings } from '../src/config';
@@ -343,5 +344,51 @@ describe('配置默认值与 wrangler.jsonc 精简', () => {
     // 配置里写 200MiB 不会放宽任何东西，只会造成「以为生效了」的错觉。
     const s = settings({ ...(BASE as object), MAX_UPLOAD_BYTES: '209715200' } as never);
     expect(s.maxUploadBytes).toBe(CF_REQUEST_BODY_LIMIT);
+  });
+});
+
+// ── 书籍对象键（2026-10-21：键里加可读文件名）───────────────────────────
+
+describe('bookObjectKey', () => {
+  it('键是 books/<id>/<文件名>，id 段与文件名段都可取', () => {
+    // 这个格式的唯一目的：让走 S3 协议的客户端（rclone / aws-cli）落盘时
+    // 拿到可读名字，而不是 `b01`。旧键 `books/<随机 id>` 没有扩展名，
+    // 拉到本地打不开、也认不出是哪本书。
+    const key = bookObjectKey('6ab0d114', '三体.epub');
+    expect(key).toBe('books/6ab0d114/三体.epub');
+    // 键的 basename 必须就是书名 —— S3 客户端只认这个
+    expect(key.split('/').pop()).toBe('三体.epub');
+  });
+
+  it('文件名含路径分隔符时被清洗成单段，不会多出层级', () => {
+    // 书名是用户可控的：`../../etc/passwd` 若原样进键，就多出层级甚至穿越。
+    // sanitiseLeafName 把 `/` 与 `\` 换成 `_`，所以结果永远是**单段**。
+    //
+    // ⚠️ 注意这里**不能**断言「键里不含 `..`」：清洗后的名字是
+    //    `.._.._etc_passwd.epub`，里面仍然有字面的 `..`，但它**只是普通字符**
+    //    （同一段内），没有任何穿越含义 —— 穿越的前提是 `..` 独立成段。
+    //    真正的判据是「段数」与「没有独立成段的 ..」，不是子串。
+    const key = bookObjectKey('abc', '../../etc/passwd.epub');
+    const parts = key.split('/');
+    expect(parts).toHaveLength(3); // books / abc / <一段>
+    expect(parts[1]).toBe('abc');
+    // 关键：没有任何一段**恰好**是 .. 或 .
+    expect(parts.some((s) => s === '..' || s === '.')).toBe(false);
+    expect(parts[2]).toBe('.._.._etc_passwd.epub');
+  });
+
+  it('清洗后为空时退回 book，绝不产出带 .. 的键', () => {
+    const key = bookObjectKey('abc', '..');
+    expect(key).toBe('books/abc/book');
+    expect(key).not.toContain('..');
+  });
+
+  it('键必须逐段编码后才能进 URL（含中文）', () => {
+    const key = bookObjectKey('abc', '三体.epub');
+    const url = encodeR2Key(key);
+    // 斜杠是层级分隔符，不能被编码成 %2F
+    expect(url.startsWith('books/abc/')).toBe(true);
+    expect(url).toContain('%E4%B8%89%E4%BD%93');
+    expect(url).not.toContain('%2F');
   });
 });

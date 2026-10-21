@@ -174,8 +174,13 @@ describe('书卡 href 指向 R2 公开域', () => {
       .bind('三体.epub')
       .first<{ r2_key: string }>();
     const key = row!.r2_key;
-    // 对象键形如 books/<随机 id>，直链就是 <公开域>/books/<id>（无需编码）
-    expect(html).toContain(`href="${R2_BASE}/${key}"`);
+    // 对象键现在是 `books/<id>/<书名>`（2026-10-21 起，为了走 S3 的客户端
+    // 也能拿到可读文件名）。键里含中文，所以直链**必须**经 encodeR2Key 逐段
+    // 编码 —— 原先这里是直接拼原始键（那时键是 `books/<随机 id>`，纯 ASCII，
+    // 不编码也对）。断言改成编码后的形态，并额外钉住「键里确实带书名」。
+    expect(html).toContain(`href="${R2_BASE}/${encodeR2Key(key)}"`);
+    // 键的第二段就是书名 —— 这是整个改动的目的，单独钉住
+    expect(key.split('/').pop()).toBe('三体.epub');
     // 反向断言：书卡不能再指回 /dav（否则「省一次请求」是假的）
     expect(html).not.toContain(`href="/dav/${encodeURIComponent('最近收录')}/%E4%B8%89%E4%BD%93.epub"`);
   });
@@ -450,6 +455,25 @@ describe('写 R2 的三条路径都带上 contentDisposition', () => {
     expect(meta.contentDisposition).toContain('%E4%B8%89%E4%BD%93.epub');
     // 客户端声明的 contentType 不可信：仍按扩展名推导
     expect(meta.contentType).toBe('application/epub+zip');
+
+    // ── 键格式与 id 派生（2026-10-21）─────────────────────────────────
+    // 这条守的是一个**极隐蔽**的回归：complete 端点曾经用
+    //     id: bookKey.slice('books/'.length)
+    // 反推 id。键改成两段式（`books/<id>/<书名>`）之后，slice 会把
+    // 「id + 文件名」一起切出来 —— 于是 id 变成 `xxx/三体.epub`，
+    // 接着被写进 D1、又拼成封面键 `covers/xxx/三体.epub.jpg`。
+    // 整个流程照样「能跑」，每一行数据却是错的，而且没有任何报错。
+    const row = await testEnv.DB.prepare('SELECT id, r2_key FROM books WHERE leaf_name = ?')
+      .bind('三体.epub')
+      .first<{ id: string; r2_key: string }>();
+    const parts = row!.r2_key.split('/');
+    // 键必须是 books / <id> / <文件名> 三段
+    expect(parts).toHaveLength(3);
+    // id 段必须等于 D1 里的 id，且**不含**斜杠（切片回归的直接症状）
+    expect(parts[1]).toBe(row!.id);
+    expect(row!.id).not.toContain('/');
+    // 文件名段必须是可读书名 —— 这就是整个改动的目的
+    expect(parts[2]).toBe('三体.epub');
   });
 
   it('封面对象不带 contentDisposition（它是 <img> 内联展示的）', async () => {

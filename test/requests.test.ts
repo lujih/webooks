@@ -13,6 +13,9 @@
 import { SELF } from 'cloudflare:test';
 import { beforeEach, describe, expect, it } from 'vitest';
 import { purgeByPrefixes } from '../src/lib/cache';
+// 对象键 2026-10-21 起是 `books/<id>/<书名>`，含中文 → 直链必须逐段编码。
+// 断言直接用同一个编码函数，而不是手拼原始键（手拼会在改格式时静默错位）。
+import { encodeR2Key } from '../src/lib/r2';
 import {
   anonKey,
   normaliseKey,
@@ -689,8 +692,8 @@ describe('上传者榜单（公开端点）', () => {
         latest: { href: string; downloadUrl: string | null } | null;
       };
       expect(body.latest).not.toBeNull();
-      // 绝对地址 + R2 公开域 + 就是这本书的对象键
-      expect(body.latest!.downloadUrl).toBe(`${R2_BASE}/${row!.r2_key}`);
+      // 绝对地址 + R2 公开域 + 就是这本书的对象键（键含中文书名，需逐段编码）
+      expect(body.latest!.downloadUrl).toBe(`${R2_BASE}/${encodeR2Key(row!.r2_key)}`);
       // ⚠️ href 不变：它仍是站内 WebDAV 路径（别的调用方与文档按此依赖）
       expect(body.latest!.href.startsWith('/dav/最近收录/')).toBe(true);
       // 「点一下不经过 Worker」的前提：直链必须是**绝对**地址，
@@ -719,7 +722,7 @@ describe('上传者榜单（公开端点）', () => {
       const res = await SELF.fetch(`${ORIGIN}/api/credits`);
       const body = (await res.json()) as { latest: { title: string; downloadUrl: string | null } };
       expect(body.latest.title).toBe('新书');
-      expect(body.latest.downloadUrl).toBe(`${R2_BASE}/${row!.r2_key}`);
+      expect(body.latest.downloadUrl).toBe(`${R2_BASE}/${encodeR2Key(row!.r2_key)}`);
     });
   });
 
