@@ -268,7 +268,9 @@ describe('源码守卫：R2 写入只允许有一份元数据实现', () => {
       // 网页上传 complete 的搬运
       '../src/api/upload.ts': 1,
       // 已存在对象的回填
-      '../src/api/admin.ts': 1,
+      //（+2026-10-21 的 migrate-keys：把存量对象搬到可读键，
+      // 搬的过程中 put 必须带完整 httpMetadata，否则文件变 octet-stream）
+      '../src/api/admin.ts': 2,
     });
   });
 

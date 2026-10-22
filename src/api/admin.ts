@@ -25,7 +25,7 @@ import {
   upsertBookStatement,
 } from '../lib/db';
 import { sniffKindFromBucket } from '../lib/kind-sniff';
-import { r2HttpMetadata } from '../lib/r2';
+import { bookObjectKey, r2HttpMetadata } from '../lib/r2';
 import { hasAdminToken } from '../lib/auth';
 import { releaseLocksForLeafNames } from '../lib/locks';
 import { handleAdminRequests, handleCreditBoard, handleCreditPurge } from './requests';
@@ -40,7 +40,7 @@ import {
   sanitiseLeafName,
   sha256Hex,
 } from '../lib/metadata';
-import { davCache, purgeEntries } from '../lib/cache';
+import { bookCacheTargets, davCache, purgeEntries } from '../lib/cache';
 import { purgeCreditCache } from './requests';
 
 const BATCH_SIZE = 50;
@@ -83,6 +83,8 @@ export async function handleAdmin(
       return rebucket(env, url);
     case 'backfill-disposition':
       return backfillDisposition(env, url);
+    case 'migrate-keys':
+      return migrateKeys(env, url);
     case 'stats':
       return stats(env);
     case 'books':
@@ -759,6 +761,210 @@ async function backfillDisposition(env: Env, url: URL): Promise<Response> {
         : '已扫描完全部书；R2 响应头已补上下载名，D1 与目录缓存都不需要改动',
   });
 }
+
+/**
+ * 把存量对象从旧键 `books/<id>` 迁到可读键 `books/<id>/<书名>`。
+ *
+ * ── 为什么需要它 ────────────────────────────────────────────────────────
+ * `bookObjectKey()` 让**新书**的键带上了书名，于是走 S3 协议的客户端
+ * （rclone / aws-cli）落盘时能拿到可读文件名。但**存量对象仍是旧键**：
+ * 它们拉下来还是 `b01`、`b02`。`reindex` 救不了这件事 —— 它写的是
+ * `r2Key: object.key`，只**发现**对象，不**重命名**对象。
+ *
+ * ── 安全性设计（这是唯一会动线上真实数据的端点，所以每一步都保守）──
+ *
+ *  1. **默认 dry-run**：不传 `apply=1` 就只统计、不改任何东西。
+ *     需要显式 `apply=1` 才真的搬。这是 R2 `delete` / `put` 这类不可逆操作
+ *     的底线 —— 一个手滑的 GET 请求不该能重写整库。
+ *
+ *  2. **先 put 新的、再删旧的**：顺序反过来会在两步之间留下「D1 指着新键、
+ *     R2 里还没有」的窗口，那段时间这本书 404。先写后删则最坏情况是
+ *     **孤儿旧对象**（占空间但可读），而不是**数据丢失**。
+ *     孤儿可以在下一次跑这个端点时被 `cleanup=1` 清掉。
+ *
+ *  3. **元数据一次给全**：`put` 会用新的 httpMetadata 整体替换旧值。
+ *     只搬字节不带元数据，会把 Content-Type 与 Content-Disposition 清成默认
+ *     （比不迁移更糟：文件变成 `binary/octet-stream` 且没有下载名）。
+ *
+ *  4. **一次只处理一页、带 cursor**：几百本 × 2.5 MB 的搬移会超出 Worker
+ *     的时长与内存限制。`while (nextAfter)` 分页跑，每页有界。
+ *
+ *  5. **失败不中断**：单本失败只计数并留前 5 条原因，不让一本坏书卡住整库。
+ *
+ * ── 幂等 ────────────────────────────────────────────────────────────────
+ * 已经在新格式的键（`books/<id>/<...>`）直接跳过，可以反复跑。
+ * 这就是为什么迁移脚本可以「跑到全绿为止」而不需要额外状态记录。
+ */
+async function migrateKeys(env: Env, url: URL): Promise<Response> {
+  const after = url.searchParams.get('after') ?? '';
+  const requested = Number.parseInt(
+    url.searchParams.get('limit') ?? String(DEFAULT_BACKFILL_LIMIT),
+    10,
+  );
+  const limit = Math.min(Math.max(requested || DEFAULT_BACKFILL_LIMIT, 1), MAX_BACKFILL_LIMIT);
+  // ⚠️ 默认 false：不传 apply 只做预演。见上面第 1 条。
+  const apply = ['1', 'true', 'yes'].includes(
+    (url.searchParams.get('apply') ?? '').toLowerCase(),
+  );
+  // cleanup=1 时，顺带删掉「已迁移但旧对象还留着」的孤儿。
+  // 与 apply 独立：可以只清孤儿、不搬新书。
+  const cleanup = ['1', 'true', 'yes'].includes(
+    (url.searchParams.get('cleanup') ?? '').toLowerCase(),
+  );
+
+  // 与 backfillDisposition 相同的「多查一行当探针」手法，理由见那里的长注释。
+  // 多查一列（分桶字段）是为了**正确失效目录缓存**：键一改，书卡 href 与
+  // GET 302 的 Location 都变了，缓存里指向旧键的条目必须清掉，否则客户端会
+  // 拿着已经不存在的键去请求。`bookCacheTargets()` 需要的正是这几列。
+  const { results } = await env.DB
+    .prepare(
+      `SELECT id, leaf_name, r2_key, size, title_letter, author_letter, format_bucket
+         FROM books
+        WHERE status = 'published' AND id > ?
+        ORDER BY id LIMIT ?`,
+    )
+    .bind(after, limit + 1)
+    .all<{
+      id: string;
+      leaf_name: string;
+      r2_key: string;
+      size: number;
+      title_letter: string;
+      author_letter: string;
+      format_bucket: string;
+    }>();
+  const fetched = results ?? [];
+  const hasMore = fetched.length > limit;
+  const rows = hasMore ? fetched.slice(0, limit) : fetched;
+
+  let migrated = 0;
+  let alreadyReadable = 0;
+  let orphanCleaned = 0;
+  let missing = 0;
+  let failed = 0;
+  let bytesMoved = 0;
+  const failures: Array<{ id: string; leafName: string; error: string }> = [];
+  /** 预演时列出将要发生的改名，方便人工先看一眼 */
+  const plan: Array<{ id: string; from: string; to: string }> = [];
+
+  for (const row of rows) {
+    if (row.r2_key.startsWith('covers/') || row.r2_key.startsWith('uploads/')) {
+      // 与 backfill 同样的防御：脏数据把封面/暂存键写进 r2_key 时不许搬
+      continue;
+    }
+
+    const wantKey = bookObjectKey(row.id, row.leaf_name);
+    // 幂等：已经是可读键就跳过（也可能上次 put 成功、删旧键失败）
+    if (row.r2_key === wantKey) {
+      alreadyReadable++;
+      // cleanup 分支：旧键 `books/<id>` 若还在，删掉它。
+      if (apply && cleanup) {
+        const legacy = `books/${row.id}`;
+        if (await env.BUCKET.head(legacy)) {
+          await env.BUCKET.delete(legacy);
+          orphanCleaned++;
+        }
+      }
+      continue;
+    }
+
+    try {
+      const head = await env.BUCKET.head(row.r2_key);
+      if (!head) {
+        // D1 有行、R2 没对象 —— 数据不一致，单独计数
+        missing++;
+        continue;
+      }
+
+      if (!apply) {
+        // 预演：只记录计划，不碰任何对象
+        migrated++;
+        bytesMoved += head.size;
+        if (plan.length < limit) plan.push({ id: row.id, from: row.r2_key, to: wantKey });
+        continue;
+      }
+
+      // 读原文 → 用**完整**元数据写新键（见上面第 3 条）
+      const source = await env.BUCKET.get(row.r2_key);
+      if (!source) {
+        missing++;
+        continue;
+      }
+      const written = await env.BUCKET.put(wantKey, source.body, {
+        httpMetadata: r2HttpMetadata(row.leaf_name),
+      });
+
+      // D1 指向新键。**必须在删除旧对象之前** —— 顺序见上面第 2 条。
+      await env.DB
+        .prepare('UPDATE books SET r2_key = ?, updated_at = ? WHERE id = ?')
+        .bind(wantKey, new Date().toISOString(), row.id)
+        .run();
+
+      // 旧键删除放在最后：即使这里失败，数据仍然完整可读
+      if (row.r2_key !== wantKey) {
+        await env.BUCKET.delete(row.r2_key);
+      }
+
+      migrated++;
+      bytesMoved += written.size;
+    } catch (err) {
+      failed++;
+      if (failures.length < 5) {
+        failures.push({
+          id: row.id,
+          leafName: row.leaf_name,
+          error: err instanceof Error ? `${err.name}: ${err.message}` : String(err),
+        });
+      }
+    }
+  }
+
+  // 键变了意味着书卡 href 与 GET 302 的 Location 都变了 —— 目录缓存里的
+  // 旧 href 会指向已经不存在的键，必须失效这部分。用现成的 bookCacheTargets()
+  // 而不是手拼路径：一本书同时出现在 5 个集合下（5 条叶子路径 + 5 个所属列表），
+  // 漏掉任何一条就会让某个入口继续指向旧键。
+  // 榜单（/api/credits）也带 downloadUrl，一并清。
+  if (apply && migrated > 0) {
+    const moved = rows.filter((r) => r.r2_key !== bookObjectKey(r.id, r.leaf_name));
+    const targets = moved.flatMap((r) =>
+      bookCacheTargets({
+        leafName: r.leaf_name,
+        titleLetter: r.title_letter,
+        authorLetter: r.author_letter,
+        formatBucket: r.format_bucket,
+      }),
+    );
+    await purgeEntries(targets);
+    await purgeCreditCache();
+  }
+
+  const last = rows[rows.length - 1];
+  const nextAfter = hasMore && last ? last.id : null;
+
+  return jsonResponse({
+    action: 'migrate-keys',
+    after,
+    limit,
+    apply,
+    cleanup,
+    scanned: rows.length,
+    migrated,
+    alreadyReadable,
+    orphanCleaned,
+    missing,
+    failed,
+    bytesMoved,
+    nextAfter,
+    failures,
+    plan: apply ? undefined : plan,
+    note: !apply
+      ? '预演模式：没有写入任何对象。确认 plan 无误后加 apply=1 再跑'
+      : nextAfter
+        ? `已迁移 ${migrated} 本，还有下一页，请带上 after=${nextAfter} 再调一次`
+        : '已扫描完全部书；存量对象键已变成可读格式',
+  });
+}
+
 
 async function stats(env: Env): Promise<Response> {
   const collections = ['title', 'author', 'format', 'recent'] as const;

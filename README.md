@@ -69,7 +69,7 @@ src/
     cache.ts            条目缓存的键与「写入即失效」逻辑
     metadata.ts         从文件名推导元数据（Phase 1 换成解析 EPUB OPF）
     xml.ts / http.ts    XML 与 HTTP 工具
-  api/admin.ts          reindex / stats / purge / backfill-disposition
+  api/admin.ts          reindex / stats / purge / backfill-disposition / migrate-keys
 migrations/0001_init.sql
 public/                 ★ 静态资源：唯一「不计入请求配额」的一类请求
   favicon.ico           浏览器每次浏览都会猜它；没有它就是每次白花一次请求
@@ -335,15 +335,15 @@ WebDAV 只留给只会讲 WebDAV 的客户端（Finder、Windows 资源管理器
 >     永远单段（`/`→`_`，`.`/`..` 整名拒绝），不会多出层级或穿越。
 >
 > **兼容**：`r2_key` 是 D1 里的一列（不是从 leaf_name 推导），所有读取都走
-> `book.r2_key`，所以**新旧格式可以共存**。存量书保持旧键不动（已实测确认），
-> 新书用新键；覆盖上传会**沿用旧键**，不会产生孤儿对象。
+> `book.r2_key`，所以**新旧格式可以共存**。覆盖上传会**沿用旧键**，
+> 不会产生孤儿对象。
 >
-> ⚠️ **存量对象不会自动变成可读名，而且 reindex 也改不了**：reindex 写的是
-> `r2Key: object.key`（读 R2 里现有的键），它是**发现**对象、不是**重命名**对象。
-> 要让存量对象也可读，需要一次真正的「copy 到新键 + 删旧键 + 更新 D1」的迁移，
-> 代码里没有这个端点。当前状态是：**新书可读，老书仍是 `books/<id>`** ——
-> 想彻底统一得写迁移脚本，尚未做。
-> 实现见 [src/lib/r2.ts](src/lib/r2.ts) 的 `bookObjectKey`。
+> **存量对象**：有 `POST /api/admin/migrate-keys` 迁移端点
+> （`src/api/admin.ts`），把 `books/<id>` 搬到 `books/<id>/<书名>`。
+> 默认 **dry-run 只统计不改**，需显式 `apply=1` 才真搬；幂等、可分页、
+> 先写新键再删旧键（最坏结果是孤儿旧对象，不是丢数据）。
+> 注意 `reindex` 改不了这件事 —— 它写的是 `r2Key: object.key`（发现对象），
+> 不是重命名。实现见 [src/lib/r2.ts](src/lib/r2.ts) 的 `bookObjectKey`。
 
 ```bash
 # 推荐：rclone 直连 R2 的 S3 端点（0 次 Worker 请求）
@@ -542,6 +542,38 @@ curl -X POST "https://你的域名/api/admin/purge?path=/title/A/" -H "Authoriza
 ```
 
 `stats` 会返回 `directoryCount` —— 这个数字必须远低于 200，否则挂载一次的请求数会失控。
+
+### 迁移存量对象键（`migrate-keys`）
+
+新书的对象键是 `books/<id>/<书名>`（见第 5 节），但「可读键」上线前
+已经入库的书仍是 `books/<id>`。`POST /api/admin/migrate-keys` 把存量对象
+搬成可读键，与 `backfill-disposition` 的纪律一致：**先预演，再真跑，分页收尾**。
+
+```bash
+# ① 预演：不传 apply，只统计。返回的 plan 列出「谁将从哪个键搬到哪个键」
+curl -X POST "https://你的域名/api/admin/migrate-keys" \
+  -H "Authorization: Bearer $ADMIN_TOKEN"
+
+# ② 确认 plan 无误后真跑，每页 10 本；nextAfter 非空就带 after 继续
+curl -X POST "https://你的域名/api/admin/migrate-keys?apply=1" \
+  -H "Authorization: Bearer $ADMIN_TOKEN"
+
+# ③ 全量跑完再来一遍，带 cleanup=1 清掉「put 成功但 delete 没跑成」的
+#    孤儿旧键（正常跑完不会有孤儿；这一步只是收尾保险）
+curl -X POST "https://你的域名/api/admin/migrate-keys?apply=1&cleanup=1" \
+  -H "Authorization: Bearer $ADMIN_TOKEN"
+```
+
+为什么敢做：
+
+- **默认 dry-run**，不传 `apply=1` 就一个字节都不写；
+- **幂等**：已经在新键的行会进 `alreadyReadable` 直接跳过，可以反复跑；
+- **顺序即安全**：先 put 新键 → 再更新 D1 → 最后 delete 旧键。任何一步失败
+  最坏结果是「旧对象变成孤儿」（占空间但可读，下一步 cleanup 清掉），
+  而不是丢数据。顺序如果反了，一次 put 失败就永久丢书 —— 这是
+  `test/migrate-keys.test.ts` 里那条**源码结构断言**专门守住的
+  （变异测试实测过：把 delete 提前，11 条行为用例全绿，只有结构断言变红）；
+- 每页上限同 backfill 的 16 本：一本最坏 `head + get + put + delete` 四个子请求。
 
 ---
 
