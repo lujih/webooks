@@ -788,6 +788,10 @@ async function backfillDisposition(env: Env, url: URL): Promise<Response> {
  *
  *  4. **一次只处理一页、带 cursor**：几百本 × 2.5 MB 的搬移会超出 Worker
  *     的时长与内存限制。`while (nextAfter)` 分页跑，每页有界。
+ *     游标语义：`nextAfter` = 本页已扫描（`scanned` 行）中最大的 id；
+ *     多查的 1 行探针只用于判断 `hasMore`，不能作为游标——错用探针 id
+ *     会把探针那本整个跳过（生产预演曾因此让 16 本永远扫不到、每页
+ *     死在同一批 10+6 本上）。
  *
  *  5. **失败不中断**：单本失败只计数并留前 5 条原因，不让一本坏书卡住整库。
  *
@@ -939,6 +943,11 @@ async function migrateKeys(env: Env, url: URL): Promise<Response> {
   }
 
   const last = rows[rows.length - 1];
+  // nextAfter 取**已扫描行的 id**（不是探针行的）：id 是 hex 短串，lex 排序，
+  // `WHERE id > ?` 用「已扫描的最后一行」做游标不会漏也不会重。
+  // 如果错用探针行（第 limit+1 行）的 id，那本在下一页**没有出现在 plan**
+  // 中，却直接跳到了它的后一行，导致它被整个跳过（生产预演里曾因此让
+  // 16 本书永远扫不到，每页都死在同一批 10+6 本上）。
   const nextAfter = hasMore && last ? last.id : null;
 
   return jsonResponse({
