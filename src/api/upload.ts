@@ -28,6 +28,7 @@ import { shortId } from '../lib/http';
 import { clientIpFromRequest, guardWrite } from '../lib/throttle';
 import { sanitiseCredit } from '../lib/requests';
 import { purgeCreditCache } from './requests';
+import { bookCacheTargets, purgeEntries } from '../lib/cache';
 import { createPresignedPutUrl } from '../lib/sigv4';
 import { parseEpub, coverExtFor, PARSE_SIZE_CAP } from '../lib/epub';
 import { jsonResponse, textResponse } from '../lib/http';
@@ -580,6 +581,27 @@ export async function handleUploadComplete(request: Request, env: Env): Promise<
   // 单独一次 cache.delete，不与条目缓存的失效混在一起 —— Cache API
   // 在 Free 层有 50 次/请求的上限。
   await purgeCreditCache();
+
+  // 条目缓存（PROPFIND/目录页，TTL 默认 300s）也一并失效。
+  //
+  // ⚠️ 这是联调抓出来的真实错配：上传页承诺「传完立刻能在 WebDAV
+  //    客户端与浏览器书架里看到」，但 complete 原来只打了榜单缓存 ——
+  //    预热过的 PROPFIND 缓存里 5 分钟都看不到新书。真浏览器联调
+  //    （scripts/joint-debug.mjs）复现：complete 后立刻 PROPFIND
+  //    「最近收录」返回旧列表，新书缺席。
+  //
+  // bookCacheTargets() 返回这本书出现的全部路径（5 条叶子 + 5 个列表，
+  // 与 migrate-keys / 删除路径用的是同一套），漏一条就有一个入口
+  // 继续指旧列表。上传一次多花 ≤20 次 cache.delete，完全在 50 上限内
+  //（上传是低频操作，这笔开销可以接受 —— 榜单缓存同理）。
+  await purgeEntries(bookCacheTargets({
+    leafName: safeName,
+    titleLetter: letterBucket(title),
+    authorLetter: authorBucket(author),
+    formatBucket: format,
+  }));
+
+
 
   return jsonResponse({
     ok: true,
