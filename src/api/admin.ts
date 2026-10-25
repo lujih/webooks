@@ -43,6 +43,7 @@ import {
 import { bookCacheTargets, davCache, purgeEntries } from '../lib/cache';
 import { purgeCreditCache } from './requests';
 import { handleImportUrl } from './import-url';
+import { handleImportManifest } from './import-manifest';
 
 const BATCH_SIZE = 50;
 const MAX_LIST_LIMIT = 1000;
@@ -100,6 +101,10 @@ export async function handleAdmin(
       return handleCreditBoard(request, env, url);
     case 'credits/purge':
       return handleCreditPurge(request);
+    case 'import/manifest':
+      // 公版种子库的**登记**批：字节已经由 S3 直传到 books/<id>/<书名>，
+      // 这里只补 D1 元数据（每批 ≤8 本）。见 src/api/import-manifest.ts。
+      return handleImportManifest(request, env);
     case 'import/url':
       // 从网址导入一本书。鉴权由 handleAdmin 统一做（ADMIN_TOKEN），
       // 这里只负责「拉取 → 入库」—— 字节不经过调用方，所以也不占额外请求。

@@ -15,3 +15,7 @@ home-preview.png
 # 编辑器
 .vscode/
 .idea/
+
+seed/.cache/
+seed/submit/
+

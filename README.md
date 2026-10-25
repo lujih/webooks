@@ -599,6 +599,38 @@ curl -X POST "https://你的域名/api/admin/migrate-keys?apply=1&cleanup=1" \
   （变异测试实测过：把 delete 提前，11 条行为用例全绿，只有结构断言变红）；
 - 每页上限同 backfill 的 16 本：一本最坏 `head + get + put + delete` 四个子请求。
 
+### 公版种子库（800 本，期 2）
+
+从**中文维基文库**铺公有领域的书（古籍、白话小说、民國公版作品）。
+流水线、清单格式与验收命令都在 **[seed/README.md](seed/README.md)**，这里只给最短路径：
+
+```bash
+# ① 采集清单（本机跑，限速礼貌抓取；产出 seed/catalog.json，可入库）
+node scripts/seed/harvest.mjs
+
+# ② 生成 EPUB（本机跑，零运行时依赖；产出 seed/submit/）
+node scripts/seed/build-epub.mjs --all
+
+# ③ 字节直传 R2 —— 走 S3，0 次 Worker 请求
+rclone copy seed/submit/books r2:webooks-bucket/books --progress
+
+# ④ 登记元数据（每批 8 本 = 1 次 Worker 请求；跑完自己打缓存）
+node scripts/seed/register.mjs --dry-run          # 先验清单与文件
+node scripts/seed/register.mjs --site https://你的域名 --token "$ADMIN_TOKEN"
+```
+
+几条边界，**不要改写**：
+
+- **授权是机械判定的**：作者卒年 + 50 年 < 今年，或匿名/上古作品；拿不到卒年的
+  「民國/現代」作品一律剔除，不默认公版。`license_basis` 落库，事后可审。
+- 登记端点只接受 `books/<id>/<书名>` 且与 id/书名自洽的键 —— 否则就成了
+  「把桶里任意对象挂到任意书名下」的入口（`test/import-manifest.test.ts` 钉死）。
+- 种子库**不搬字节**：800 本走 Worker 是 800 次请求 + 800 次 `put`，
+  而 S3 直传是 0 次。免费额度留给读者。
+- 目录列表在种库后最多 5 分钟才全部刷新（`PROPFIND_TTL`），第 ④ 步会主动打
+  5 个集合根路径的缓存；单本书的 20 个缓存键**不打** —— 8 本就是 160 次
+  Cache API 删除，超 Workers Free 的 50/次上限。
+
 ---
 
 ## Phase 0 必须实测的事

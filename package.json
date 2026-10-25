@@ -18,7 +18,10 @@
     "db:migrate": "wrangler d1 migrations apply DB --remote",
     "deploy:cloudflare": "npm run db:migrate && wrangler deploy",
     "ci:build": "npm ci",
-    "check": "npm run typecheck && npm test"
+    "check": "npm run typecheck && npm test",
+    "seed:harvest": "node scripts/seed/harvest.mjs",
+    "seed:build": "node scripts/seed/build-epub.mjs",
+    "seed:register": "node scripts/seed/register.mjs"
   },
   "devDependencies": {
     "@cloudflare/vitest-pool-workers": "^0.22.0",
