@@ -68,9 +68,11 @@ src/
     db.ts               D1 访问（全部走索引）
     cache.ts            条目缓存的键与「写入即失效」逻辑
     metadata.ts         从文件名推导元数据（Phase 1 换成解析 EPUB OPF）
+    ingest.ts           ★ 唯一的入库管道：搬键/解析/封面/嗅探/分桶/缓存失效
     xml.ts / http.ts    XML 与 HTTP 工具
   api/admin.ts          reindex / stats / purge / backfill-disposition / migrate-keys
-migrations/0001_init.sql
+  api/import-url.ts     从网址导入（管理员）：SSRF 防护 + 流式落 R2
+migrations/0009_source_ingest.sql   书源与入库来源（source_*/license_basis）
 public/                 ★ 静态资源：唯一「不计入请求配额」的一类请求
   favicon.ico           浏览器每次浏览都会猜它；没有它就是每次白花一次请求
   robots.txt            挡住爬虫枚举 /dav/ 那棵可无限展开的目录树
@@ -506,6 +508,28 @@ curl -X POST "https://你的域名/api/admin/reindex?prefix=library/" \
 返回 `nextCursor` 时，带上同一个 cursor 再调一次（R2 列表分页）。
 扫完最后一个前缀才会重建分桶计数，所以中途查询目录树可能是空的。
 
+### 从网址导入一本（`import/url`）
+
+书在别人站点上、你只想给个链接时，不必先下载到本机再上传：
+
+```bash
+curl -X POST "https://你的域名/api/admin/import/url" \
+  -H "Authorization: Bearer $ADMIN_TOKEN" -H 'content-type: application/json' \
+  -d '{"url":"https://www.gutenberg.org/cache/epub/84/pg84.epub","licenseBasis":"public-domain"}'
+```
+
+- **`licenseBasis` 必填**：`public-domain` / `authorized` / `user-declared`。
+  `unknown` 不接受 —— 说不清来源的书不进库（依据落 `books.license_basis`，迁移 0009）。
+- 只允许公网 `http/https`：内网 IP、`localhost` / `.local` / `.internal`、带账号口令的
+  URL 一律 **422**，且**每一跳重定向都复检**（重定向到内网是 SSRF 最常见的绕过）。
+  想更严格就配 `IMPORT_URL_ALLOWLIST`（逗号分隔域名）。
+  ⚠️ Workers **没有 DNS 解析 API**，挡不住「公网域名解析到内网地址」——
+  这条防护**不完整**，所以端点只给管理员用。完整说明见
+  [书源接入设计](docs/source-ingest-design.md) §5.2，不要把它当完整 SSRF 防护。
+- 上游返回 HTML 错误页、内容与扩展名不符（`.epub` 却不是 ZIP）、超过 200 MiB：
+  分别 **415 / 415 / 413**，失败路径都会清掉暂存对象，不在桶里留垃圾。
+- 与匿名上传共用 `DAILY_WRITE_QUOTA`（默认 300/日）—— 管理员不是「无限写」。
+
 ### 但如果你是从 R2 直接导入的书，还要补一次下载名
 
 对象键 `books/<随机 id>` 里没有书名也没有扩展名，浏览器只能靠对象上的
@@ -735,6 +759,7 @@ node scripts/verify-upload-chain.mjs --site https://你的域名                
 ## 相关文档
 
 - [可行性报告](docs/cloudflare-ebook-library-feasibility.md) —— 平台限制、合规、成本、落地路线
+- [书源接入设计](docs/source-ingest-design.md) —— **为什么不爬源站**、四条自动入库路线（URL / 公版种子 / OPDS / 联邦）、合规前置与配额测算
 - [平台调研原始记录](docs/appendix-platform-research.md) —— 逐条引用与官方文档日期
 - [安全审计报告](docs/security-audit.md) —— 漏洞复现、修复与实测数据
 - [RFC 合规清单](docs/rfc-compliance.md) —— 逐条对照 RFC 4918 / 9110
