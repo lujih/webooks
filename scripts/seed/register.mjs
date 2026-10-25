@@ -22,7 +22,8 @@ import path from 'node:path';
 
 const ROOT = process.cwd();
 const MANIFEST = path.join(ROOT, 'seed/submit/manifest.json');
-const CATALOG = path.join(ROOT, 'seed/catalog.json');
+// 允许用 SEED_CATALOG 指定清单（两条路线并存：catalog.json / catalog.volumes.json）
+const CATALOG = path.resolve(ROOT, process.env.SEED_CATALOG ?? 'seed/catalog.json');
 const BATCH_LIMIT = 8; // 与 src/api/import-manifest.ts 的 MAX_ENTRIES 一致
 
 /** 收尾要打掉的缓存根路径（目录列表最多 300 秒后自然刷新，这里是提前打） */

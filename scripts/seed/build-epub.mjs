@@ -42,7 +42,8 @@ import { fileURLToPath } from 'node:url';
 // ── 常量 ────────────────────────────────────────────────────────────────
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
 const SEED_DIR = path.join(REPO_ROOT, 'seed');
-const CATALOG_PATH = path.join(SEED_DIR, 'catalog.json');
+// 允许用 SEED_CATALOG 指定清单（两条路线并存：catalog.json / catalog.volumes.json）
+const CATALOG_PATH = path.resolve(process.cwd(), process.env.SEED_CATALOG ?? 'seed/catalog.json');
 const SUBMIT_DIR = path.join(SEED_DIR, 'submit');
 const BOOKS_DIR = path.join(SUBMIT_DIR, 'books');
 const MANIFEST_PATH = path.join(SUBMIT_DIR, 'manifest.json');

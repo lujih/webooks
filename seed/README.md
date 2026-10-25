@@ -15,7 +15,7 @@
 ## 流水线
 
 ```
-① harvest.mjs   → seed/catalog.json      800 条候选（页面、作者、卒年、授权依据）
+① harvest-volumes.mjs → seed/catalog.json  800 卷（页面、来源总集、授权依据）
 ② build-epub.mjs→ seed/submit/books/<id>/<书名>.epub + seed/submit/manifest.json
 ③ rclone copy   → R2（0 次 Worker 请求）
 ④ register.mjs  → POST /api/admin/import/manifest（每批 ≤8 本，只写 D1）
@@ -35,7 +35,8 @@ seed/
     manifest.json       注册载荷（供 ④）
     books/<id>/<name>   待上传的 EPUB
 scripts/seed/
-  harvest.mjs           ①
+  harvest-volumes.mjs   ①（卷级，交付路线）
+  harvest.mjs           ①（整本，实验，慢）
   build-epub.mjs        ②
   register.mjs          ④
 ```
@@ -46,6 +47,7 @@ scripts/seed/
 {
   "version": 1,
   "source": "zh.wikisource.org",
+  "mode": "volumes",              // volumes = 卷级路线（本仓库交付的路线）
   "generatedAt": "2026-10-23T00:00:00.000Z",
   "entries": [
     {
@@ -68,18 +70,25 @@ scripts/seed/
 
 ### 硬性规则（校验脚本会拒）
 
+**本仓库交付的是卷级路线（`mode: "volumes"`）**，规则如下：
+
 1. **正好 800 条**，`page` 全局唯一。
-2. `licenseBasis` 必须是 `public-domain`。
-3. 授权判定：`authorDeathYear === null` → 视为公版（上古/匿名），
-   或 `authorDeathYear + 50 < 2026`。**卒年 > 1975 一律剔除**
-   （1976 年卒 → 2026-12-31 才到期，现在仍在保护期）。
-4. `chapters` 非空，且每一项都以 `page` 开头（`page` 本身或 `page/子页`）。
-5. 排除「不是书」的页面：标题以 `序 / 跋 / 目錄 / 凡例 / 提要 / 後記 / 前言 / 索引`
-   结尾，或标题长度 < 2。
-6. 组成约束（防止整库都是佛经或短诗）：
-   - 至少 **400 条**是多章作品（`chapters.length ≥ 2`）；
-   - 任一来源分类最多 **300 条**；
-   - 单页作品（`chapters.length === 1`）正文至少 **20 KB**。
+2. `licenseBasis` 必须是 `public-domain`，且 `licenseNote` 非空 ——
+   逐条写「总集名 + 成书年代 + 编者卒年」，授权依据可以当场核对。
+3. `chapters` **恰好是 `[page]`**：一卷就是一个维基文库页面。
+4. 正文 `bytes ≥ 3000`（按 wikitext 长度）。
+5. 排除标题像序跋的页面（`序 / 跋 / 目錄 / 凡例 / 提要 / 後記 / 前言 / 索引` 结尾）。
+6. 来源配额：任一总集最多 300 卷（防止 800 卷全变成《全唐詩》）；
+   二十四史共享 250 卷配额。
+
+> **为什么不是整本**：整本要逐章抓取（800 本 × 平均 20 章 ≈ 1.6 万次请求），
+> 维基文库匿名 API 实测约 14 次/45 秒 —— 那是十几小时。卷级每本 1 个页面，
+> 800 本 ≈ 800 次请求，本轮真的能铺完。代价是粒度更细（《全唐詩·卷001》）：
+> 对写作查找典故反而更快，但不是传统意义上的「整本书」。
+
+> 整本路线本轮**未交付**：按分类递归 + 子页发现找整本、用 Wikidata 核对作者卒年，
+> 逻辑更严格，但 800 本 × 平均 20 章 ≈ 1.6 万次请求，在当前限速下要十几小时。
+> 实验稿未入库（工作区已清理），需要时按同一契约重写，且要预留一整晚。
 
 ## build-epub 的输出要求
 
@@ -98,11 +107,24 @@ scripts/seed/
 `id` 为 16 位十六进制（与 `shortId(8)` 同形），`<书名>` 经 sanitiseLeafName 同规则清洗
 （`/`→`_`，不带路径分隔符），且**全局唯一**（同名加 ` (作者)`）。
 
+## 两条路线并存
+
+`SEED_CATALOG` 环境变量可以让脚本换一份清单，互不覆盖：
+
+```bash
+# 卷级（默认，已交付 800 卷 + 800 本 EPUB）
+node scripts/seed/build-epub.mjs --all
+
+# 整本（实验清单真出现时；未在限速下验证过全量）
+SEED_CATALOG=seed/catalog.works.json node scripts/seed/build-epub.mjs --limit 3
+SEED_CATALOG=seed/catalog.works.json node scripts/seed/register.mjs --dry-run
+```
+
 ## 验收（不跑真实上传也能验）
 
 ```bash
 # ① 校验清单
-node scripts/seed/harvest.mjs --validate-only
+node scripts/seed/harvest-volumes.mjs --validate-only
 
 # ② 生成 3 本样板并验证结构
 node scripts/seed/build-epub.mjs --limit 3

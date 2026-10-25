@@ -467,7 +467,8 @@ CREATE TABLE opds_entries (
 | 改动 | 文件 |
 |---|---|
 | 清单契约与流水线（采集 → 生成 EPUB → S3 直传 → 登记） | `seed/README.md` |
-| 采集脚本（维基文库分类遍历 + Wikidata 卒年 + 机械公版判定） | `scripts/seed/harvest.mjs` |
+| 采集脚本·卷级（交付路线：一个页面 = 一卷，几分钟出 800 条） | `scripts/seed/harvest-volumes.mjs` |
+| 采集脚本·整本（实验：分类递归 + 子页发现 + Wikidata 卒年；限速下数小时） | `scripts/seed/harvest.mjs` |
 | EPUB 生成脚本（已渲染 HTML → EPUB 3，零依赖手写 ZIP） | `scripts/seed/build-epub.mjs` |
 | 登记脚本（`--dry-run` 校验本地一致性；正式跑按批 8 本 + 收尾打缓存） | `scripts/seed/register.mjs` |
 | 登记端点：只接受 `books/<id>/<书名>` 自洽键、head 验存、每批 ≤8 本 | `src/api/import-manifest.ts` |
@@ -478,6 +479,11 @@ CREATE TABLE opds_entries (
 第四步才进 Worker（一本一次 D1 写入）。合并成一个脚本就会把 800 次
 `put` 和 800 次 `fetch` 都塞进 Worker —— 那正是设计稿 §2 拒绝的形态。
 
+**路线调整（2026-10-23 深夜）**：整本路线在当前限速下需要十几小时，
+本轮改为**卷级路线**（《全唐詩·卷001》这样的一卷一本）：清单几分钟出齐，
+800 本 EPUB 约半小时生成。授权依据从「作者卒年」改为「总集成书年代 + 编者卒年」，
+逐条写进 `licenseNote`，仍然可核对。
+
 **仍未完成（需要用户侧条件）**：真正的 800 本入库需要
-① 本机 `harvest`/`build` 跑完 ② R2 凭据供 rclone 直传 ③ 站点 `ADMIN_TOKEN`。
+① 本机 `build-epub --all` 跑完 ② R2 凭据供 rclone 直传 ③ 站点 `ADMIN_TOKEN`。
 本工作区没有真实 R2 凭据（`.dev.vars` 里是联调占位值），所以字节没有推上去。

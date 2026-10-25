@@ -19,9 +19,10 @@
     "deploy:cloudflare": "npm run db:migrate && wrangler deploy",
     "ci:build": "npm ci",
     "check": "npm run typecheck && npm test",
-    "seed:harvest": "node scripts/seed/harvest.mjs",
+    "seed:harvest": "node scripts/seed/harvest-volumes.mjs",
     "seed:build": "node scripts/seed/build-epub.mjs",
-    "seed:register": "node scripts/seed/register.mjs"
+    "seed:register": "node scripts/seed/register.mjs",
+    "seed:harvest:works": "node scripts/seed/harvest.mjs"
   },
   "devDependencies": {
     "@cloudflare/vitest-pool-workers": "^0.22.0",

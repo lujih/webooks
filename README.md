@@ -606,7 +606,8 @@ curl -X POST "https://你的域名/api/admin/migrate-keys?apply=1&cleanup=1" \
 
 ```bash
 # ① 采集清单（本机跑，限速礼貌抓取；产出 seed/catalog.json，可入库）
-node scripts/seed/harvest.mjs
+#    卷级路线：一个维基文库页面 = 一卷 = 一本。整本路线太慢，见 seed/README.md
+node scripts/seed/harvest-volumes.mjs
 
 # ② 生成 EPUB（本机跑，零运行时依赖；产出 seed/submit/）
 node scripts/seed/build-epub.mjs --all
@@ -621,8 +622,12 @@ node scripts/seed/register.mjs --site https://你的域名 --token "$ADMIN_TOKEN
 
 几条边界，**不要改写**：
 
-- **授权是机械判定的**：作者卒年 + 50 年 < 今年，或匿名/上古作品；拿不到卒年的
-  「民國/現代」作品一律剔除，不默认公版。`license_basis` 落库，事后可审。
+- **授权逐条可查**：每个条目都记「总集名 + 成书年代 + 编者卒年」
+  （如《全唐詩》1705 年官修、編者曹寅卒於 1712）；不收任何民國/現代分类下的作品。
+  `license_basis` 落库，事后可审。
+- **粒度是「卷」不是「整本」**：整本要逐章抓取（800 本 × 平均 20 章 ≈ 1.6 万次请求），
+  维基文库匿名 API 实测约 14 次/45 秒 —— 那是十几小时。卷级每本 1 个页面，
+  800 本 ≈ 800 次请求。代价是《全唐詩·卷001》这样的一卷一本，不是传统整本。
 - 登记端点只接受 `books/<id>/<书名>` 且与 id/书名自洽的键 —— 否则就成了
   「把桶里任意对象挂到任意书名下」的入口（`test/import-manifest.test.ts` 钉死）。
 - 种子库**不搬字节**：800 本走 Worker 是 800 次请求 + 800 次 `put`，
