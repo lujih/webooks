@@ -468,7 +468,7 @@ CREATE TABLE opds_entries (
 |---|---|
 | 清单契约与流水线（采集 → 生成 EPUB → S3 直传 → 登记） | `seed/README.md` |
 | 采集脚本·卷级（交付路线：一个页面 = 一卷，几分钟出 800 条） | `scripts/seed/harvest-volumes.mjs` |
-| 采集脚本·整本（实验：分类递归 + 子页发现 + Wikidata 卒年；限速下数小时） | `scripts/seed/harvest.mjs` |
+| 采集脚本·整本（分类递归 + 子页发现 + Wikidata 卒年；3 小时出清单，逐章生成约 6–11 小时） | `scripts/seed/harvest-works.mjs` |
 | EPUB 生成脚本（已渲染 HTML → EPUB 3，零依赖手写 ZIP） | `scripts/seed/build-epub.mjs` |
 | 登记脚本（`--dry-run` 校验本地一致性；正式跑按批 8 本 + 收尾打缓存） | `scripts/seed/register.mjs` |
 | 登记端点：只接受 `books/<id>/<书名>` 自洽键、head 验存、每批 ≤8 本 | `src/api/import-manifest.ts` |
@@ -487,3 +487,16 @@ CREATE TABLE opds_entries (
 **仍未完成（需要用户侧条件）**：真正的 800 本入库需要
 ① 本机 `build-epub --all` 跑完 ② R2 凭据供 rclone 直传 ③ 站点 `ADMIN_TOKEN`。
 本工作区没有真实 R2 凭据（`.dev.vars` 里是联调占位值），所以字节没有推上去。
+
+### 13.6 两条清单并存（2026-10-24）
+
+| | 卷级（主线，已生成 EPUB） | 整本（备线，仅清单） |
+|---|---|---|
+| 清单 | `seed/catalog.json` | `seed/catalog.works.json` |
+| 条目 | 800 卷 | 800 本（466 多章 / 334 单页） |
+| 章节页 | 800 | 13,115 |
+| EPUB | **800 本已生成**（0 失败，14.7 MB） | 未生成（约 6–11 小时） |
+
+整本清单的价值：466 部多章作品带完整章节列表，是「下一轮整本铺库」的现成输入；
+代价是逐章抓取。两条清单用 `SEED_CATALOG` 切换，互不覆盖。
+整本清单的已知边界（名著缺席、`bytes` 低估嵌入页、429 条卒年未知）写在 `seed/README.md`。

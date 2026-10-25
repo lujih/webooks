@@ -611,6 +611,8 @@ node scripts/seed/harvest-volumes.mjs
 
 # ② 生成 EPUB（本机跑，零运行时依赖；产出 seed/submit/）
 node scripts/seed/build-epub.mjs --all
+# 整本清单已交付但未生成 EPUB（13,115 章节页，约 6–11 小时）：
+# SEED_CATALOG=seed/catalog.works.json node scripts/seed/build-epub.mjs --all
 
 # ③ 字节直传 R2 —— 走 S3，0 次 Worker 请求
 rclone copy seed/submit/books r2:webooks-bucket/books --progress

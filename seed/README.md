@@ -29,14 +29,16 @@
 
 ```
 seed/
-  catalog.json          ①的产物，**提交进仓库**（它是清单，不是内容）
-  report.md             ①的统计与排除原因
+  catalog.json          ①的产物（卷级，主线），**提交进仓库**
+  catalog.works.json    ①的产物（整本，备线），**提交进仓库**
+  report.md             卷级的统计与排除原因
+  report.works.md       整本的统计与排除原因
   submit/               ②的产物，**.gitignore**（二进制，别进仓库）
     manifest.json       注册载荷（供 ④）
     books/<id>/<name>   待上传的 EPUB
 scripts/seed/
   harvest-volumes.mjs   ①（卷级，交付路线）
-  harvest.mjs           ①（整本，实验，慢）
+  harvest-works.mjs     ①（整本，13,115 章节页，清单已交付）
   build-epub.mjs        ②
   register.mjs          ④
 ```
@@ -107,18 +109,32 @@ scripts/seed/
 `id` 为 16 位十六进制（与 `shortId(8)` 同形），`<书名>` 经 sanitiseLeafName 同规则清洗
 （`/`→`_`，不带路径分隔符），且**全局唯一**（同名加 ` (作者)`）。
 
-## 两条路线并存
+## 两条路线（都已交付清单，只有卷级生成了 EPUB）
 
-`SEED_CATALOG` 环境变量可以让脚本换一份清单，互不覆盖：
+| | 卷级（主线） | 整本（备线） |
+|---|---|---|
+| 清单 | `seed/catalog.json` | `seed/catalog.works.json` |
+| 报告 | `seed/report.md` | `seed/report.works.md` |
+| 脚本 | `scripts/seed/harvest-volumes.mjs` | `scripts/seed/harvest-works.mjs` |
+| 条目 | 800 卷（1 页/卷） | 800 本（466 多章 / 334 单页） |
+| 章节页 | 800 | **13,115**（多章作品平均 27.4 章） |
+| 正文 | 28 MB wikitext | 276 MB wikitext |
+| EPUB | **已生成 800 本，0 失败** | 未生成（按实测速率约 6–11 小时） |
+| 客户端 | `node scripts/seed/...` | `SEED_CATALOG=seed/catalog.works.json node scripts/seed/build-epub.mjs …` |
 
-```bash
-# 卷级（默认，已交付 800 卷 + 800 本 EPUB）
-node scripts/seed/build-epub.mjs --all
+**为什么两条都留着**：卷级在限额内可以当天交付并已生成全部 EPUB；整本清单更接近「真正的书」，
+但逐章生成要跑一整晚。两者互不覆盖，`SEED_CATALOG` 切换。
 
-# 整本（实验清单真出现时；未在限速下验证过全量）
-SEED_CATALOG=seed/catalog.works.json node scripts/seed/build-epub.mjs --limit 3
-SEED_CATALOG=seed/catalog.works.json node scripts/seed/register.mjs --dry-run
-```
+### 整本清单的已知边界（来自采集报告，不要当缺陷清单）
+
+- **名著缺席**：《紅樓夢》《三國演義》《水滸傳》没进 800 —— 它们所在的
+  `章回小說`(8 页) / `演義小說`(7 页) 分类太小，没进按体量选出的前 14 个来源分类。
+  库的强项是集部 / 四庫 / 佛經 / 史部 / 子部。要补名著走 `import/url` 单点导入更省事。
+- **`bytes` 会低估一部分多章作品**：部分四部叢刊/正史卷页是 `<pages … djvu>` 嵌入或重定向
+  （如 `丁卯集/卷上` 只有 158 B）；`action=parse` 会展开，实际 EPUB 大得多。
+- **429 条卒年未知**（其中 234 条作者有名字但 Wikidata 无 P570）——
+  按「null → 上古/佚名」规则收，`licenseNote` 写的是规则依据，不是核实过的卒年。
+- 清单多一个 `sourceCategories` 数组（来源分类上限需要可机读），其余字段与契约一致。
 
 ## 验收（不跑真实上传也能验）
 
