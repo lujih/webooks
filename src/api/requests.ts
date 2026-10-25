@@ -18,7 +18,7 @@
 
 import type { Env } from '../config';
 import { jsonResponse } from '../lib/http';
-import { creditsCacheKey, davCache, requestsCacheKey } from '../lib/cache';
+import { creditsCacheKey, davCache, purgeCreditCache, requestsCacheKey } from '../lib/cache';
 import { guardWrite } from '../lib/throttle';
 import { latestBook } from '../lib/db';
 import { collectionSegment } from '../lib/collections';
@@ -421,18 +421,10 @@ export async function handleCreditPublic(request: Request, env: Env): Promise<Re
 /**
  * 上传/删除后让榜单缓存失效（1 次 Cache API 调用）。
  *
- * ⚠️ Cache API 在 Workers Free 有 50 次/请求的上限（见 purgeEntries 的注释），
- *   所以这里是**单独一次**调用，不与条目缓存的失效混在一起。
+ * 实现在 lib/cache.ts（入库管道也要用，lib 不应反向依赖 api 层）。
+ * 这里保留同名转出，现有调用方与注释里的引用都不用改。
  */
-export async function purgeCreditCache(): Promise<void> {
-  const cache = davCache();
-  if (!cache) return;
-  try {
-    await cache.delete(creditsCacheKey());
-  } catch {
-    /* 忽略 */
-  }
-}
+export { purgeCreditCache } from '../lib/cache';
 
 /**
  * 手动打掉榜单缓存（管理端用）。

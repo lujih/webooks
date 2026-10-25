@@ -42,6 +42,7 @@ import {
 } from '../lib/metadata';
 import { bookCacheTargets, davCache, purgeEntries } from '../lib/cache';
 import { purgeCreditCache } from './requests';
+import { handleImportUrl } from './import-url';
 
 const BATCH_SIZE = 50;
 const MAX_LIST_LIMIT = 1000;
@@ -99,6 +100,11 @@ export async function handleAdmin(
       return handleCreditBoard(request, env, url);
     case 'credits/purge':
       return handleCreditPurge(request);
+    case 'import/url':
+      // 从网址导入一本书。鉴权由 handleAdmin 统一做（ADMIN_TOKEN），
+      // 这里只负责「拉取 → 入库」—— 字节不经过调用方，所以也不占额外请求。
+      // 设计见 docs/source-ingest-design.md §5。
+      return handleImportUrl(request, env);
     default:
       // `requests` 与 `requests/<id>` 都要走同一个处理器（列表 vs 标记状态），
       // 所以不能放在上面的精确匹配里 —— 标记状态需要 path 里带 id。

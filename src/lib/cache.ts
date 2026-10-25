@@ -101,6 +101,26 @@ export function creditsCacheKey(): string {
 }
 
 /**
+ * 上传/删除/导入后让榜单缓存失效（1 次 Cache API 调用）。
+ *
+ * ⚠️ Cache API 在 Workers Free 有 50 次/请求的上限（见 purgeEntries 的注释），
+ *   所以这里是**单独一次**调用，不与条目缓存的失效混在一起。
+ *
+ * 放在 lib 而不是 api/requests.ts：入库管道（lib/ingest.ts）要用它，
+ * 而 lib 不应该反向依赖 api 层。api/requests.ts 仍原样转出这个名字，
+ * 现有调用方（webdav、admin、upload）一行都不用改。
+ */
+export async function purgeCreditCache(): Promise<void> {
+  const cache = davCache();
+  if (!cache) return;
+  try {
+    await cache.delete(creditsCacheKey());
+  } catch {
+    /* 忽略 */
+  }
+}
+
+/**
  * 求书墙列表的缓存键（分页参数不同则键不同）。
  * 求书提交后漏看 60 秒的代价接近零，所以**不做失效钩子** ——
  * 那是比缓存更贵的复杂度。见 api/requests.ts 的注释。

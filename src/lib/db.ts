@@ -367,6 +367,22 @@ export interface UpsertBookInput {
    *   把它放进书库」，不是「谁最后一次改了文件」。
    */
   credit?: string | null;
+  /**
+   * 书源与入库来源（迁移 0009）。全部可空，省略即「未声明」。
+   *
+   * ⚠️ 覆盖写入时用 COALESCE 保护第一次的来源记录：来源属于
+   *   「谁第一个把它放进书库、凭什么」，不是「谁最后一次改了文件」。
+   *   这与 credit 的保护是同一个理由。
+   *
+   * ⚠️ 不要在这里做取值校验 —— 闭集校验放在 lib/ingest.ts 的入参类型上。
+   *   这里只负责存储，多一道校验就多一个「上传能写、reindex 不能写」的分歧。
+   */
+  sourceKind?: string | null;
+  sourceUrl?: string | null;
+  licenseBasis?: string | null;
+  ingestedBy?: string | null;
+  sourceId?: string | null;
+  sourceEntry?: string | null;
   publishedAt: string | null;
   coverKey?: string | null;
   description?: string | null;
@@ -383,8 +399,10 @@ export function upsertBookStatement(db: D1Database, b: UpsertBookInput): D1Prepa
     .prepare(
       `INSERT INTO books (id, leaf_name, title, author, language, format, content_type, size,
          sha256, r2_key, etag, title_letter, author_letter, format_bucket, kind_bucket, kind_source,
-          published_at, cover_key, description, credit, created_at, updated_at, status)
-       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+          published_at, cover_key, description, credit,
+          source_kind, source_url, license_basis, ingested_by, source_id, source_entry,
+          created_at, updated_at, status)
+       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
        ON CONFLICT(id) DO UPDATE SET
          leaf_name = excluded.leaf_name,
          title = excluded.title,
@@ -430,6 +448,17 @@ export function upsertBookStatement(db: D1Database, b: UpsertBookInput): D1Prepa
          --   B 覆盖上传 A 传的书时，A 的署名必须保留。
          --   COALESCE 让「上传时没留名」不会抹掉已有的署名。
          credit = COALESCE(books.credit, excluded.credit),
+         -- 书源同理：第一次的「哪来的、凭什么」不该被后来的自动化覆盖。
+         -- 覆盖上传只会更新文件本身，来源记录保持原样（迁移 0009）。
+         source_kind = COALESCE(books.source_kind, excluded.source_kind),
+         source_url = COALESCE(books.source_url, excluded.source_url),
+         license_basis = COALESCE(books.license_basis, excluded.license_basis),
+         ingested_by = COALESCE(books.ingested_by, excluded.ingested_by),
+         -- source_id / source_entry 是同步去重键，**不做 COALESCE**：
+         -- 它们是「这本书来自哪一条源记录」，值变了就是另一条记录，
+         -- 而 (source_id, source_entry) 上有唯一索引，冲突会在写入时暴露出来。
+         source_id = excluded.source_id,
+         source_entry = excluded.source_entry,
          description = excluded.description,
          updated_at = excluded.updated_at,
          status = excluded.status`,
@@ -440,6 +469,8 @@ export function upsertBookStatement(db: D1Database, b: UpsertBookInput): D1Prepa
       b.publishedAt,
       b.coverKey ?? null, b.description ?? null,
       b.credit ?? DEFAULT_CREDIT,
+      b.sourceKind ?? null, b.sourceUrl ?? null, b.licenseBasis ?? null,
+      b.ingestedBy ?? null, b.sourceId ?? null, b.sourceEntry ?? null,
       now, now, b.status ?? 'published',
     );
 }

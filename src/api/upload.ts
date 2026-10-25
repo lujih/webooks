@@ -17,21 +17,17 @@
  */
 
 import type { Env } from '../config';
-import { ALLOWED_UPLOAD_FORMATS, isAllowedUploadExt, authorBucket, letterBucket, normaliseFormat } from '../lib/collections';
+import { ALLOWED_UPLOAD_FORMATS, isAllowedUploadExt } from '../lib/collections';
 import { safeEqual } from '../lib/auth';
-import { deriveMetadata, guessAuthorFromText, safeContentTypeFor, sanitiseLeafName } from '../lib/metadata';
-import { bookObjectKey, r2HttpMetadata } from '../lib/r2';
-import { sniffKindFromBucket } from '../lib/kind-sniff';
-import { adjustBuckets, bucketDeltas, bucketIdentityOf, upsertBook, findBookByLeaf
- } from '../lib/db';
-import { shortId } from '../lib/http';
+import { safeContentTypeFor } from '../lib/metadata';
 import { clientIpFromRequest, guardWrite } from '../lib/throttle';
 import { sanitiseCredit } from '../lib/requests';
-import { purgeCreditCache } from './requests';
-import { bookCacheTargets, purgeEntries } from '../lib/cache';
 import { createPresignedPutUrl } from '../lib/sigv4';
-import { parseEpub, coverExtFor, PARSE_SIZE_CAP } from '../lib/epub';
-import { jsonResponse, textResponse } from '../lib/http';
+import { PARSE_SIZE_CAP } from '../lib/epub';
+// 入库管道只有一条：upload 只是「字节已经在 R2 上」的四种来源之一。
+// 搬键、解析、封面、嗅探、分桶、缓存失效全在 lib/ingest.ts。
+import { DEFAULT_MAX_BYTES, ingestBook, ingestFailureResponse } from '../lib/ingest';
+import { jsonResponse, shortId, textResponse } from '../lib/http';
 
 const SITEVERIFY = 'https://challenges.cloudflare.com/turnstile/v0/siteverify';
 
@@ -45,15 +41,14 @@ const SITEVERIFY = 'https://challenges.cloudflare.com/turnstile/v0/siteverify';
 const ALLOWED_EXT = new Set(ALLOWED_UPLOAD_FORMATS);
 
 /**
- * 网页上传通道的默认体积上限。
+ * 默认体积上限现在定义在 lib/ingest.ts（`DEFAULT_MAX_BYTES`）——
+ * URL 导入、OPDS 同步共用同一个数，分两处写就会出现
+ * 「网页能传 200MB、导入只认 100MB」这种说不清的差异。
  *
  * 与 WebDAV 的 100 MiB **故意不同**：这条通道用预签名 PUT 直传 R2，
  * 字节不经过 Worker，因此不受 Cloudflare 的「请求体 ≤ 100MB」限制
  * （那个限制只作用于 Worker 的入站请求）。所以这里可以放 200 MiB。
- *
- * 换句话说：想要大文件就走路面上传，走 WebDAV 传不进来。
  */
-const DEFAULT_MAX_BYTES = 200 * 1024 * 1024; // 200 MiB
 
 /**
  * 上传链路的每日写次数上限（每 IP）。
@@ -354,7 +349,7 @@ export async function handleUploadComplete(request: Request, env: Env): Promise<
   }
 
   // ── 写节流 ──────────────────────────────────────────────────────
-  // complete 是最重的端点之一（2 次 R2 读 + 1 次写 + D1 写 + rebuildBuckets），
+  // complete 是最重的端点之一（2 次 R2 读 + 1 次写 + D1 写 + 分桶更新），
   // 却曾经完全开放给任何人反复调用。init 的节流挡不住它 ——
   // 攻击者可以在 init 之后、complete 之前任意次地重放。
   const blocked = await guardWrite(env, request, DEFAULT_WRITE_QUOTA);
@@ -368,252 +363,37 @@ export async function handleUploadComplete(request: Request, env: Env): Promise<
   }
 
   const { key, filename, size } = body;
-  const credit = sanitiseCredit(body.credit);
   if (typeof key !== 'string' || !key.startsWith('uploads/')) {
     return jsonResponse({ error: 'bad-key' }, 400);
   }
 
-  // 校验对象确实存在，并取真实大小/类型（防止前端伪造 size）
-  const head = await env.BUCKET.head(key);
-  if (!head) {
-    return jsonResponse({ error: 'object-not-found' }, 404);
-  }
-
-  const actualSize = head.size;
-  const maxBytes = Number.parseInt(env.UPLOAD_MAX_BYTES ?? '', 10) || DEFAULT_MAX_BYTES;
-  if (actualSize > maxBytes) {
-    // 超标：立刻删除刚传上来的文件
-    await env.BUCKET.delete(key);
-    return jsonResponse({ error: 'file-too-large', maxBytes, size }, 413);
-  }
-
-  // 文件名清洗必须与 WebDAV PUT 完全一致（sanitiseLeafName）。
-  // 早期实现只替换了 / 和 \，于是控制字符、<>:"|?* 与超长名字都能进 D1 ——
-  // 虽然后续渲染都有转义，但「入库前就该干净」是更可靠的防线。
-  const safeName =
-    sanitiseLeafName((filename || key.split('/').pop() || 'book').replace(/[\/\\]/g, '_')) ??
-    `book-${shortId(6)}`;
-
-  // ── 同名书检测 ──
-  // ⚠️ 之前完全没有这一步，于是网页上传同名文件会**静默覆盖**已有那本。
-  //   对 WebDAV 通道来说这是有意的（带口令才能覆盖），但网页上传是
-  //   匿名的 —— 也就是说只要猜到文件名，谁都能把别人的书顶掉。
-  //
-  //   （WebDAV PUT 那条路径我这次也加了明确提示；这里是同一类问题的
-  //   另一半：不是「提示不清」，而是「根本没检测」。）
-  //
-  //   策略：**默认拒绝并说清**，给出改名建议。
-  //   想要覆盖的用户可以走 WebDAV（带口令），或换个文件名。
-  const clash = await findBookByLeaf(env.DB, safeName);
-  if (clash) {
-    // 把刚传上来的临时文件清掉，别让 R2 里堆垃圾
-    await env.BUCKET.delete(key);
-    return jsonResponse(
-      {
-        error: 'already-exists',
-        message:
-          `《${clash.title || safeName}》已经在书库里了`
-          + `${clash.author ? `（作者：${clash.author}）` : ''}。`
-          + `如果要收录另一本同名书，请改个文件名（加版本号、译者或副标题）。`,
-        existing: {
-          title: clash.title,
-          author: clash.author,
-          size: clash.size,
-          publishedAt: clash.published_at,
-        },
-      },
-      409,
-    );
-  }
-
-  // ── 白名单校验（此前 complete 完全没做，只有 init 有）────────────
-  // 漏洞路径：init 时传 `a.epub`（过白名单、签 application/epub+zip），
-  // complete 时传 `filename: "a.exe"` —— 白名单被完全绕过。
-  //
-  // 危害有界但真实：R2 的 Content-Type 由 safeContentTypeFor 推导，
-  // 所以**存不出 text/html**（这点是安全的）；但 D1 的 leaf_name / format /
-  // title 可以被写成任意值，format 还会进 format_bucket 影响分桶展示，
-  // 留下一批「按格式/other」里的幽灵条目。
-  const completeExt = safeName.split('.').pop()?.toLowerCase() ?? '';
-  if (!isAllowedUploadExt(completeExt)) {
-    // 把暂存对象删掉：不能让它一直躺在 uploads/ 里
-    await env.BUCKET.delete(key);
-    return jsonResponse(
-      { error: 'unsupported-format', ext: completeExt, allowed: [...ALLOWED_EXT] },
-      415,
-    );
-  }
-
-  const meta = deriveMetadata(safeName);
-  const format = normaliseFormat(safeName.split('.').pop());
-  // 安全关键：落 R2 的 Content-Type 只按扩展名推导，绝不用 uploads/ 里的元数据
-  // 或客户端声明的值 —— R2 对外提供的就是它，信任它等于允许 text/html 托管。
-  // Content-Disposition 一并由 r2HttpMetadata 生成：网页上传走预签名直传，
-  // 是这条路径上唯一能写下载名的时机，漏掉就只能下载成随机 id。
-  const httpMetadata = r2HttpMetadata(safeName);
-  const contentType = httpMetadata.contentType ?? safeContentTypeFor(safeName);
-
-  // 从 uploads/ 搬到 books/ 并登记元数据（自动上架）。
-  // 先确认源对象可读（R2 的 get 可能返回 null），再流式搬到目标键。
-  const source = await env.BUCKET.get(key);
-  if (!source) {
-    return jsonResponse({ error: 'object-unreadable' }, 404);
-  }
-  // 书籍对象键现在带可读文件名（`books/<id>/<书名>`），见 lib/r2.ts 的
-  // `bookObjectKey` 注释 —— 原因是走 S3 协议的客户端只看键、不看
-  // Content-Disposition，旧键 `books/<id>` 会让它们拿到一堆无法识别的 id。
-  //
-  // ⚠️ id 必须**单独**算出来，不能再用 `bookKey.slice('books/'.length)` 反推：
-  //    新键是两段（`books/<id>/<书名>`），slice 会把 id + 文件名一起切出来，
-  //    于是 id 变成 `xxx/三体.epub`，接着被写进 D1、拼成封面键 `covers/xxx/三体.epub.jpg`
-  //    —— 一切都还「能跑」，但每一行数据都是错的。这是本次改动里最隐蔽的一处。
-  const bookId = shortId(8);
-  const bookKey = bookObjectKey(bookId, safeName);
-  const copied = await env.BUCKET.put(bookKey, source.body, {
-    httpMetadata,
+  // 从这里往下**不区分来源**：入库管道只有一条（见 lib/ingest.ts）。
+  // 本处理器只负责「上传通道特有」的三件事：POST 校验、节流、uploads/ 前缀校验。
+  const result = await ingestBook(env, {
+    stagingKey: key,
+    filename,
+    declaredSize: size,
+    credit: sanitiseCredit(body.credit),
+    sourceKind: 'upload',
+    // 匿名上传只能声明「我有权上传」—— 这是最弱的依据，是**声明**不是授权。
+    // 也因此 complete 不该被当成「已审核」的来源（隔离区见设计稿 §3）。
+    licenseBasis: 'user-declared',
   });
-  await env.BUCKET.delete(key);
 
-  // ── EPUB 解析：用文件内部的权威元数据 + 封面图，取代文件名的猜测 ──
-  let title = meta.title;
-  let author = meta.author;
-  let language: string | null = null;
-  let coverKey: string | null = null;
-  /** 内容嗅探出的形态（漫画/电子书）；null = 判不出，按扩展名分类 */
-  let sniffedKind: 'ebook' | 'comic' | 'audio' | null = null;
+  if (!result.ok) return ingestFailureResponse(result);
 
-  if (format === 'epub') {
-    try {
-      const fetched = await env.BUCKET.get(bookKey);
-      const epubBuf = await fetched?.arrayBuffer();
-      if (epubBuf && epubBuf.byteLength <= PARSE_SIZE_CAP) {
-        const parsed = await parseEpub(epubBuf);
-        if (parsed) {
-          if (parsed.title) title = parsed.title;
-          if (parsed.author) author = parsed.author;
-          language = parsed.language;
-          // EPUB 的固定版式判断来自 OPF（已解析出来，不额外读盘）
-          if (parsed.layout === 'comic') sniffedKind = 'comic';
-          else if (parsed.layout === 'text') sniffedKind = 'ebook';
-          if (parsed.cover) {
-            const coverType = parsed.cover.contentType;
-            // 扩展名由白名单推导（封面类型只可能来自字节嗅探，见 epub.ts）
-            const ext = coverExtFor(coverType);
-            if (ext) {
-              coverKey = `covers/${bookId}.${ext}`;
-              await env.BUCKET.put(coverKey, new Uint8Array(parsed.cover.bytes), {
-                httpMetadata: { contentType: coverType },
-              });
-            }
-          }
-        }
-      }
-    } catch {
-      // 解析失败不影响上架：退回文件名推导，封面留空
-    }
-  }
-
-  // ── 没有作者就再尽力找一次 ──
-  // TXT 这类格式没有元数据，但很多中文小说会在开头几行写「作者：XXX」。
-  // 只读一个小片段，读不到就算了。
-  if (!author && format === 'txt') {
-    try {
-      const obj = await env.BUCKET.get(bookKey, { range: { offset: 0, length: 16 * 1024 } });
-      if (obj) {
-        const sample = new TextDecoder('utf-8').decode(await obj.arrayBuffer());
-        const found = guessAuthorFromText(sample);
-        if (found) author = found;
-      }
-    } catch {
-      // 读不到就算了，不影响上架
-    }
-  }
-
-  // ── PDF 内容嗅探：区分「文字书 PDF」与「扫描漫画 PDF」──
-  if (format === 'pdf') {
-    try {
-      sniffedKind = await sniffKindFromBucket(env.BUCKET, bookKey, format);
-    } catch {
-      sniffedKind = null;
-    }
-  }
-
-  await upsertBook(env.DB, {
-    id: bookId,
-    leafName: safeName,
-    title,
-    author,
-    language,
-    format,
-    contentType,
-    size: actualSize,
-    sha256: null,
-    r2Key: bookKey,
-    etag: head.etag,
-    titleLetter: letterBucket(title),
-    authorLetter: authorBucket(author),
-    formatBucket: format,
-    // 内容嗅探优先于扩展名；判不出才交给 upsertBookStatement 按扩展名派生
-    // 来源标记为 'sniffed'：内容嗅探得出来的值，比「按扩展名猜」更权威，
-    // 但仍可被重新嗅探覆盖（只有管理员手工改的才是 'manual'，见迁移 0006）。
-    ...(sniffedKind ? { kindBucket: sniffedKind, kindSource: 'sniffed' as const } : {}),
-    publishedAt: new Date().toISOString(),
-    coverKey,
-    credit,
-  });
-  // 增量更新分桶计数（不是全量重算）—— 理由见 lib/db.ts 的 adjustBuckets 注释。
-  // 网页上传同样是匿名入口（一次 Turnstile 换 10 分钟通行证），
-  // 批量导入时写操作很密集，全表聚合会迅速吃掉 D1 的行读额度。
-  // 上传的一定是**新书**（complete 走的是 books/<新id>），所以 before = null。
-  await adjustBuckets(
-    env.DB,
-    bucketDeltas(
-      null,
-      bucketIdentityOf({
-        titleLetter: letterBucket(title),
-        authorLetter: authorBucket(author),
-        formatBucket: format,
-      }),
-    ),
-  );
-
-  // 榜单缓存失效（首页 /api/credits 缓存 1 小时，不打的话新书不进榜）。
-  // 单独一次 cache.delete，不与条目缓存的失效混在一起 —— Cache API
-  // 在 Free 层有 50 次/请求的上限。
-  await purgeCreditCache();
-
-  // 条目缓存（PROPFIND/目录页，TTL 默认 300s）也一并失效。
-  //
-  // ⚠️ 这是联调抓出来的真实错配：上传页承诺「传完立刻能在 WebDAV
-  //    客户端与浏览器书架里看到」，但 complete 原来只打了榜单缓存 ——
-  //    预热过的 PROPFIND 缓存里 5 分钟都看不到新书。真浏览器联调
-  //    （scripts/joint-debug.mjs）复现：complete 后立刻 PROPFIND
-  //    「最近收录」返回旧列表，新书缺席。
-  //
-  // bookCacheTargets() 返回这本书出现的全部路径（5 条叶子 + 5 个列表，
-  // 与 migrate-keys / 删除路径用的是同一套），漏一条就有一个入口
-  // 继续指旧列表。上传一次多花 ≤20 次 cache.delete，完全在 50 上限内
-  //（上传是低频操作，这笔开销可以接受 —— 榜单缓存同理）。
-  await purgeEntries(bookCacheTargets({
-    leafName: safeName,
-    titleLetter: letterBucket(title),
-    authorLetter: authorBucket(author),
-    formatBucket: format,
-  }));
-
-
-
+  const book = result.book;
   return jsonResponse({
     ok: true,
-    title,
-    author,
-    language,
-    format,
-    size: actualSize,
-    leafName: safeName,
-    credit,
+    title: book.title,
+    author: book.author,
+    language: book.language,
+    format: book.format,
+    size: book.size,
+    leafName: book.leafName,
+    credit: book.credit,
     // 封面绝对 URL：上传页立刻可预览
-    coverUrl: coverKey ? `${env.R2_PUBLIC_BASE}/${coverKey}` : null,
-    parsed: format === 'epub' && actualSize <= PARSE_SIZE_CAP,
+    coverUrl: book.coverKey ? `${env.R2_PUBLIC_BASE}/${book.coverKey}` : null,
+    parsed: book.format === 'epub' && book.size <= PARSE_SIZE_CAP,
   });
 }

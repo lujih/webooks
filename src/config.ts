@@ -41,6 +41,18 @@ export interface Env {
   R2_BUCKET_NAME?: string;
   /** 单文件大小上限（字节），默认 200 MiB */
   UPLOAD_MAX_BYTES?: string;
+  /**
+   * URL 导入的**域名白名单**（逗号分隔）。留空＝不启用白名单。
+   *
+   * 为什么需要它：Workers 运行时**没有 DNS 解析 API**，无法在 fetch 之前把
+   * 域名解析成 IP 再判断是否内网，所以 SSRF 防护只能做到「拒绝 IP 字面量 +
+   * 拒绝内网后缀 + 每跳重定向复查」。挡不住「公网域名解析到内网地址」的
+   * DNS rebinding。配上白名单（如 `www.gutenberg.org,zh.wikisource.org`）
+   * 才是真正可靠的形态；管理员手动导入时依赖人工看 URL。
+   *
+   * 详见 docs/source-ingest-design.md §5.2 —— 那里明写了这条防护不完整。
+   */
+  IMPORT_URL_ALLOWLIST?: string;
   /** 单文件大小上限（字节），WebDAV 与上传 API 共用；0 表示不限制 */
   MAX_UPLOAD_BYTES?: string;
   /** 每 IP 每日写操作上限；0 表示不限制 */

@@ -265,8 +265,10 @@ describe('源码守卫：R2 写入只允许有一份元数据实现', () => {
       // COPY/MOVE 一处 + WebDAV PUT 一处（PUT 的「可解析」与「流式」两个分支
       // 共用同一个 httpMetadata 常量，所以这里是 2 而不是 3）
       '../src/webdav/index.ts': 2,
-      // 网页上传 complete 的搬运
-      '../src/api/upload.ts': 1,
+      // 入库管道的搬运（2026-10-23 起从 api/upload.ts 抽到 lib/ingest.ts：
+      // 网页上传 / URL 导入 / OPDS 同步 / 公版种子库共用这一份，
+      // 见 docs/source-ingest-design.md）
+      '../src/lib/ingest.ts': 1,
       // 已存在对象的回填
       //（+2026-10-21 的 migrate-keys：把存量对象搬到可读键，
       // 搬的过程中 put 必须带完整 httpMetadata，否则文件变 octet-stream）
@@ -281,7 +283,8 @@ describe('源码守卫：R2 写入只允许有一份元数据实现', () => {
       .sort((a, b) => a[0].localeCompare(b[0]));
 
     expect(sites).toEqual([
-      ['../src/api/upload.ts', 1],
+      // 入库管道（原 api/upload.ts；2026-10-23 抽出，四条入库路线共用）
+      ['../src/lib/ingest.ts', 1],
       ['../src/webdav/index.ts', 1],
     ]);
   });
