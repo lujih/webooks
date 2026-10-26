@@ -336,6 +336,29 @@ export function isPageSegment(seg: string): boolean {
   return /^[1-9][0-9]{0,4}$/.test(seg);
 }
 
+/**
+ * 这个路径段是不是该集合的**合法桶段**（`A`、`0-9`、`其他`、`epub`…）。
+ *
+ * 用途：在没有尾斜杠时判断「末段可能是目录」还是「末段是叶子」。
+ * 见 resolveNode 里那段客户端事故注释。
+ */
+export function isBucketSegmentOf(collection: CollectionId, segment: string): boolean {
+  const bucket = bucketFromSegment(segment);
+  switch (collection) {
+    case 'title':
+      return LETTER_BUCKETS.includes(bucket);
+    case 'author':
+      return LETTER_BUCKETS.includes(bucket) || bucket === UNKNOWN_AUTHOR_BUCKET;
+    case 'type':
+      return KIND_BUCKETS.includes(bucket);
+    case 'format':
+      return FORMAT_BUCKETS.includes(bucket);
+    case 'recent':
+      // 扁平集合没有桶层
+      return false;
+  }
+}
+
 export function splitPath(pathname: string): { segments: string[]; trailingSlash: boolean } {
   const trailingSlash = pathname.length > 1 && pathname.endsWith('/');
   const segments = pathname
@@ -374,7 +397,27 @@ export function resolveNode(pathname: string): DavNode {
   if (segments.length === 2) {
     if (def.bucketed) {
       // 有分桶的集合这一层只能是桶（目录）；没有尾斜杠则当叶子处理。
+      //
+      // ⚠️ 例外：**合法桶段即使没有尾斜杠也按目录解析**（2026-10-26 真实事故）。
+      //
+      //   现象：用户把站点挂成 WebDAV 盘后，第一层（`/dav/最近收录/`、
+      //   `/dav/按书名/`）能正常列出；第二层全部报「没有加载到数据，请检查
+      //   配置信息是否正确」—— `/dav/最近收录/2`、`/dav/按书名/A` 全挂。
+      //
+      //   原因：这类客户端**不按 PROPFIND 返回的 href 拼路径**，而是自己拼
+      //   「父路径 + 名字」，拼出来的二级路径**没有尾斜杠**。而这里原来
+      //   一律把「无尾斜杠」当叶子 → 去 D1 找一本名叫 `A` 的书 → 404。
+      //   第一层之所以没事，是因为单段路径（`/最近收录`）无论有无尾斜杠
+      //   都解析成集合，绕过了这条分支。
+      //
+      //   为什么用「合法桶段」当判据不会误伤叶子：本站所有叶子都必须带
+      //   允许的扩展名（`isAllowedUploadExt` 在 WebDAV PUT、网页上传、
+      //   reindex 三处都拦），所以 `A`、`2`、`其他` 这种**无点号的末段
+      //   根本不可能**是书名。真书名一定带 `.epub` 之类，走下面的 leaf 分支。
       if (trailingSlash) return { kind: 'list', collection, bucket: seg1, page: 1 };
+      if (isBucketSegmentOf(collection, segments[1] as string)) {
+        return { kind: 'list', collection, bucket: seg1, page: 1 };
+      }
       return { kind: 'leaf', collection, bucket: seg1, leafName: segments[1] as string };
     }
     // recent：seg 只能是页码（目录）或叶子（文件）
@@ -382,6 +425,8 @@ export function resolveNode(pathname: string): DavNode {
       if (isPageSegment(seg1)) return { kind: 'list', collection, bucket: 'all', page: Number(seg1) };
       return { kind: 'unknown' };
     }
+    // 同上：页码是无点号的纯数字，不可能是书名 —— 无尾斜杠也按目录解析。
+    if (isPageSegment(seg1)) return { kind: 'list', collection, bucket: 'all', page: Number(seg1) };
     return { kind: 'leaf', collection, bucket: 'all', leafName: segments[1] as string };
   }
 
@@ -393,6 +438,8 @@ export function resolveNode(pathname: string): DavNode {
       if (isPageSegment(rawSeg2)) return { kind: 'list', collection, bucket: seg1, page: Number(rawSeg2) };
       return { kind: 'unknown' };
     }
+    // 页码段无尾斜杠同样按目录解析（同上面二级路径的客户端事故）
+    if (isPageSegment(rawSeg2)) return { kind: 'list', collection, bucket: seg1, page: Number(rawSeg2) };
     return { kind: 'leaf', collection, bucket: seg1, leafName: rawSeg2 };
   }
 

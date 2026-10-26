@@ -550,6 +550,68 @@ describe('浏览器目录页', () => {
   });
 });
 
+// ── 客户端兼容：集合路径没有尾斜杠 ──────────────────────────────────────
+//
+// 2026-10-26 真实事故：用户把站点挂成 WebDAV 盘，第一层正常，第二层全部
+// 报「没有加载到数据」—— 客户端自己拼路径，二级目录的请求不带尾斜杠。
+// 以前一律当叶子 → 404。这一组把修复钉死（解析层 + 分发层归一 + 缓存共用）。
+
+describe('客户端兼容：二级目录没有尾斜杠', () => {
+  it('PROPFIND /title/A（无尾斜杠）返回 207 并列出叶子', async () => {
+    await seed(['Alice.epub']);
+    await clearDavCache(ALL_PATHS);
+    const res = await propfind('/title/A', '1');
+    expect(res.status, '无尾斜杠的桶目录必须可列').toBe(207);
+    const xml = await res.text();
+    expect(xml).toContain('Alice.epub');
+  });
+
+  it('PROPFIND /recent/2（无尾斜杠）返回 207 而不是 404', async () => {
+    // 页码越界本来就该 404（既有测试钉着这个语义），所以要造出真第 2 页：
+    // 默认 MAX_ENTRIES=200，250 本足够。
+    await seed(Array.from({ length: 250 }, (_, i) => `R${String(i).padStart(3, '0')}.epub`));
+    await clearDavCache(ALL_PATHS);
+    const res = await propfind('/recent/2', '1');
+    expect(res.status).toBe(207);
+    // 无尾斜杠也必须被认成「第 2 页目录」，而不是一本叫 2 的书
+    expect(Number(res.headers.get('x-dav-entries'))).toBeGreaterThan(1);
+  });
+
+  it('GET 目录页（无尾斜杠）返回 HTML 而不是 404', async () => {
+    await seed(['Alice.epub']);
+    await clearDavCache(ALL_PATHS);
+    const res = await dav('/title/A');
+    expect(res.status).toBe(200);
+    expect(res.headers.get('content-type')).toContain('text/html');
+  });
+
+  it('两种写法共用同一条缓存（否则写入失效永远打不中）', async () => {
+    await seed(['Alice.epub']);
+    await clearDavCache(ALL_PATHS);
+
+    const noSlash = await propfind('/title/A', '1');
+    expect(noSlash.headers.get('x-dav-cache')).toBe('MISS');
+    await noSlash.text();
+
+    // 带尾斜杠的写法必须命中**刚才那条**缓存 —— 分发层把路径归一成
+    // `/title/A/`，所以缓存键一致；写入路径（PUT/DELETE/complete）失效时
+    // 用的也是带尾斜杠的键，两边才对得上。
+    const withSlash = await propfind('/title/A/', '1');
+    expect(withSlash.headers.get('x-dav-cache')).toBe('HIT');
+    expect(await withSlash.text()).toContain('Alice.epub');
+  });
+
+  it('回归：带扩展名的叶子仍然当叶子（无尾斜杠照旧 302）', async () => {
+    await seed(['Alice.epub']);
+    // ⚠️ redirect: 'manual' —— 否则 SELF.fetch 会跟随 302 去
+    // https://books.test/…（测试环境里不存在），拿到的是跟随后的失败，
+    // 而不是我们要断言的 302 本身。
+    const res = await dav('/title/A/Alice.epub', { redirect: 'manual' });
+    expect(res.status).toBe(302);
+    expect(res.headers.get('location')).toContain('/books/');
+  });
+});
+
 // ── 管理接口鉴权 ────────────────────────────────────────────────────────
 
 describe('admin 鉴权', () => {

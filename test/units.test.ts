@@ -116,6 +116,55 @@ describe('resolveNode', () => {
     });
   });
 
+  /**
+   * 2026-10-26 真实事故：很多 WebDAV 客户端自己拼路径，二级目录的请求
+   * **不带尾斜杠**（`/dav/按书名/A`、`/dav/最近收录/2`）。以前一律当叶子
+   * → 404，表现为「第一层能进、第二层全打不开」。判据是「合法桶段/页码
+   * 一定不带扩展名，而本站叶子一定带扩展名」。
+   */
+  it('无尾斜杠的合法桶段仍解析成目录（客户端兼容）', () => {
+    expect(resolveNode('/title/A')).toEqual({
+      kind: 'list', collection: 'title', bucket: 'A', page: 1,
+    });
+    // 中文桶段（「其他」）同样成立
+    expect(resolveNode('/title/其他')).toEqual({
+      kind: 'list', collection: 'title', bucket: 'other', page: 1,
+    });
+    expect(resolveNode('/按书名/A')).toEqual({
+      kind: 'list', collection: 'title', bucket: 'A', page: 1,
+    });
+    // 有分桶集合下的分页目录
+    expect(resolveNode('/title/A/2')).toEqual({
+      kind: 'list', collection: 'title', bucket: 'A', page: 2,
+    });
+  });
+
+  it('无尾斜杠的 recent 页码解析成目录', () => {
+    expect(resolveNode('/recent/2')).toEqual({
+      kind: 'list', collection: 'recent', bucket: 'all', page: 2,
+    });
+    expect(resolveNode('/最近收录/3')).toEqual({
+      kind: 'list', collection: 'recent', bucket: 'all', page: 3,
+    });
+  });
+
+  it('叶子判定不受影响：带扩展名的末段永远是叶子', () => {
+    // 哪怕首字母恰好是桶名
+    expect(resolveNode('/title/A/Dune.epub')).toEqual({
+      kind: 'leaf', collection: 'title', bucket: 'A', leafName: 'Dune.epub',
+    });
+    expect(resolveNode('/recent/Dune.epub')).toEqual({
+      kind: 'leaf', collection: 'recent', bucket: 'all', leafName: 'Dune.epub',
+    });
+    // 无尾斜杠 + 不是合法桶段 + 不是页码 → 仍是叶子（后续查不到就 404）
+    expect(resolveNode('/title/不是桶')).toEqual({
+      kind: 'leaf', collection: 'title', bucket: '不是桶', leafName: '不是桶',
+    });
+    expect(resolveNode('/recent/not-a-page')).toEqual({
+      kind: 'leaf', collection: 'recent', bucket: 'all', leafName: 'not-a-page',
+    });
+  });
+
   it('nodePath 与 resolveNode 互相可逆（规范形式为中文段名）', () => {
     // nodePath 生成的是「规范形式」：集合与桶段都是中文
     const cases: Array<[string, string]> = [

@@ -109,35 +109,55 @@ export async function handleDav(
     });
   }
 
-  if (method === 'PROPFIND') return handlePropfind(request, env, cfg, davPath);
-
+  // ── 集合路径统一补尾斜杠（2026-10-26 真实事故）─────────────────────
+  // 现象：用户把站点挂成 WebDAV 盘，第一层（`/dav/最近收录/`）正常，
+  //   第二层全部报「没有加载到数据」——`/dav/最近收录/2`、`/dav/按书名/A`
+  //   全挂。原因是这类客户端**不按 PROPFIND 返回的 href 拼路径**，而是自己
+  //   拼「父路径 + 名字」，拼出来的二级路径没有尾斜杠；解析层把无尾斜杠当
+  //   叶子 → 404。resolveNode 现在能把「合法桶段/页码 + 无尾斜杠」认成目录，
+  //   这里再把路径**规范化成带尾斜杠的形态**，让下游只见到一种写法：
+  //     · PROPFIND 条目缓存键（entriesCacheKey 保留尾斜杠）—— 两种写法共用
+  //       同一条缓存。否则「写入时按 /A/ 失效、读取时按 /A 命中」永远打不
+  //       中，用户会看到删掉的书还在（缓存失效等于白做）；
+  //     · 锁资源键（LOCK /A 与 /A/ 必须指向同一个资源）；
+  //     · 面包屑与 href 生成。
+  //   叶子（真书名，必带扩展名）与未知节点原样透传，不补。
   const node = resolveNode(davPath);
+  const canonicalPath =
+    node.kind === 'leaf' || node.kind === 'unknown'
+      ? davPath
+      : davPath.endsWith('/')
+        ? davPath
+        : `${davPath}/`;
+
+  if (method === 'PROPFIND') return handlePropfind(request, env, cfg, canonicalPath);
+
   // 锁资源键必须用规范路径：客户端可能用 /recent/（旧英文），也可能用 /最近收录/（中文），
   // 两种写法指向同一本书，不归一的话「加锁」和「写入」会落在不同键上，锁就形同虚设。
-  const lockKey = canonicalDavPath(davPath);
+  const lockKey = canonicalDavPath(canonicalPath);
 
   switch (method) {
     case 'GET':
     case 'HEAD':
-      return handleGet(request, env, cfg, node, davPath, method === 'HEAD');
+      return handleGet(request, env, cfg, node, canonicalPath, method === 'HEAD');
     case 'PUT':
-      return handleLockedWrite(request, () => handlePut(request, env, node, davPath, cfg), env, lockKey);
+      return handleLockedWrite(request, () => handlePut(request, env, node, canonicalPath, cfg), env, lockKey);
     case 'DELETE':
       // 删除是破坏性操作：需要共享口令。读与新增保持匿名。
       if (!hasWriteToken(request, cfg.writeToken)) return unauthorizedResponse();
-      return handleLockedWrite(request, () => handleDelete(request, env, node, davPath), env, lockKey);
+      return handleLockedWrite(request, () => handleDelete(request, env, node, canonicalPath), env, lockKey);
     case 'MKCOL':
-      return handleMkcol(request, env, node, davPath);
+      return handleMkcol(request, env, node, canonicalPath);
     case 'MOVE':
       // MOVE 会删除源，属于破坏性操作：需要口令。
       if (!hasWriteToken(request, cfg.writeToken)) return unauthorizedResponse();
-      return handleMoveCopy(request, env, cfg, node, davPath, true);
+      return handleMoveCopy(request, env, cfg, node, canonicalPath, true);
     case 'COPY':
       // COPY 不删源，但**覆盖已有目标时等于破坏别人的书** —— 所以
       // 「目标是否已存在」这个判断在 handleMoveCopy 内部做，且与 PUT
       // 用同一套判据（口令 + 白名单 + 节流 + Overwrite）。
       // 这里**不**无条件要口令：往新路径复制一本该操作是合理的匿名行为。
-      return handleMoveCopy(request, env, cfg, node, davPath, false);
+      return handleMoveCopy(request, env, cfg, node, canonicalPath, false);
     case 'LOCK':
       // LOCK 是「承载写入权威」的操作：§14.15 规定 locktype 只有 write 一种，
       // 拿下一把锁就等于拿下该资源的写权限裁决权。它的影响面比 DELETE 更大 ——
@@ -161,7 +181,7 @@ export async function handleDav(
     case 'UNLOCK':
       return handleUnlock(request, env, lockKey);
     case 'PROPPATCH':
-      return handleProppatch(request, env, node, davPath);
+      return handleProppatch(request, env, node, canonicalPath);
     default:
       return methodNotAllowed(ALLOW);
   }
