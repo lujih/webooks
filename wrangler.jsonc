@@ -31,10 +31,7 @@
     // ⚠️ 不要用 r2.dev —— Cloudflare 官方明示它不适用于生产。
     //   症状：目录能列、一点下载就 530。
     // ⚠️ 必须是 https，且不带尾部斜杠。
-    "R2_PUBLIC_BASE": "https://books.cszxorx.dpdns.org",
-    // ⚠️ 临时：公版种库一次性导入（800 本 = 1600 次写，默认 300/日打不满）。
-    //    种完立刻改回默认（删掉这一行）。见 scripts/seed/upload-via-api.mjs。
-    "DAILY_WRITE_QUOTA": "4000"
+    "R2_PUBLIC_BASE": "https://books.cszxorx.dpdns.org"
   },
 
   // ── 资源绑定 ────────────────────────────────────────────────────────
