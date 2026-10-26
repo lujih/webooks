@@ -114,7 +114,18 @@ export function canonicalDavPath(pathname: string): string {
     out.push(bucketSegment(bucketFromSegment(segs[1]!)));
     for (let i = 2; i < segs.length; i++) out.push(segs[i]!);
   }
-  const joined = `/${out.join('/')}`;
+
+  // 分页目录段（/最近收录/2/书名、/按格式/epub/2/书名）是**虚拟**的一层：
+  // 成员的真实路径在它的上一层。缓存键与锁键必须把这一层归一掉 ——
+  // 否则「按分页路径读」和「按真实路径失效」落在两个键上，删除后仍命中
+  // 旧缓存（同一本书出现两份缓存，其中一份永不失效）。
+  // 判据：页码段**后面还有段**才算分页前缀；居末位的页码是真正的目录。
+  const lastIdx = out.length - 1;
+  const normalised = out.filter(
+    (seg, i) => !(i > 0 && i < lastIdx && isPageSegment(seg)),
+  );
+
+  const joined = `/${normalised.join('/')}`;
   return trailing ? `${joined}/` : joined;
 }
 
@@ -329,7 +340,14 @@ export type DavNode =
   | { kind: 'root' }
   | { kind: 'nav'; collection: CollectionId }
   | { kind: 'list'; collection: CollectionId; bucket: string; page: number }
-  | { kind: 'leaf'; collection: CollectionId; bucket: string; leafName: string }
+  /**
+   * `page` 只在**经分页目录访问**时出现（`/最近收录/2/书名.epub`）。
+   * 为什么需要：分页目录返回的成员 href 必须落在分页路径之下，否则严格的
+   * WebDAV 客户端会认为「这些条目不属于被请求的集合」而当成空目录
+   * （2026-10-26 真实事故：分页路径报「没有加载到数据」）。见 propfind.ts
+   * 的 bookEntry 注释。
+   */
+  | { kind: 'leaf'; collection: CollectionId; bucket: string; leafName: string; page?: number }
   | { kind: 'unknown' };
 
 export function isPageSegment(seg: string): boolean {
@@ -432,8 +450,19 @@ export function resolveNode(pathname: string): DavNode {
 
   // /<集合>/<bucket>/<seg>/
   if (segments.length === 3) {
-    if (!def.bucketed) return { kind: 'unknown' };
     const rawSeg2 = segments[2] as string;
+    if (!def.bucketed) {
+      // 扁平集合（最近收录）的这一层是**分页目录下的成员**：
+      // /最近收录/2/书名.epub —— 分页列表把成员 href 放在分页路径下
+      // （严格客户端的硬要求），所以这里必须能解析回来。
+      if (isPageSegment(segments[1] as string)) {
+        return {
+          kind: 'leaf', collection, bucket: 'all',
+          leafName: rawSeg2, page: Number(segments[1]),
+        };
+      }
+      return { kind: 'unknown' };
+    }
     if (trailingSlash) {
       if (isPageSegment(rawSeg2)) return { kind: 'list', collection, bucket: seg1, page: Number(rawSeg2) };
       return { kind: 'unknown' };
@@ -441,6 +470,16 @@ export function resolveNode(pathname: string): DavNode {
     // 页码段无尾斜杠同样按目录解析（同上面二级路径的客户端事故）
     if (isPageSegment(rawSeg2)) return { kind: 'list', collection, bucket: seg1, page: Number(rawSeg2) };
     return { kind: 'leaf', collection, bucket: seg1, leafName: rawSeg2 };
+  }
+
+  // /<集合>/<bucket>/<页码>/<叶子> —— 分页目录下的成员（有分桶集合）
+  if (segments.length === 4) {
+    if (!def.bucketed) return { kind: 'unknown' };
+    if (!isPageSegment(segments[2] as string)) return { kind: 'unknown' };
+    return {
+      kind: 'leaf', collection, bucket: seg1,
+      leafName: segments[3] as string, page: Number(segments[2]),
+    };
   }
 
   return { kind: 'unknown' };
@@ -463,9 +502,12 @@ export function nodePath(node: DavNode): string {
     case 'leaf': {
       const def = COLLECTIONS[node.collection];
       const col = collectionSegment(node.collection);
+      // 经分页目录访问时，自身 href 也要带分页段（与请求路径一致，
+      // 否则严格的客户端会认为「返回的不是我要的那个资源」）
+      const pageSeg = node.page && node.page > 1 ? `/${node.page}` : '';
       return def.bucketed
-        ? `/${col}/${bucketSegment(node.bucket)}/${node.leafName}`
-        : `/${col}/${node.leafName}`;
+        ? `/${col}/${bucketSegment(node.bucket)}${pageSeg}/${node.leafName}`
+        : `/${col}${pageSeg}/${node.leafName}`;
     }
     default:
       return '/';

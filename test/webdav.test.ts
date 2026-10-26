@@ -601,6 +601,46 @@ describe('客户端兼容：二级目录没有尾斜杠', () => {
     expect(await withSlash.text()).toContain('Alice.epub');
   });
 
+  it('分页目录的成员 href 必须落在分页路径之下（2026-10-26 事故）', async () => {
+    // 严格客户端会丢弃「不属于被请求集合」的成员：分页目录若把成员
+    // href 写成 /最近收录/书名，一个 201 条的响应会被当成**空目录**，
+    // 界面报「没有加载到数据，请检查配置信息是否正确」。
+    const many = Array.from({ length: 250 }, (_, i) => `R${String(i).padStart(3, '0')}.epub`);
+    await seed(many);
+    await clearDavCache(ALL_PATHS);
+
+    const res = await propfind('/recent/2/', '1');
+    expect(res.status).toBe(207);
+    const xml = await res.text();
+    const hrefs = [...xml.matchAll(/<D:href>([^<]*)<\/D:href>/g)]
+      .map((m) => decodeURIComponent(m[1] as string));
+
+    expect(hrefs[0]).toBe('/dav/最近收录/2/');
+    const members = hrefs.slice(1);
+    expect(members.length).toBeGreaterThan(0);
+    const outside = members.filter((h) => !h.startsWith('/dav/最近收录/2/'));
+    expect(outside, `这些成员不在分页路径下：${outside.slice(0, 3).join(' , ')}`).toHaveLength(0);
+
+    // 且点进去必须能拿到字节（成员路径能被解析回同一本书）
+    const leaf = await dav(members[0]!.replace('/dav', ''), { redirect: 'manual' });
+    expect(leaf.status).toBe(302);
+  });
+
+  it('分桶集合的分页目录同理（/按格式 或 /按书名 的第 2 页）', async () => {
+    const many = Array.from({ length: 250 }, (_, i) => `R${String(i).padStart(3, '0')}.epub`);
+    await seed(many);
+    await clearDavCache(ALL_PATHS);
+
+    const res = await propfind('/title/R/2/', '1');
+    expect(res.status).toBe(207);
+    const xml = await res.text();
+    const hrefs = [...xml.matchAll(/<D:href>([^<]*)<\/D:href>/g)]
+      .map((m) => decodeURIComponent(m[1] as string));
+    expect(hrefs[0]).toBe('/dav/按书名/R/2/');
+    const outside = hrefs.slice(1).filter((h) => !h.startsWith('/dav/按书名/R/2/'));
+    expect(outside).toHaveLength(0);
+  });
+
   it('回归：带扩展名的叶子仍然当叶子（无尾斜杠照旧 302）', async () => {
     await seed(['Alice.epub']);
     // ⚠️ redirect: 'manual' —— 否则 SELF.fetch 会跟随 302 去

@@ -356,14 +356,29 @@ export interface Entry {
   meta: ResourceMeta;
 }
 
-function bookEntry(collection: CollectionId, bucket: string, book: BookRow, r2PublicBase: string): Entry {
+function bookEntry(
+  collection: CollectionId,
+  bucket: string,
+  book: BookRow,
+  r2PublicBase: string,
+  page = 1,
+): Entry {
   const def = COLLECTIONS[collection];
   // 路径段用中文（客户端的文件夹名取自 href 末段）
   const col = collectionSegment(collection);
+  // 分页目录下的成员 href 必须落在**分页路径之下**（/最近收录/2/书名.epub）。
+  //
+  // ⚠️ 2026-10-26 真实事故：以前这里不管页码，总是给出 /最近收录/书名.epub。
+  //    严格的 WebDAV 客户端会校验「成员 href 是不是被请求集合的子项」——
+  //    一个 201 条的响应里 200 条都不在 /2/ 下，于是被当成**空目录**，
+  //    界面报「没有加载到数据，请检查配置信息是否正确」。
+  //    第一层目录没这个毛病，正因为它的成员 href 天然在请求路径之下。
+  //    对应的解析与缓存归一见 resolveNode / canonicalDavPath。
+  const pageSeg = page > 1 ? `/${page}` : '';
   return {
     path: def.bucketed
-      ? `/${col}/${bucketSegment(bucket)}/${book.leaf_name}`
-      : `/${col}/${book.leaf_name}`,
+      ? `/${col}/${bucketSegment(bucket)}${pageSeg}/${book.leaf_name}`
+      : `/${col}${pageSeg}/${book.leaf_name}`,
     isCollection: false,
     meta: {
       // 解析过 EPUB 时用真实书名/作者，否则退回文件名
@@ -462,7 +477,7 @@ export async function collectDavEntries(
       if (depth === 0) return entries;
 
       const books = await listBooks(env.DB, node.collection, node.bucket, offset, cfg.maxEntries);
-      for (const book of books) entries.push(bookEntry(node.collection, node.bucket, book, cfg.r2PublicBase));
+      for (const book of books) entries.push(bookEntry(node.collection, node.bucket, book, cfg.r2PublicBase, node.page));
 
       // 分页子目录只在第 1 页列出：/title/A/2/ 是 /title/A/ 的子节点，
       // 它自己的子节点只有书 —— 否则第 2 页会列出一个指向自己的「第 2 页」。
@@ -492,7 +507,7 @@ export async function collectDavEntries(
       if (!book) return null;
       // 叶子按 leaf_name 全局唯一查找，因此对路径宽容：
       // 即使客户端 PUT 到的桶与书的实际分桶不一致，也能取到文件。
-      return [bookEntry(node.collection, node.bucket, book, cfg.r2PublicBase)];
+      return [bookEntry(node.collection, node.bucket, book, cfg.r2PublicBase, node.page)];
     }
 
     default:

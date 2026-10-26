@@ -148,8 +148,24 @@ describe('resolveNode', () => {
     });
   });
 
-  it('叶子判定不受影响：带扩展名的末段永远是叶子', () => {
-    // 哪怕首字母恰好是桶名
+  it('分页目录下的成员路径能解析回同一本书', () => {
+    // 分页列表把成员 href 放在分页路径下（严格客户端的硬要求），
+    // 所以解析层必须能把它认回来，否则点进去就是 404。
+    expect(resolveNode('/recent/2/Dune.epub')).toEqual({
+      kind: 'leaf', collection: 'recent', bucket: 'all', leafName: 'Dune.epub', page: 2,
+    });
+    expect(resolveNode('/title/A/2/Dune.epub')).toEqual({
+      kind: 'leaf', collection: 'title', bucket: 'A', leafName: 'Dune.epub', page: 2,
+    });
+    // 自身 href 带上分页段（与请求路径一致）
+    expect(nodePath(resolveNode('/recent/2/Dune.epub'))).toBe('/最近收录/2/Dune.epub');
+    expect(nodePath(resolveNode('/title/A/2/Dune.epub'))).toBe('/按书名/A/2/Dune.epub');
+    // 非页码段不能被当成页码吞掉
+    expect(resolveNode('/recent/abc/Dune.epub')).toEqual({ kind: 'unknown' });
+    expect(resolveNode('/title/A/abc/Dune.epub')).toEqual({ kind: 'unknown' });
+  });
+
+  it('叶子判定不受影响：带扩展名的末段永远是叶子', () => {    // 哪怕首字母恰好是桶名
     expect(resolveNode('/title/A/Dune.epub')).toEqual({
       kind: 'leaf', collection: 'title', bucket: 'A', leafName: 'Dune.epub',
     });
@@ -196,6 +212,18 @@ describe('resolveNode', () => {
     expect(canonicalDavPath('/')).toBe('/');
     // 未知集合原样返回，交给 resolveNode 判 unknown
     expect(canonicalDavPath('/nope/')).toBe('/nope/');
+  });
+
+  it('canonicalDavPath 归一掉虚拟的分页段（否则缓存会出现永不失效的第二份）', () => {
+    // 分页目录是虚拟层：成员真实路径在它上一层。
+    // 若分页路径与真实路径各占一个缓存键，「按分页路径读」的那份
+    // 永远等不到 bookCacheTargets 的失效 —— 删掉的书还会显示。
+    expect(canonicalDavPath('/recent/2/x.epub')).toBe('/最近收录/x.epub');
+    expect(canonicalDavPath('/最近收录/2/x.epub')).toBe('/最近收录/x.epub');
+    expect(canonicalDavPath('/title/A/2/x.epub')).toBe('/按书名/A/x.epub');
+    // 页码居末位时是**真目录**，必须保留（否则分页目录自己的缓存键会塌成桶）
+    expect(canonicalDavPath('/recent/2/')).toBe('/最近收录/2/');
+    expect(canonicalDavPath('/title/A/2/')).toBe('/按书名/A/2/');
   });
 
   it('「其他」桶：路径段中文、内部 id 仍是 other', () => {
