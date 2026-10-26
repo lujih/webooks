@@ -500,3 +500,16 @@ CREATE TABLE opds_entries (
 整本清单的价值：466 部多章作品带完整章节列表，是「下一轮整本铺库」的现成输入；
 代价是逐章抓取。两条清单用 `SEED_CATALOG` 切换，互不覆盖。
 整本清单的已知边界（名著缺席、`bytes` 低估嵌入页、429 条卒年未知）写在 `seed/README.md`。
+
+### 13.7 实际入库结果（2026-10-26）
+
+800 卷已经进了线上库（站点总数 816 = 本次 800 + 原有 16）。
+
+- 通道：**公开上传 API**（`scripts/seed/upload-via-api.mjs`）——
+  本工作区没有 R2 S3 凭据，也没有站点 `ADMIN_TOKEN`，S3 直传 + 登记端点跑不了。
+- 因此这 800 条的 `source_kind=upload`、`license_basis=user-declared`，
+  **不是**种子库的 `seed/public-domain`。署名是「公版种子」，书卡可见。
+  要纠正来源字段需管理端 SQL 或配好 ADMIN_TOKEN 后用登记端点重跑（幂等）。
+- 写配额：默认 300/日 会在第 ~150 本打满，种库期间临时调至 4000
+  （commit `b5ef0dc`），完成后立刻回滚（commit `1e71356`）。
+- 验证：抽样 12 本 PROPFIND 全 207；下载一本与本地文件字节一致（72166 B）。

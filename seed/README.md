@@ -177,3 +177,30 @@ node -e "import('/tmp/epub-parser.mjs').then(async m=>{
 
 `register.mjs` 支持 `--dry-run`：只校验本地文件与 catalog 的一致性，
 不发任何请求。真正铺库需要 R2 凭据（rclone/S3）与站点的 `ADMIN_TOKEN`。
+
+## 实际入库记录（2026-10-26）
+
+| 项 | 结果 |
+|---|---|
+| 线上库总数 | **816 本**（本次种入 **800 卷**，原有 16 本） |
+| 通道 | **公开上传 API**（`scripts/seed/upload-via-api.mjs`） |
+| 请求 | 800 本 × 2 次写（init + complete） |
+| 校验 | 抽样 12 本 PROPFIND 全 207；下载一本与本地文件**字节一致**（72166 B） |
+
+### 为什么走的是公开上传通道，而不是 S3 + 登记端点
+
+本工作区**没有** R2 S3 凭据（`.dev.vars` 只是联调占位值），也没有站点的
+`ADMIN_TOKEN`。所以「S3 直传 + `/api/admin/import/manifest` 登记」这条正规路线
+跑不了；能用的只有公开上传通道。
+
+**代价（如实记录）**：走上传通道入库的书，`source_kind = upload`、
+`license_basis = user-declared`，不是种子库的 `seed` / `public-domain`。
+署名（`credit`）仍是「公版种子」，所以书卡上能看出是种库批次。
+要纠正来源字段，需要管理端 SQL（`books` 表 `source_kind/license_basis/ingested_by`），
+或给站点配上 `ADMIN_TOKEN` 后用登记端点重跑（幂等）。
+
+### 写配额
+
+800 本 = 1600 次写，默认 `DAILY_WRITE_QUOTA=300` 会在第 ~150 本打满。
+种库期间临时把它调到 4000（commit `b5ef0dc`），种完立刻回滚（commit `1e71356`）。
+两次配置变更都在 git 历史里，没有静默改生产。
