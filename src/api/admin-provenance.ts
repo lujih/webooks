@@ -79,7 +79,11 @@ export async function handleProvenanceFix(
 
   // 范围锁死：只动「匿名上传者自称有权」且署名匹配的行。
   // 这条 WHERE 是本端点的安全边界 —— 少了它，一次调用就能改全库。
-  const scope = `WHERE credit = ? AND license_basis = 'user-declared'`;
+  //
+  // 为什么要把 NULL 也算上：迁移 0009 之前入库的行没有 license_basis，
+  // 种库那 800 本里就有 1 本是在新代码部署前传的（实测：dry-run 命中 799）。
+  // NULL 只可能是「来源字段上线前的存量」，credit 过滤仍然是第二道锁。
+  const scope = `WHERE credit = ? AND (license_basis = 'user-declared' OR license_basis IS NULL)`;
 
   const counted = await env.DB.prepare(`SELECT COUNT(*) AS n FROM books ${scope}`)
     .bind(credit)

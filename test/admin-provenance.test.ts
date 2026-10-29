@@ -99,6 +99,21 @@ describe('范围与幂等', () => {
     expect(already?.ingested_by).toBe('anonymous');
   });
 
+  it('license_basis 为 NULL 的存量行也会被命中（种库实测少 1 本的原因）', async () => {
+    await seedBook('a1', '公版一.epub', '公版种子', 'user-declared');
+    await testEnv.DB.prepare(`UPDATE books SET license_basis = NULL WHERE id = 'a1'`).run();
+
+    const res = await fix({});
+    const json = (await res.json()) as { matched: number; updated: number };
+    expect(json.matched).toBe(1);
+    expect(json.updated).toBe(1);
+
+    const row = await testEnv.DB.prepare(`SELECT license_basis FROM books WHERE id='a1'`).first<{
+      license_basis: string;
+    }>();
+    expect(row?.license_basis).toBe('public-domain');
+  });
+
   it('重复执行是幂等的：第二次 updated = 0', async () => {
     await seedBook('a1', '公版一.epub', '公版种子', 'user-declared');
     await fix({});
