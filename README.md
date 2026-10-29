@@ -585,6 +585,27 @@ curl -H "Authorization: Bearer $ADMIN_TOKEN" https://你的域名/api/admin/stat
 curl -X POST "https://你的域名/api/admin/purge?path=/title/A/" -H "Authorization: Bearer $ADMIN_TOKEN"
 ```
 
+### 修正来源字段（`provenance`）
+
+种子库如果有书是经**公开上传通道**入库的（那时没有 ADMIN_TOKEN / R2 凭据），
+来源会记成 `upload` / `user-declared`。这个端点按 `credit` 圈定批次、把来源改回
+`seed` / `public-domain`，**只动 `license_basis='user-declared'` 的行**：
+
+```bash
+# 先预演：只统计会命中多少条
+curl -X POST "https://你的域名/api/admin/provenance" \
+  -H "Authorization: Bearer $ADMIN_TOKEN" -H 'content-type: application/json' \
+  -d '{"credit":"公版种子","dryRun":true}'
+
+# 确认数字后真改（幂等：再跑一次 updated=0）
+curl -X POST "https://你的域名/api/admin/provenance" \
+  -H "Authorization: Bearer $ADMIN_TOKEN" -H 'content-type: application/json' \
+  -d '{"credit":"公版种子"}'
+```
+
+> 它不是"漂白工具"：范围锁死在 `credit` 匹配 + `user-declared`，改不了
+> 有版权的内容；`sourceKind` / `licenseBasis` 都是闭集，写错直接 400。
+
 `stats` 会返回 `directoryCount` —— 这个数字必须远低于 200，否则挂载一次的请求数会失控。
 
 ### 迁移存量对象键（`migrate-keys`）

@@ -44,6 +44,7 @@ import { bookCacheTargets, davCache, navCacheTargets, purgeEntries } from '../li
 import { purgeCreditCache } from './requests';
 import { handleImportUrl } from './import-url';
 import { handleImportManifest } from './import-manifest';
+import { handleProvenanceFix } from './admin-provenance';
 
 const BATCH_SIZE = 50;
 const MAX_LIST_LIMIT = 1000;
@@ -141,6 +142,10 @@ export async function handleAdmin(
       return handleCreditBoard(request, env, url);
     case 'credits/purge':
       return handleCreditPurge(request);
+    case 'provenance':
+      // 修正来源字段的**安全边界**：只改 license_basis='user-declared'
+      // 且 credit 匹配的行（见 src/api/admin-provenance.ts 的文件头）。
+      return handleProvenanceFix(request, env, url);
     case 'import/manifest':
       // 公版种子库的**登记**批：字节已经由 S3 直传到 books/<id>/<书名>，
       // 这里只补 D1 元数据（每批 ≤8 本）。见 src/api/import-manifest.ts。
