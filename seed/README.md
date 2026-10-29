@@ -204,3 +204,47 @@ node -e "import('/tmp/epub-parser.mjs').then(async m=>{
 800 本 = 1600 次写，默认 `DAILY_WRITE_QUOTA=300` 会在第 ~150 本打满。
 种库期间临时把它调到 4000（commit `b5ef0dc`），种完立刻回滚（commit `1e71356`）。
 两次配置变更都在 git 历史里，没有静默改生产。
+
+## 2026-10-29 补记：来源字段修正 + 三大名著
+
+### 1) 800 本的来源字段已修正
+
+拿到 `ADMIN_TOKEN` 后，用新加的 `POST /api/admin/provenance` 把种库批次改回正确语义：
+
+```
+dry-run  → matched 800
+apply    → updated 800
+再 dry-run → matched 0（幂等）
+```
+
+结果：800 本 `source_kind=seed`、`license_basis=public-domain`、`ingested_by=seed`、
+`source_id=zh.wikisource.org`。
+
+> 为什么最初是 799：第一本在包含迁移 0009 的代码部署**之前**上传，
+> 当时还没有 `license_basis` 列（值为 NULL）。端点的 WHERE 因此放宽为
+> `user-declared OR NULL`，credit 过滤仍是第二道锁。
+
+### 2) 三大名著补齐（逐章构建，340 章）
+
+| 书名 | 回数 | EPUB | 说明 |
+|---|---:|---:|---|
+| 紅樓夢 | 120 | 1.25 MB | 曹雪芹（卒 1763） |
+| 三國演義 | 120 | 0.93 MB | 羅貫中（約卒 1400） |
+| 水滸傳（100回本） | 100 | 1.18 MB | 施耐庵（約卒 1370） |
+
+构建命令（清单在临时目录，不进仓库）：
+
+```bash
+node scripts/seed/build-epub.mjs --all          # 340 章，约 30–40 分钟（受维基文库限速）
+node scripts/seed/upload-via-api.mjs --all --credit 公版种子
+node scripts/seed/... /api/admin/provenance      # 再把来源改回 seed/public-domain
+```
+
+三本都通过 PROPFIND 207 核对；下载核对见下方「已知问题」。
+
+### 3) 已知问题：大文件完整下载偶发卡住
+
+`紅樓夢.epub`（1.25 MB）的 R2 直链 **Range 请求正常**（`206`、1024 字节），
+但一次完整 `GET` 在 60 秒内没有返回（重试才完成）。同一对象 HEAD 也偶发无响应。
+不是入库问题（PROPFIND 207、字节已在 R2），更像公网域名到 R2 的偶发慢连接；
+线上书卡点下载如果遇到卡顿，重试即可。待观察是否与 Cloudflare 边缘缓存有关。

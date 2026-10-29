@@ -513,3 +513,14 @@ CREATE TABLE opds_entries (
 - 写配额：默认 300/日 会在第 ~150 本打满，种库期间临时调至 4000
   （commit `b5ef0dc`），完成后立刻回滚（commit `1e71356`）。
 - 验证：抽样 12 本 PROPFIND 全 207；下载一本与本地文件字节一致（72166 B）。
+
+### 13.8 2026-10-29：拿到 ADMIN_TOKEN 之后
+
+- **来源修正**：`POST /api/admin/provenance`（新端点）把 800 本从
+  `upload/user-declared` 改回 `seed/public-domain`；dry-run 800 → apply 800 →
+  再 dry-run 0。端点范围锁死在 `credit` + `user-declared OR NULL`，改不了全库。
+- **三大名著**：《紅樓夢》120 回、《三國演義》120 回、《水滸傳（100回本）》100 回
+  逐章构建后入库（共 340 章），来源同样修正为 public-domain。
+- **线上总数**：**819** = 816（种库前原有 16 + 种库 800）+ 3 本名著。
+- **已知问题**：1.25 MB 的《紅樓夢》直链完整 GET 偶发卡住（Range 正常、PROPFIND 207），
+  判断为公网到 R2 的偶发慢连接，重试可完成；待观察。
