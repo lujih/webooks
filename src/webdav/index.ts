@@ -563,11 +563,44 @@ async function handleMoveCopy(
   // 解析 Destination 的 path（剥掉 mount 前缀）
   let targetDavPath: string;
   try {
-    const destUrl = new URL(dest, 'https://webooks.invalid');
+    const selfUrl = new URL(request.url);
+    const destUrl = new URL(dest, selfUrl);
+
+    // ── 同源校验（RFC 4918 §10.3，2026-10-28 审查 🟠-12）─────────────────
+    // 原文要求：Destination 的 scheme/host/port 与请求不一致时，
+    // 服务器 MUST fail（常用 502）。旧实现用 `new URL(dest, 'webooks.invalid')`
+    // 兜底，**完全忽略 host** —— 指向任意站点的 Destination 都会被当成站内路径
+    // 处理，写入的却是本地书库。
+    if (destUrl.protocol !== selfUrl.protocol || destUrl.host !== selfUrl.host) {
+      return textResponse(
+        502,
+        `Destination 必须与本站同 scheme/host/port（RFC 4918 §10.3）。\n`
+        + `  请求：${selfUrl.protocol}//${selfUrl.host}\n`
+        + `  目标：${destUrl.protocol}//${destUrl.host}`,
+        { allow: ALLOW },
+      );
+    }
+
     let rawPath = destUrl.pathname; // e.g. /dav/recent/other.epub
     // 剥掉 mount 前缀（cfg.mountPath，可能是 '/dav' 或 ''）
+    //
+    // ⚠️ 边界必须是**段边界**：旧实现 `rawPath.startsWith(mount)` 会把
+    // `/davevil/x.epub` 也当成挂载点下的路径，剥成 `evil/x.epub`。
+    // 另外，不在挂载点下的目标应当明确拒绝，而不是默默当成站内路径。
     const mount = cfg.mountPath;
-    if (mount && rawPath.startsWith(mount)) rawPath = rawPath.slice(mount.length) || '/';
+    if (mount) {
+      if (rawPath === mount) {
+        rawPath = '/';
+      } else if (rawPath.startsWith(`${mount}/`)) {
+        rawPath = rawPath.slice(mount.length);
+      } else {
+        return textResponse(
+          400,
+          `Destination 不在 WebDAV 挂载点 ${mount} 下：${rawPath}`,
+          { allow: ALLOW },
+        );
+      }
+    }
     targetDavPath = rawPath;
   } catch {
     return textResponse(

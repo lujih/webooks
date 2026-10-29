@@ -57,7 +57,12 @@ const FETCH_TIMEOUT_MS = 25_000;
  * 而 `::ffff:127.0.0.1` 这类映射写法逐个放行太容易漏。
  */
 export function isBlockedHost(hostname: string): boolean {
-  const h = hostname.trim().toLowerCase().replace(/^\[|\]$/g, '');
+  // ⚠️ 2026-10-28 审查 S6：先剥掉**结尾的点**再判定。
+  //   DNS 里 `localhost.` / `metadata.internal.` 是合法 FQDN 写法且解析结果相同，
+  //   但 `endsWith('.internal')` 匹配不到 `metadata.internal.` —— 于是
+  //   「写个点就绕过内网过滤」。同理 `127.0.0.1.` 会让 IPv4 正则失配。
+  //   剥点后再做后缀 / 字面量 / 十进制三套判定。
+  const h = hostname.trim().toLowerCase().replace(/^\[|\]$/g, '').replace(/\.+$/, '');
   if (!h) return true;
 
   // 主机名后缀

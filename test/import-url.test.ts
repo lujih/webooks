@@ -96,6 +96,15 @@ describe('isBlockedHost：内网判定', () => {
     ['2130706433', true],
     ['8.8.8.8', false],
     ['www.gutenberg.org', false],
+    // 2026-10-28 审查 S6：结尾的点是合法 FQDN 写法，解析结果与不加点时相同
+    // —— 旧实现 endsWith('.internal') 匹配不到 'metadata.internal.'。
+    ['localhost.', true],
+    ['metadata.internal.', true],
+    ['nas.local.', true],
+    ['127.0.0.1.', true],
+    ['169.254.169.254.', true],
+    ['2130706433.', true],
+    ['www.gutenberg.org.', false],
   ])('%s → %s', (host, blocked) => {
     expect(isBlockedHost(host)).toBe(blocked);
   });

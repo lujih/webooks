@@ -505,7 +505,7 @@ describe('MOVE / COPY', () => {
     await dav('/recent/src.epub', { method: 'PUT', body: 'x' });
     const res = await dav('/recent/src.epub', {
       method: 'MOVE',
-      headers: { destination: 'https://webooks.invalid/dav/recent/dst.epub' },
+      headers: { destination: 'https://webooks.test/dav/recent/dst.epub' },
     });
     expect(res.status).toBe(201);
     expect(res.headers.get('location')).toContain('/dav/recent/dst.epub');
@@ -519,11 +519,42 @@ describe('MOVE / COPY', () => {
     await dav('/recent/src2.epub', { method: 'PUT', body: 'x' });
     const res = await dav('/recent/src2.epub', {
       method: 'COPY',
-      headers: { destination: 'https://webooks.invalid/dav/recent/dst2.epub' },
+      headers: { destination: 'https://webooks.test/dav/recent/dst2.epub' },
     });
     expect(res.status).toBe(201);
     expect((await dav('/recent/src2.epub', { method: 'PROPFIND' })).status).toBe(207);
     expect((await dav('/recent/dst2.epub', { method: 'PROPFIND' })).status).toBe(207);
+
+    // ── 2026-10-28 审查 🟠-12：Destination 的同源与挂载点边界 ────────────
+  });
+
+  it('Destination 指向别的站点 → 502（RFC 4918 §10.3 要求 MUST fail）', async () => {
+    await dav('/recent/x1.epub', { method: 'PUT', body: 'x' });
+    const res = await dav('/recent/x1.epub', {
+      method: 'COPY',
+      headers: { destination: 'https://evil.example/dav/recent/x2.epub' },
+    });
+    expect(res.status).toBe(502);
+    await res.text();
+    // 源必须完好
+    expect((await dav('/recent/x1.epub', { method: 'PROPFIND' })).status).toBe(207);
+  });
+
+  it('Destination 不在挂载点下 / 只是前缀相似 → 400（不能把 /davevil 当 /dav）', async () => {
+    await dav('/recent/x3.epub', { method: 'PUT', body: 'x' });
+    for (const destination of [
+      'https://webooks.test/other/x4.epub',      // 完全不在 /dav 下
+      // ⚠️ 这条才是真正能区分新旧行为的：旧实现 `startsWith('/dav')` 会把它
+      // 剥成 `/title/A/x5.epub` —— 而 `title` 是集合的**英文别名**，能解析成
+      // 合法叶子，于是旧代码会照单全收（201），写进按书名/A/。
+      // 只写 `/davevil/...` 是测不出来的（剥完解不出版本，两种实现都 400）。
+      'https://webooks.test/davtitle/A/x5.epub',
+    ]) {
+      const res = await dav('/recent/x3.epub', { method: 'COPY', headers: { destination } });
+      expect(res.status, destination).toBe(400);
+      await res.text();
+    }
+    expect((await dav('/recent/x3.epub', { method: 'PROPFIND' })).status).toBe(207);
   });
 
   it('MOVE 缺 Destination 头 → 400', async () => {
@@ -845,7 +876,7 @@ describe('DAV 错误体', () => {
   it('MOVE 到目录（非叶子）返回 403', async () => {
     const res = await dav('/recent/', {
       method: 'MOVE',
-      headers: { destination: 'https://webooks.invalid/dav/recent/newdir/' },
+      headers: { destination: 'https://webooks.test/dav/recent/newdir/' },
     });
     // 源是 /recent/ 目录（kind=list），MOVE 目录 → 403
     expect(res.status).toBe(403);

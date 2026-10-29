@@ -426,7 +426,7 @@ describe('写 R2 的三条路径都带上 contentDisposition', () => {
     const target = `/dav/recent/${encodeURIComponent('拷贝版.epub')}`;
     const res = await dav('/recent/src.epub', {
       method: 'COPY',
-      headers: { destination: `https://webooks.invalid${target}` },
+      headers: { destination: `https://webooks.test${target}` },
     });
     expect(res.status).toBe(201);
     const meta = await storedMeta('拷贝版.epub');
