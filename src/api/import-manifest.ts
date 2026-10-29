@@ -41,7 +41,7 @@ import {
   findBookByLeaf,
   upsertBook,
 } from '../lib/db';
-import { purgeCreditCache } from '../lib/cache';
+import { navCacheTargets, purgeCreditCache, purgeEntries } from '../lib/cache';
 import { LICENSE_BASIS_VALUES, type LicenseBasis } from '../lib/ingest';
 import { jsonResponse, textResponse } from '../lib/http';
 import { authorBucket, letterBucket } from '../lib/collections';
@@ -117,7 +117,15 @@ export async function handleImportManifest(request: Request, env: Env): Promise<
 
   // 榜单缓存 1 小时：种库后不打的话首页活书脊看不到新书。
   // 只打 1 个键，远低于 Cache API 的 50/次上限。
-  if (registered.length > 0) await purgeCreditCache();
+  //
+  // ⚠️ 2026-10-28 审查 G：原来只打榜单，**导航层与列表一个都没打** ——
+  // 一条 manifest 里已经登记过的书，在 TTL 内目录里仍然看不到。
+  // 这里补上有界的导航层失效（8 个键），批量路径不做逐本叶子失效
+  //（理由见 navCacheTargets 的注释）。
+  if (registered.length > 0) {
+    await purgeEntries(navCacheTargets());
+    await purgeCreditCache();
+  }
 
   return jsonResponse({
     ok: true,

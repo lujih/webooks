@@ -190,10 +190,10 @@ PDF 的判据来自实测：用户那本 86MB 的扫描漫画，采样 2.86MB �
 
 ```bash
 # 只重算字母桶（不动类型）
-curl -H "Authorization: Bearer $ADMIN_TOKEN" https://你的域名/api/admin/rebucket
+curl -X POST -H "Authorization: Bearer $ADMIN_TOKEN" https://你的域名/api/admin/rebucket
 
 # 按内容重新嗅探类型 + 补齐缺失作者（会读 R2，较慢）
-curl -H "Authorization: Bearer $ADMIN_TOKEN" "https://你的域名/api/admin/rebucket?sniff=1"
+curl -X POST -H "Authorization: Bearer $ADMIN_TOKEN" "https://你的域名/api/admin/rebucket?sniff=1"
 ```
 
 > `rebucket` **默认不动 `kind_bucket`**：它现在来自内容嗅探或人工修正，比「按扩展名猜」
@@ -252,8 +252,13 @@ curl -H "Authorization: Bearer $ADMIN_TOKEN" "https://你的域名/api/admin/reb
 > 一旦回退生效，攻击者只要把 XFF 填成签发时的 IP 就能在别的机器上复用通行证。
 > 早期实现有那个回落，承诺实际上是失效的。
 >
-> 密钥默认复用 `TURNSTILE_SECRET`（想独立轮换再设 `UPLOAD_TICKET_SECRET`），
-> 不引入新的必填配置。
+> 密钥取自 `UPLOAD_TICKET_SECRET`，**回落链是 `WRITE_TOKEN` → `ADMIN_TOKEN`**
+> （`src/api/upload.ts` 的 `ticketSecret()`）。三个都没配时上传接口整体 503。
+>
+> ⚠️ 2026-10-28 订正：本节此前写「默认复用 `TURNSTILE_SECRET`」—— 那条回落链
+> 早已删除，照旧文档配置会「上传能发起但永远拿不到通行证」。
+> 另外这条回落链意味着 **通行证的安全性等于 ADMIN_TOKEN 的强度**，
+> 所以建议显式设置独立的 `UPLOAD_TICKET_SECRET`。
 
 同时 widget 设成 `appearance: 'interaction-only'`：正常用户根本看不到验证框，
 只有 Cloudflare 判定可疑时才弹出来要求交互。

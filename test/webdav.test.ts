@@ -637,8 +637,115 @@ describe('客户端兼容：二级目录没有尾斜杠', () => {
     const hrefs = [...xml.matchAll(/<D:href>([^<]*)<\/D:href>/g)]
       .map((m) => decodeURIComponent(m[1] as string));
     expect(hrefs[0]).toBe('/dav/按书名/R/2/');
+    // ⚠️ 2026-10-28 审查 T-05：缺非空哨兵 —— 让第 2 页**一个成员都不列**，
+    // 这条断言仍然成立（只有无关的 MAX_ENTRIES 用例变红）。先钉住「有成员」。
+    expect(hrefs.length, '第 2 页必须真的有成员，否则下面的过滤是在空集上成立')
+      .toBeGreaterThan(1);
     const outside = hrefs.slice(1).filter((h) => !h.startsWith('/dav/按书名/R/2/'));
     expect(outside).toHaveLength(0);
+  });
+
+  it('显式第 1 页（/recent/1/）的成员 href 也必须落在该路径之下', async () => {
+    // RFC 4918 §8.3：成员 href 必须在被请求集合之下（MUST NOT 相反）。
+    // 修复前只有 page>1 才带页段，于是 /recent/1/ 返回的成员全在 /最近收录/ 下。
+    await seed(['Dune.epub']);
+    await clearDavCache(ALL_PATHS);
+    const res = await propfind('/recent/1/', '1');
+    expect(res.status).toBe(207);
+    const xml = await res.text();
+    const hrefs = [...xml.matchAll(/<D:href>([^<]*)<\/D:href>/g)]
+      .map((m) => decodeURIComponent(m[1] as string));
+    expect(hrefs[0]).toBe('/dav/最近收录/1/');
+    const outside = hrefs.slice(1).filter((h) => !h.startsWith('/dav/最近收录/1/'));
+    expect(outside, `不在 /1/ 下的成员：${outside.slice(0, 3).join(' , ')}`).toHaveLength(0);
+  });
+
+  it('分页路径不进缓存：不能把带页段的 href 投毒给规范路径', async () => {
+    const many = Array.from({ length: 250 }, (_, i) => `R${String(i).padStart(3, '0')}.epub`);
+    await seed(many);
+    await clearDavCache(ALL_PATHS);
+
+    // 取第 2 页的一个真成员
+    const page2 = await propfind('/recent/2/', '1');
+    const page2Xml = await page2.text();
+    const member = [...page2Xml.matchAll(/<D:href>([^<]*)<\/D:href>/g)]
+      .map((m) => decodeURIComponent(m[1] as string))
+      .find((h) => h.includes('/2/') && h.endsWith('.epub'));
+    expect(member).toBeDefined();
+
+    // ① 先请求「分页叶子」—— 旧实现会把条目写进规范路径的缓存键
+    // 用分页路径请求 depth 0
+    const paged = await SELF.fetch(`${ORIGIN}/dav${encodeURI(member!.replace('/dav', ''))}`, {
+      method: 'PROPFIND',
+      headers: { depth: '0', 'content-type': 'application/xml' },
+    });
+    expect(paged.status).toBe(207);
+    await paged.text();
+    expect(paged.headers.get('x-dav-cache'), '分页路径必须绕过缓存').toBe('OFF');
+
+    // ② 再请求同一个叶子的**规范路径**：必须回源，且 href 里不能出现 /2/
+    const canonicalPath = member!.replace('/dav/最近收录/2/', '/dav/最近收录/');
+    const canonical = await SELF.fetch(`${ORIGIN}${encodeURI(decodeURIComponent(canonicalPath))}`, {
+      method: 'PROPFIND',
+      headers: { depth: '0', 'content-type': 'application/xml' },
+    });
+    expect(canonical.status).toBe(207);
+    const xml = await canonical.text();
+    expect(xml, '规范路径不能返回带 /2/ 的 href（缓存投毒）').not.toContain('/最近收录/2/');
+    expect(xml, '规范叶子的自身 href 不能带 /1/').not.toContain('/最近收录/1/');
+  });
+
+  // ── 2026-10-28 审查 G：写路径的缓存失效缺口 ────────────────────────────
+  it('PUT 后榜单缓存立刻失效（新书能进首页活书脊）', async () => {
+    await seed(['Old.epub']);
+    // 先请求一次把 /api/credits 的 1 小时缓存写热
+    const warm = await SELF.fetch(`${ORIGIN}/api/credits`);
+    expect(warm.status).toBe(200);
+    await warm.text();
+
+    await dav('/recent/CreditsProbe.epub', { method: 'PUT', body: 'x' });
+
+    // 修复前：PUT 从不打榜单缓存，这里会拿到 warm 时刻的 latest（Old.epub）
+    const after = await SELF.fetch(`${ORIGIN}/api/credits`);
+    const json = (await after.json()) as { latest?: { title?: string } | null };
+    expect(json.latest?.title, 'PUT 之后榜单必须回源').toContain('CreditsProbe');
+  });
+
+  it('MOVE 后旧路径的叶子缓存立刻失效', async () => {
+    await dav('/recent/MoveSource.epub', { method: 'PUT', body: 'x' });
+    // 预热旧路径的 depth-0 条目
+    const warm = await propfind('/recent/MoveSource.epub', '0');
+    expect(warm.status).toBe(207);
+    await warm.text();
+
+    const dest = `${ORIGIN}/dav/recent/MoveTarget.epub`;
+    const moved = await SELF.fetch(`${ORIGIN}/dav/recent/MoveSource.epub`, {
+      method: 'MOVE',
+      headers: {
+        authorization: 'Bearer test-write-token',
+        destination: dest,
+      },
+    });
+    expect([200, 201, 204]).toContain(moved.status);
+    await moved.text();
+
+    // 修复前：只打目标路径，旧路径的缓存条目在 TTL 内仍返回 207
+    const after = await propfind('/recent/MoveSource.epub', '0');
+    expect(after.status, 'MOVE 之后旧路径必须 404').toBe(404);
+  });
+
+  it('分页目录是只读虚拟层：PUT 到 /recent/2/ 返回 405', async () => {
+    // 目标 ①/⑥：分页目录不可写。DELETE 已由 delete-collection.test.ts 钉住，
+    // 这里补 PUT —— 一个虚拟分页目录不该成为「新建书籍」的落点。
+    await seed(['Dune.epub']);
+    await clearDavCache(ALL_PATHS);
+    const res = await dav('/recent/2/', { method: 'PUT', body: 'x' });
+    expect(res.status).toBe(405);
+    await res.text();
+    const row = await testEnv.DB
+      .prepare('SELECT COUNT(*) AS n FROM books')
+      .first<{ n: number }>();
+    expect(row?.n, '被拒的 PUT 不能创建任何书').toBe(1);
   });
 
   it('回归：带扩展名的叶子仍然当叶子（无尾斜杠照旧 302）', async () => {

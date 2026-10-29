@@ -74,19 +74,24 @@ webdav.org 的规格清单里被标记为 *obsoleted* 的只有 **RFC 2518**，�
 > 兼容性：DB 里可能还有 TTL 内的存量行是带括号形态。比较路径两侧统一做 `stripBrackets()` 归一
 > （`If:` 抓取、`Lock-Token` 头比较、刷新查行、删除），所以存量锁不会变成解不开的孤儿 —— 见
 > `test/lock-xml.test.ts` 的「兼容存量行」用例。
-| §9.10.2 | 无 body + `If:` 头 = 刷新锁 | 支持刷新 | ⚠️ 已修正 |
+| §9.10.2 | 无 body + `If:` 头 = 刷新锁 | 支持刷新（刷新响应**不带** Lock-Token） | ✅ 2026-10-28 补齐 |
 
 > **2026-10-14 订正**：本条此前标 ✅，实测是错的：
 >   ① 刷新路径仍然回了 `Lock-Token` 头，违反 §9.10.2 的「not returned」
->   ② 对**不存在的** token 回 200 并新造一把锁 —— §9.10.6 要求
->      412 + `lock-token-matches-request-uri`
+>   ② 对**不存在的** token 回 200 并新造一把锁
+>
+> **2026-10-28 再订正**：此前只修了 ② 的一半（文档却写「已修正」）。本轮两处都补齐：
+>   ① 刷新成功不再返回 `Lock-Token`（`isRefresh ? {} : {lock-token}`）
+>   ② `If:` 里的令牌匹配不到活锁时直接 **412** + 不建锁
+>   （`locks.ts` 抛 `preconditionFailed`，`handleLock` 映射成 412）。
+>   回归：`test/lock-lifecycle.test.ts`「LOCK 刷新带无效 If 令牌 → 412，且不得新造锁」。
 | §9.10.6 | 已有不兼容锁 → 423（不是 412） | 423 + `lock-token-submitted` | ✅ 已修正 |
 | §11.3 | 对已锁资源写入 → 423 Locked | 423 | ✅ |
 | §9.1 | PROPFIND 不存在的资源 → 404 | 404 | ✅ |
 | §9.1 | Depth: infinity **MAY** 被禁用；拒绝时 SHOULD 用 403 + `propfind-finite-depth` | 降级为 Depth: 1 | ⚠️ 见偏离表 |
 | §9.2 / §9.2.1 | 指令「MUST either all be executed or none」；受保护属性用 403 + `cannot-modify-protected-property` | 207 + 403 + 前置条件 | ✅ |
 | §9.3 | URI 已映射时 MKCOL「MUST fail」 | 已映射 → 405；未映射 → 403 + `valid-resourcetype` | ✅ |
-| §9.6.1 | 集合 DELETE「MUST act as if Depth: infinity」 | 递归删除该桶全部书；**根目录例外**（见偏离表） | ✅ |
+| §9.6.1 | 集合 DELETE「MUST act as if Depth: infinity」 | 删桶全部书；**根/导航层/分页目录拒绝（405）**，单请求上限 8 本（409）；见偏离表 | ✅ 2026-10-28 加固 |
 | §9.7.2 | PUT 到集合「MAY be treated as an error (405)」 | 405 + Allow | ✅ |
 | §9.4 | GET 集合「may return … a human-readable view」 | 返回 HTML 目录页 | ✅ |
 | §15.6 | entity-tag 是 ASCII token | 原样输出不转义，客户端 If-Match 能对上 | ✅ |

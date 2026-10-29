@@ -25,7 +25,12 @@
 
 // ── 环境 ──────────────────────────────────────────────────────────────
 const BASE = process.env.JOINT_BASE ?? 'http://127.0.0.1:8907';
-const ADMIN = 'Bearer ljh.111111';
+// ⚠️ 管理口令**必须**从环境变量来，绝不写字面量。
+// 2026-10-28 审查发现：本脚本早先硬编码了生产 ADMIN_TOKEN，而仓库是公开的，
+// 等于把后台密钥公布在 GitHub 上（已在历史里，只能靠轮换作废）。
+// 用法：JOINT_ADMIN_TOKEN=xxx node scripts/joint-debug.mjs
+const ADMIN_TOKEN = process.env.JOINT_ADMIN_TOKEN ?? '';
+const ADMIN = `Bearer ${ADMIN_TOKEN}`;
 // Playwright 从 npx 缓存加载 —— 不给项目加依赖
 const PW_PATH =
   process.env.PLAYWRIGHT_PATH ??
@@ -361,11 +366,15 @@ async function journeyUpload(page) {
 
 async function journeyAdmin(page) {
   console.log('\n▶ 旅程五：管理后台（登录 → 列表 → 真实管理动作）');
+  if (!ADMIN_TOKEN) {
+    console.log('  [skip] 未设置 JOINT_ADMIN_TOKEN —— 管理旅程需要口令，跳过（不是失败）');
+    return;
+  }
   await page.goto(`${BASE}/admin`, { waitUntil: 'networkidle' });
 
   const tokenInput = page.locator('#token, input[type="password"]').first();
   ok('令牌输入框存在', (await tokenInput.count()) > 0);
-  await tokenInput.fill('ljh.111111');
+  await tokenInput.fill(ADMIN_TOKEN);
 
   // 登录按钮的文本是「进入」（id=loginBtn）
   const loginBtn = page.locator('#loginBtn');

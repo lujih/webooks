@@ -18,7 +18,6 @@ import {
   bucketIdentityOf,
   adminListBooks,
   adminTotals,
-  deleteBook,
   findBooksByLeafNames,
   listBucketTotals,
   rebuildBuckets,
@@ -27,6 +26,7 @@ import {
 import { sniffKindFromBucket } from '../lib/kind-sniff';
 import { bookObjectKey, r2HttpMetadata } from '../lib/r2';
 import { hasAdminToken } from '../lib/auth';
+import { clientIpFromRequest } from '../lib/throttle';
 import { releaseLocksForLeafNames } from '../lib/locks';
 import { handleAdminRequests, handleCreditBoard, handleCreditPurge } from './requests';
 import { jsonResponse, textResponse } from '../lib/http';
@@ -40,7 +40,7 @@ import {
   sanitiseLeafName,
   sha256Hex,
 } from '../lib/metadata';
-import { bookCacheTargets, davCache, purgeEntries } from '../lib/cache';
+import { bookCacheTargets, davCache, navCacheTargets, purgeEntries } from '../lib/cache';
 import { purgeCreditCache } from './requests';
 import { handleImportUrl } from './import-url';
 import { handleImportManifest } from './import-manifest';
@@ -61,9 +61,31 @@ const MAX_LIST_LIMIT = 1000;
 const MAX_BACKFILL_LIMIT = 16;
 const DEFAULT_BACKFILL_LIMIT = 10;
 
-function authorised(request: Request, url: URL, cfg: Settings): boolean {
-  return hasAdminToken(request, url, cfg.adminToken);
+function authorised(request: Request, cfg: Settings): boolean {
+  return hasAdminToken(request, cfg.adminToken);
 }
+
+/**
+ * 只读动作：允许 GET。
+ *
+ * 其余动作（delete / update / reindex / rebucket / backfill-disposition /
+ * migrate-keys / purge / credits/purge / import/*）**必须 POST**。
+ *
+ * 为什么（2026-10-28 审查 S5）：旧实现「GET 或 POST 都行」，于是
+ *   <img src="https://站/api/admin/delete?leafNames=…">
+ * 这类零交互请求就能触发破坏性动作 —— 口令在头里时浏览器不会自动带上，
+ * 但一旦口令曾经放进过 URL（旧版支持 ?token=），或被代理/日志泄露，
+ * 这个组合就是可用的 CSRF。要求 POST + JSON 还额外获得一层屏障：
+ * 跨源带 `content-type: application/json` 会触发预检，简单请求带不了。
+ */
+const READ_ONLY_ACTIONS = new Set(['stats', 'books', 'requests', 'credits']);
+
+import {
+  ADMIN_FAIL_WINDOW_MS,
+  clearAdminFailures,
+  isAdminRateLimited,
+  noteAdminFailure,
+} from '../lib/admin-guard';
 
 export async function handleAdmin(
   request: Request,
@@ -72,12 +94,30 @@ export async function handleAdmin(
   url: URL,
 ): Promise<Response> {
   if (!cfg.adminToken) return textResponse(404, 'Not Found');
-  if (!authorised(request, url, cfg)) return textResponse(403, 'Forbidden');
-  if (request.method !== 'POST' && request.method !== 'GET') {
-    return textResponse(405, 'Method Not Allowed', { allow: 'GET, POST' });
+
+  const ip = clientIpFromRequest(request);
+  if (isAdminRateLimited(ip)) {
+    return textResponse(429, 'Too many failed admin attempts. Try again later.', {
+      'retry-after': String(Math.ceil(ADMIN_FAIL_WINDOW_MS / 1000)),
+    });
   }
+  if (!authorised(request, cfg)) {
+    noteAdminFailure(ip);
+    return textResponse(403, 'Forbidden');
+  }
+  clearAdminFailures(ip);
 
   const action = url.pathname.slice('/api/admin/'.length).replace(/\/+$/, '');
+
+  // 方法闸门：只读动作可 GET，其余必须 POST（见 READ_ONLY_ACTIONS 的注释）
+  if (request.method === 'GET' && !READ_ONLY_ACTIONS.has(action)) {
+    return textResponse(405, 'This admin action requires POST', { allow: 'POST' });
+  }
+  if (request.method !== 'POST' && request.method !== 'GET') {
+    return textResponse(405, 'Method Not Allowed', {
+      allow: READ_ONLY_ACTIONS.has(action) ? 'GET, POST' : 'POST',
+    });
+  }
   switch (action) {
     case 'reindex':
       return reindex(env, url);
@@ -255,7 +295,24 @@ async function updateBook(env: Env, request: Request): Promise<Response> {
  * 删除若干本书（同时清理 R2 对象与封面）。
  * 这是管理后台的核心动作 —— 遇到侵权/恶意内容要能立刻移除。
  */
+/**
+ * 单次管理批量删除的上限（2026-10-28 审查 S1/S3）。
+ *
+ * 每本书 2 个 R2 子请求（正对象 + 封面），而 Workers Free 单请求子请求上限
+ * 是 50，且 Cache API 调用与子请求共用同一个池。旧实现接受 200 个 leafName：
+ * 约第 17 本就会抛错，而那时前面的书**已经删了**、后面的收尾（锁释放 /
+ * 重算桶 / 缓存失效）一次都没执行 —— 正是「删掉的书还在显示」的原形状。
+ *
+ * 取 8 与集合 DELETE 的 MAX_COLLECTION_DELETE 一致：
+ * 8×2（R2）+ 1（D1 批量）+ ~8（锁）+ ≤24（缓存）+ ~6（重算桶）≈ 45 < 50。
+ */
+const MAX_ADMIN_BULK_DELETE = 8;
+
+/** 一次批量删除最多失效多少个缓存键（与子请求预算同源，见上） */
+const MAX_BULK_PURGE_TARGETS = 24;
+
 async function deleteBooks(env: Env, cfg: Settings, request: Request): Promise<Response> {
+  void cfg;
   let body: { leafNames?: unknown };
   try {
     body = (await request.json()) as { leafNames?: unknown };
@@ -263,50 +320,133 @@ async function deleteBooks(env: Env, cfg: Settings, request: Request): Promise<R
     return jsonResponse({ error: 'bad-json' }, 400);
   }
   const raw = Array.isArray(body.leafNames) ? body.leafNames : [];
-  const names = raw.filter((n): n is string => typeof n === 'string' && n.length > 0).slice(0, 200);
+  const names = raw.filter((n): n is string => typeof n === 'string' && n.length > 0);
   if (names.length === 0) return jsonResponse({ error: 'no-leaf-names' }, 400);
+
+  // 超限 → **整体拒绝**，不做「删一部分」：半删状态比拒绝危险得多，
+  // 而且调用方无法从响应里知道哪几本成功了。
+  if (names.length > MAX_ADMIN_BULK_DELETE) {
+    return jsonResponse(
+      {
+        error: 'too-many-leaf-names',
+        limit: MAX_ADMIN_BULK_DELETE,
+        requested: names.length,
+        message:
+          `单次最多删除 ${MAX_ADMIN_BULK_DELETE} 本：每本 2 个 R2 子请求，`
+          + '超过会撞 Workers Free 的 50 子请求上限并留下半删状态。请分批调用。',
+      },
+      400,
+    );
+  }
 
   const found = await findBooksByLeafNames(env.DB, names);
   const deleted: string[] = [];
-  const missing: string[] = names.filter((n) => !found.some((b) => b.leaf_name === n));
+  const failures: Array<{ leafName: string; error: string }> = [];
+  const missing = names.filter((n) => !found.some((b) => b.leaf_name === n));
 
-  for (const b of found) {
-    await env.BUCKET.delete(b.r2_key);
-    if (b.cover_key) await env.BUCKET.delete(b.cover_key);
-    await deleteBook(env.DB, b.id);
-    deleted.push(b.leaf_name);
-  }
-
-  if (deleted.length > 0) {
-    // §9.6 MUST destroy：书没了，它在**所有别名路径**上的锁也必须销毁。
-    // 管理后台按 leaf_name 删书，而一把锁的 resource 是某条具体路径
-    // （`/最近收录/x.epub`、`/按书名/A/x.epub`…），只删一条路径会留下
-    // 「资源已不存在、锁还在」的残行 —— TTL 内会挡住同名文件被重新上传。
-    // 与 WebDAV 的 DELETE 用同一个 helper，判据（末段 leaf_name）也保持一致。
-    await releaseLocksForLeafNames(env.DB, deleted);
-
-    await rebuildBuckets(env.DB);
-    // 让读者侧的目录缓存立刻失效，否则删掉的书在 TTL 内仍会显示。
-    // 路径段必须与 nodePath() 一致（中文），否则缓存键对不上、失效没有效果。
-    const titleCol = collectionSegment('title');
-    const authorCol = collectionSegment('author');
-    const formatCol = collectionSegment('format');
-    const recentCol = collectionSegment('recent');
-    const targets: Array<readonly [string, 0 | 1]> = [['/', 1]];
+  // ── 删除 + **保证收尾** ────────────────────────────────────────────────
+  // R2 删除逐本 try/catch：单个对象删不掉只留一个不可见的孤儿对象，
+  // 不能让循环中断；而锁释放 / 重算桶 / 缓存失效放在 finally 里，
+  // 无论前面出什么事都一定会跑。
+  try {
     for (const b of found) {
-      targets.push(
-        [`/${titleCol}/${bucketSegment(b.title_letter)}/`, 1],
-        [`/${authorCol}/${bucketSegment(b.author_letter)}/`, 1],
-        [`/${formatCol}/${bucketSegment(b.format_bucket)}/`, 1],
-        [`/${recentCol}/`, 1],
+      try {
+        await env.BUCKET.delete(b.r2_key);
+        if (b.cover_key) await env.BUCKET.delete(b.cover_key);
+      } catch (err) {
+        failures.push({
+          leafName: b.leaf_name,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+      deleted.push(b.leaf_name);
+    }
+
+    if (found.length > 0) {
+      // D1 删除合成一次 batch（一次子请求），而不是每本一次。
+      await env.DB.batch(
+        found.map((b) => env.DB.prepare('DELETE FROM books WHERE id = ?').bind(b.id)),
       );
     }
-    await purgeEntries(targets);
-    // 榜单缓存失效（首页 /api/credits 缓存 1 小时）
-    await purgeCreditCache();
+  } finally {
+    if (deleted.length > 0) {
+      // §9.6 MUST destroy：书没了，它在**所有别名路径**上的锁也必须销毁。
+      // 管理后台按 leaf_name 删书，而一把锁的 resource 是某条具体路径
+      // （`/最近收录/x.epub`、`/按书名/A/x.epub`…），只删一条路径会留下
+      // 「资源已不存在、锁还在」的残行 —— TTL 内会挡住同名文件被重新上传。
+      // 与 WebDAV 的 DELETE 用同一个 helper，判据（末段 leaf_name）也保持一致。
+      await releaseLocksForLeafNames(env.DB, deleted);
+
+      await rebuildBuckets(env.DB);
+
+      // 让读者侧的目录缓存立刻失效，否则删掉的书在 TTL 内仍会显示。
+      // 路径段必须与 nodePath() 一致（中文），否则缓存键对不上、失效没有效果。
+      await purgeEntries(bulkDeleteCacheTargets(found));
+      // 榜单缓存失效（首页 /api/credits 缓存 1 小时）
+      await purgeCreditCache();
+    }
   }
 
-  return jsonResponse({ deleted, deletedCount: deleted.length, missing });
+  return jsonResponse({ deleted, deletedCount: deleted.length, missing, failures });
+}
+
+/**
+ * 批量删除要失效的缓存键（**去重 + 有界**）。
+ *
+ * 覆盖：根导航、5 个集合导航、每本书所属的桶列表（书名/作者/格式/类型）
+ * 与「最近收录」列表。
+ *
+ * 已知边界（诚实记录）：**不做**每本书的 depth-0 叶子失效 —— 8 本 × 5 个
+ * 别名就是 40 次 cache.delete，加上 R2 删除必然撞 50 上限，那正是本次要修的
+ * 问题。列表入口（用户实际会看到的地方）全部立即失效；只有「直接 PROPFIND
+ * 一条刚被删掉的叶子路径」会在 PROPFIND_TTL（默认 300s）内短暂返回 207。
+ */
+function bulkDeleteCacheTargets(
+  books: Array<{
+    leaf_name: string;
+    title_letter: string;
+    author_letter: string;
+    format_bucket: string;
+  }>,
+): Array<readonly [string, 0 | 1]> {
+  const titleCol = collectionSegment('title');
+  const authorCol = collectionSegment('author');
+  const formatCol = collectionSegment('format');
+  const typeCol = collectionSegment('type');
+  const recentCol = collectionSegment('recent');
+
+  const seen = new Set<string>();
+  const out: Array<readonly [string, 0 | 1]> = [];
+  const push = (path: string, depth: 0 | 1): void => {
+    const key = `${depth}|${path}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    out.push([path, depth]);
+  };
+
+  push('/', 1);
+  push(`/${titleCol}/`, 1);
+  push(`/${authorCol}/`, 1);
+  push(`/${formatCol}/`, 1);
+  push(`/${typeCol}/`, 1);
+  push(`/${recentCol}/`, 1);
+
+  for (const b of books) {
+    push(`/${titleCol}/${bucketSegment(b.title_letter)}/`, 1);
+    push(`/${authorCol}/${bucketSegment(b.author_letter)}/`, 1);
+    push(`/${formatCol}/${bucketSegment(b.format_bucket)}/`, 1);
+    push(`/${typeCol}/${bucketSegment(mediaKindOfFormat(b.format_bucket))}/`, 1);
+  }
+
+  if (out.length > MAX_BULK_PURGE_TARGETS) {
+    // 理论上 8 本书最多 6 + 32 = 38 个键。截断时必须留痕，不能静默少失效。
+    console.warn(
+      '[admin] 批量删除的缓存失效目标超过预算，截断到',
+      MAX_BULK_PURGE_TARGETS, '（实际', out.length, '）',
+    );
+    return out.slice(0, MAX_BULK_PURGE_TARGETS);
+  }
+  return out;
 }
 
 /**
@@ -612,7 +752,14 @@ async function reindex(env: Env, url: URL): Promise<Response> {
 
   // 只有扫完整个前缀才重建分桶计数，否则中间态会让目录树看起来是空的
   const bucketsRebuilt = !listing.truncated;
-  if (bucketsRebuilt) await rebuildBuckets(env.DB);
+  if (bucketsRebuilt) {
+    await rebuildBuckets(env.DB);
+    // 2026-10-28 审查 G：reindex 会新增/改动书，但原来**一个缓存键都不打** ——
+    // 目录里已经列出的旧集合与计数会一直显示到 TTL 过期。
+    // 批量路径只打导航层（8 个键）+ 榜单；单本书的叶子条目靠 TTL。
+    await purgeEntries(navCacheTargets());
+    await purgeCreditCache();
+  }
 
   return Response.json({
     prefix,
@@ -940,16 +1087,12 @@ async function migrateKeys(env: Env, url: URL): Promise<Response> {
   // 漏掉任何一条就会让某个入口继续指向旧键。
   // 榜单（/api/credits）也带 downloadUrl，一并清。
   if (apply && migrated > 0) {
-    const moved = rows.filter((r) => r.r2_key !== bookObjectKey(r.id, r.leaf_name));
-    const targets = moved.flatMap((r) =>
-      bookCacheTargets({
-        leafName: r.leaf_name,
-        titleLetter: r.title_letter,
-        authorLetter: r.author_letter,
-        formatBucket: r.format_bucket,
-      }),
-    );
-    await purgeEntries(targets);
+    // ⚠️ 2026-10-28 审查 G：这里原来是 `flatMap(bookCacheTargets)` = 14×N 个键。
+    // 一页最多 16 本 → 224 次 cache.delete，而 Cache API 与子请求共用 50 的池，
+    // 必然超限；更糟的是**整段 purge 在异常时被跳过**，结果「键改了、缓存还指
+    // 旧对象」。改为有界导航层失效（8 个键），单本书的叶子条目靠 TTL 过期
+    // —— 与 collectionDeleteCacheTargets / bulkDeleteCacheTargets 同一取舍。
+    await purgeEntries(navCacheTargets());
     await purgeCreditCache();
   }
 

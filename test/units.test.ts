@@ -85,7 +85,7 @@ describe('resolveNode', () => {
       kind: 'list', collection: 'title', bucket: 'A', page: 1,
     });
     expect(resolveNode('/title/A/2/')).toEqual({
-      kind: 'list', collection: 'title', bucket: 'A', page: 2,
+      kind: 'list', collection: 'title', bucket: 'A', page: 2, pageExplicit: true,
     });
     expect(resolveNode('/title/A/Dune.epub')).toEqual({
       kind: 'leaf', collection: 'title', bucket: 'A', leafName: 'Dune.epub',
@@ -97,7 +97,7 @@ describe('resolveNode', () => {
       kind: 'list', collection: 'recent', bucket: 'all', page: 1,
     });
     expect(resolveNode('/recent/3/')).toEqual({
-      kind: 'list', collection: 'recent', bucket: 'all', page: 3,
+      kind: 'list', collection: 'recent', bucket: 'all', page: 3, pageExplicit: true,
     });
     expect(resolveNode('/recent/Dune.epub')).toEqual({
       kind: 'leaf', collection: 'recent', bucket: 'all', leafName: 'Dune.epub',
@@ -135,16 +135,16 @@ describe('resolveNode', () => {
     });
     // 有分桶集合下的分页目录
     expect(resolveNode('/title/A/2')).toEqual({
-      kind: 'list', collection: 'title', bucket: 'A', page: 2,
+      kind: 'list', collection: 'title', bucket: 'A', page: 2, pageExplicit: true,
     });
   });
 
   it('无尾斜杠的 recent 页码解析成目录', () => {
     expect(resolveNode('/recent/2')).toEqual({
-      kind: 'list', collection: 'recent', bucket: 'all', page: 2,
+      kind: 'list', collection: 'recent', bucket: 'all', page: 2, pageExplicit: true,
     });
     expect(resolveNode('/最近收录/3')).toEqual({
-      kind: 'list', collection: 'recent', bucket: 'all', page: 3,
+      kind: 'list', collection: 'recent', bucket: 'all', page: 3, pageExplicit: true,
     });
   });
 

@@ -8,6 +8,13 @@
 >
 > 复跑方式：`npx wrangler dev --local --port 8907` + `node scripts/joint-debug.mjs`。
 > 全程约 2 分钟（其中 61 秒是求书墙 60s 缓存的诚实等待，见 §3.3）。
+>
+> ⚠️ **管理旅程需要口令，且口令只能从环境变量来**：
+> `JOINT_ADMIN_TOKEN=xxx node scripts/joint-debug.mjs`。未设置时整段跳过
+> （打印 `[skip]`），不会失败。2026-10-28 审查发现本脚本早先**硬编码了
+> 生产 ADMIN_TOKEN**，而仓库是公开的 —— 该值已进入 git 历史，唯一有效的
+> 补救是**轮换密钥**（`npx wrangler secret put ADMIN_TOKEN`），
+> 详见 `docs/reviews/2026-10-28-deep-audit/`。
 
 ## 0. 为什么需要这层联调
 

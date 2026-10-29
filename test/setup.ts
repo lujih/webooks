@@ -1,8 +1,9 @@
 import { applyD1Migrations, env } from 'cloudflare:test';
-import { beforeAll } from 'vitest';
+import { beforeAll, beforeEach } from 'vitest';
 import type { Env } from '../src/config';
 import type { StaticAssetsSnapshot } from './env';
 import { entriesCacheKey, purgeByPrefixes } from '../src/lib/cache';
+import { resetAdminFailures } from '../src/lib/admin-guard';
 
 export interface TestEnv extends Env {
   TEST_MIGRATIONS: Parameters<typeof applyD1Migrations>[1];
@@ -15,6 +16,12 @@ export interface TestEnv extends Env {
 }
 
 export const testEnv = env as unknown as TestEnv;
+
+// 管理口令失败计数是模块级状态：不重置的话，前面用例累积的 403 会把同一个
+// 来源 IP 推过阈值，后面的用例就会拿到 429 而不是预期的 403。
+beforeEach(() => {
+  resetAdminFailures();
+});
 
 beforeAll(async () => {
   await applyD1Migrations(testEnv.DB, testEnv.TEST_MIGRATIONS);

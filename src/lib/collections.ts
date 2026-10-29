@@ -339,7 +339,13 @@ export function authorBucket(author: string | null | undefined): string {
 export type DavNode =
   | { kind: 'root' }
   | { kind: 'nav'; collection: CollectionId }
-  | { kind: 'list'; collection: CollectionId; bucket: string; page: number }
+  /**
+   * `pageExplicit` 表示请求路径里**显式写了页码段**（`/最近收录/2/`、`/按书名/A/1/`）。
+   * 为什么必须区分：RFC 4918 §8.3 要求成员 href 落在被请求集合之下，所以
+   * 「显式分页」的列表成员的 href 必须带页段；而 `/最近收录/` 这种规范写法不带。
+   * 两者是**不同 URL、不同缓存身份**（2026-10-28 审查 🔴-3/🔴-4）。
+   */
+  | { kind: 'list'; collection: CollectionId; bucket: string; page: number; pageExplicit?: boolean }
   /**
    * `page` 只在**经分页目录访问**时出现（`/最近收录/2/书名.epub`）。
    * 为什么需要：分页目录返回的成员 href 必须落在分页路径之下，否则严格的
@@ -440,11 +446,21 @@ export function resolveNode(pathname: string): DavNode {
     }
     // recent：seg 只能是页码（目录）或叶子（文件）
     if (trailingSlash) {
-      if (isPageSegment(seg1)) return { kind: 'list', collection, bucket: 'all', page: Number(seg1) };
+      if (isPageSegment(seg1)) {
+        return {
+          kind: 'list', collection, bucket: 'all',
+          page: Number(seg1), pageExplicit: true,
+        };
+      }
       return { kind: 'unknown' };
     }
     // 同上：页码是无点号的纯数字，不可能是书名 —— 无尾斜杠也按目录解析。
-    if (isPageSegment(seg1)) return { kind: 'list', collection, bucket: 'all', page: Number(seg1) };
+    if (isPageSegment(seg1)) {
+      return {
+        kind: 'list', collection, bucket: 'all',
+        page: Number(seg1), pageExplicit: true,
+      };
+    }
     return { kind: 'leaf', collection, bucket: 'all', leafName: segments[1] as string };
   }
 
@@ -464,11 +480,21 @@ export function resolveNode(pathname: string): DavNode {
       return { kind: 'unknown' };
     }
     if (trailingSlash) {
-      if (isPageSegment(rawSeg2)) return { kind: 'list', collection, bucket: seg1, page: Number(rawSeg2) };
+      if (isPageSegment(rawSeg2)) {
+        return {
+          kind: 'list', collection, bucket: seg1,
+          page: Number(rawSeg2), pageExplicit: true,
+        };
+      }
       return { kind: 'unknown' };
     }
     // 页码段无尾斜杠同样按目录解析（同上面二级路径的客户端事故）
-    if (isPageSegment(rawSeg2)) return { kind: 'list', collection, bucket: seg1, page: Number(rawSeg2) };
+    if (isPageSegment(rawSeg2)) {
+      return {
+        kind: 'list', collection, bucket: seg1,
+        page: Number(rawSeg2), pageExplicit: true,
+      };
+    }
     return { kind: 'leaf', collection, bucket: seg1, leafName: rawSeg2 };
   }
 
@@ -495,9 +521,11 @@ export function nodePath(node: DavNode): string {
     case 'list': {
       const def = COLLECTIONS[node.collection];
       const col = collectionSegment(node.collection);
-      if (!def.bucketed) return node.page === 1 ? `/${col}/` : `/${col}/${node.page}/`;
+      // 只有**显式分页**才把页码写回自身 href；`/最近收录/` 的规范形态不带 /1/
+      const pageSeg = node.pageExplicit ? `/${node.page}` : '';
+      if (!def.bucketed) return `/${col}${pageSeg}/`;
       const b = bucketSegment(node.bucket);
-      return node.page === 1 ? `/${col}/${b}/` : `/${col}/${b}/${node.page}/`;
+      return `/${col}/${b}${pageSeg}/`;
     }
     case 'leaf': {
       const def = COLLECTIONS[node.collection];

@@ -175,6 +175,19 @@ export async function acquireLock(
     }
   }
 
+  // ⚠️ 2026-10-28 审查（协议 🟠-8）：调用方给了 `If: (<token>)` 表示「刷新
+  // 这把锁」，但库里没有对应活锁时必须 **412**，不能静默新造一把。
+  // 修复前：无效 token 直接落到下面的「新建」分支 → 200 + 新 Lock-Token，
+  // 客户端以为刷新成功，其实多了一把锁；而 `docs/rfc-compliance.md` 当时
+  // 还声称这条已修（文档与实现不符）。
+  if (opts.refreshToken) {
+    const err = new Error('LOCK_REFRESH_MISMATCH') as Error & {
+      preconditionFailed: boolean;
+    };
+    err.preconditionFailed = true;
+    throw err;
+  }
+
   // 冲突判定：资源 r 被锁（自身或祖先目录锁）且类型不兼容 → 冲突
   const blocking = await liveLockForResource(db, opts.resource);
   if (blocking) {

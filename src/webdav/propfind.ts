@@ -374,7 +374,7 @@ function bookEntry(
   //    界面报「没有加载到数据，请检查配置信息是否正确」。
   //    第一层目录没这个毛病，正因为它的成员 href 天然在请求路径之下。
   //    对应的解析与缓存归一见 resolveNode / canonicalDavPath。
-  const pageSeg = page > 1 ? `/${page}` : '';
+  const pageSeg = page > 0 ? `/${page}` : '';
   return {
     path: def.bucketed
       ? `/${col}/${bucketSegment(bucket)}${pageSeg}/${book.leaf_name}`
@@ -477,7 +477,15 @@ export async function collectDavEntries(
       if (depth === 0) return entries;
 
       const books = await listBooks(env.DB, node.collection, node.bucket, offset, cfg.maxEntries);
-      for (const book of books) entries.push(bookEntry(node.collection, node.bucket, book, cfg.r2PublicBase, node.page));
+      for (const book of books) {
+        entries.push(
+          bookEntry(
+            node.collection, node.bucket, book, cfg.r2PublicBase,
+            // 只有显式分页才带页段；规范路径 `/最近收录/` 的成员 href 不该带 /1/
+            node.pageExplicit ? node.page : 0,
+          ),
+        );
+      }
 
       // 分页子目录只在第 1 页列出：/title/A/2/ 是 /title/A/ 的子节点，
       // 它自己的子节点只有书 —— 否则第 2 页会列出一个指向自己的「第 2 页」。
@@ -507,7 +515,8 @@ export async function collectDavEntries(
       if (!book) return null;
       // 叶子按 leaf_name 全局唯一查找，因此对路径宽容：
       // 即使客户端 PUT 到的桶与书的实际分桶不一致，也能取到文件。
-      return [bookEntry(node.collection, node.bucket, book, cfg.r2PublicBase, node.page)];
+      // 传 0 而不是 undefined：默认参数是 1，会让规范叶子的 href 变成 /1/xxx
+      return [bookEntry(node.collection, node.bucket, book, cfg.r2PublicBase, node.page ?? 0)];
     }
 
     default:
@@ -563,7 +572,25 @@ export async function handlePropfind(
   const { text: bodyText } = await readDavBody(request);
   const propReq = parsePropfindBody(bodyText);
 
-  const cache = cfg.propfindTtl > 0 ? davCache() : null;
+  // ── 分页路径不进条目缓存（2026-10-28 审查 🔴-3 / M6）──────────────────
+  //
+  // 两个独立的坑，用同一条规则一起堵住：
+  //   ① **投毒**：缓存键经过 `canonicalDavPath` 会把居中的页码段归一掉，
+  //      于是 `PROPFIND /最近收录/2/x.epub` 写进的条目，会被
+  //      `PROPFIND /最近收录/x.epub` 命中并返回带 `/2/` 的 href ——
+  //      一次请求就能让所有客户端在 300s 内看到「不在请求路径下」的成员。
+  //   ② **永不失效**：`bookCacheTargets()` 只生成规范路径（14 个键），
+  //      分页目录（生产 800 本时有 ≥13 个 `/N/` 键）任何写路径都打不到，
+  //      删掉的书会一直显示到 TTL 过期。
+  //
+  // 规则：**显式分页的路径（列表或叶子）不读也不写缓存**，直接回源 D1。
+  // 代价是这些路径每次多一次 D1 索引查询；但分页目录本身是低频入口，
+  // 而且正确性优先于这点量。规范路径（`/最近收录/`、`/按书名/A/`）照旧缓存。
+  const resolved = resolveNode(davPath);
+  const cacheable =
+    !(resolved.kind === 'list' && resolved.pageExplicit) &&
+    !(resolved.kind === 'leaf' && typeof resolved.page === 'number');
+  const cache = cfg.propfindTtl > 0 && cacheable ? davCache() : null;
   const cacheKeyUrl = entriesCacheKey(davPath, depth);
 
   let entries: Entry[] | null = null;
@@ -579,7 +606,7 @@ export async function handlePropfind(
 
   if (!entries) {
     // 条目来自 D1（索引查询），绝不调用 R2 list()，因此不消耗 Class A 额度。
-    entries = await collectDavEntries(resolveNode(davPath), depth, env, cfg);
+    entries = await collectDavEntries(resolved, depth, env, cfg);
     if (!entries) {
       return new Response('Not Found\n', { status: 404, headers: { 'content-type': 'text/plain' } });
     }

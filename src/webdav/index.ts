@@ -5,11 +5,14 @@ import {
   ALLOWED_UPLOAD_FORMATS,
   isAllowedUploadExt,
   authorBucket,
+  bucketSegment,
   letterBucket,
   canonicalDavPath,
+  COLLECTIONS,
   collectionSegment,
   decodeDavPath,
   resolveNode,
+  type CollectionId,
   type DavNode,
 } from '../lib/collections';
 import {
@@ -75,6 +78,24 @@ const ALLOW = 'OPTIONS, GET, HEAD, PROPFIND, PROPPATCH, MKCOL, LOCK, UNLOCK, PUT
  * 宣告 2 是准确的：Class 1 + 完整锁支持（timeout / lock-token / If 刷新）。
  */
 const DAV_HEADER = '1, 2';
+
+/**
+ * 一次集合 DELETE 最多删多少本。
+ *
+ * 为什么必须设上限（2026-10-28 审查：代码推导 + 生产规模代入）：
+ * 每本书要删 1 个正对象（有封面时 2 个），R2 删除是**子请求**；Workers Free
+ * 单请求子请求上限 50，而 Cache API 调用与子请求**共用同一个池**。
+ * 一个 390 本的桶（生产 `按书名/Q` 实测就是）会在第 ~25 本撞上限抛错，
+ * 而那时 D1 行**已经删完** —— `rebuildBuckets`、锁释放、缓存失效全部跳过，
+ * 留下半删状态 + 数百个不可见的孤儿对象，D1 元数据不可恢复。
+ *
+ * 取 8 的依据：8×2（R2）+ ~3（D1：取候选 / 删行 / 重算桶）+ ~8（锁清理）
+ * + ≤12（缓存键）≈ 40，仍在 50 以下且留有余量。
+ *
+ * 超过上限**拒绝**而不是「尽力删一部分」：半删状态比拒绝危险得多，
+ * 且客户端能明确知道「这次没删干净」。
+ */
+const MAX_COLLECTION_DELETE = 8;
 
 export async function handleDav(
   request: Request,
@@ -336,10 +357,25 @@ async function handleLock(
         'content-type': 'application/xml; charset=utf-8',
         // §9.10.1：LOCK 响应头回 Coded-URL 形态（带尖括号）。
         // 正文里的 lockdiscovery 是裸 URI —— 同一把锁，两端形态本就不同。
-        'lock-token': toCodedUrl(lock.token),
+        //
+        // ⚠️ §9.10.2「Refreshing Locks」明确：**刷新成功的响应里不返回
+        //    Lock-Token 头**（"not returned"）。修复前所有 200 都带这个头，
+        //    客户端无法区分「新建」和「刷新」—— 文档里这条曾标注已修，
+        //    实际只修了一半（无效令牌分支）。现在两者都对了。
+        ...(isRefresh ? {} : { 'lock-token': toCodedUrl(lock.token) }),
       },
     });
   } catch (err) {
+    // If: (<token>) 里的令牌没有对应活锁 → 412 Precondition Failed
+    //（RFC 4918 §10.4.1：状态令牌不匹配 → 条件为假）。绝不能新造一把锁。
+    if ((err as { preconditionFailed?: boolean }).preconditionFailed) {
+      return textResponse(
+        412,
+        'LOCK refresh failed: the If header lock token does not match a live lock '
+        + 'on this resource (RFC 4918 §10.4.1).',
+        { allow: ALLOW },
+      );
+    }
     if ((err as { lockConflict?: boolean }).lockConflict) {
       const live = await liveLockForResource(env.DB, davPath);
       const conflictXml = live ? lockDiscoveryXml(live, davPath) : '';
@@ -575,6 +611,23 @@ async function handleMoveCopy(
     );
   }
 
+  // ── COPY 到自身：直接 204，**一个字节都不重写**（2026-10-28 审查 🔴-2）───
+  //
+  // 修复前这里只拦 MOVE，COPY 会走完整写入流程，而且更糟：
+  //   · `targetR2Key` 与源键相同 → 从 `sourceObj.body` 读、往**同一个键**写
+  //     （R2 上是「读自己→写自己」，对象内容可能被截断/置空）；
+  //   · D1 用 `sourceBook.size`/etag 写回 → 声明大小与实际字节不一致，
+  //     `HEAD`/207 的 getcontentlength 与 302 出去的字节对不上，且无法自愈。
+  //
+  // RFC 4918 §9.8.5 把「源与目标是同一资源」明确列为 COPY 可以返回 403 的
+  // 情形；§9.8.1 还要求「对目标的后续修改不得影响源」—— 同 URL 时二者是
+  // 同一对象，这条要求根本无法满足。同步客户端会发这种 no-op COPY，
+  // 所以按 RFC 的「幂等」意图返回 **204 且不动任何数据** 最稳。
+  // （旧审计把 §9.8.1 读成「COPY 到自身合法」正是这道检查缺失的原因。）
+  if (!isMove && sameResource) {
+    return new Response(null, { status: 204 });
+  }
+
   // 锁检查：源和目标都不能被锁住（同样用规范路径，与 LOCK/PUT 保持一致）
   //
   // ⚠️ 必须认 `If:` 令牌，否则**持锁者自己也被挡**：修复前这里是裸的
@@ -738,14 +791,26 @@ async function handleMoveCopy(
   }
 
   await rebuildBuckets(env.DB);
-  await purgeEntries(
-    bookCacheTargets({
+  // 目标路径的完整失效集 + **源路径**的完整失效集。
+  // ⚠️ 2026-10-28 审查 G：原来只打目标 —— MOVE 之后旧路径的叶子条目
+  // （depth 0）在 TTL 内仍返回 207，同步客户端会以为旧文件还在。
+  // purgeEntries 内部按 (path, depth) 去重，两本合起来 ≤28 个键，
+  // 单本书操作仍在 50 子请求预算内。
+  await purgeEntries([
+    ...bookCacheTargets({
+      leafName: sourceBook.leaf_name,
+      titleLetter: sourceBook.title_letter,
+      authorLetter: sourceBook.author_letter,
+      formatBucket: sourceBook.format_bucket,
+    }),
+    ...bookCacheTargets({
       leafName: targetLeafName,
       titleLetter: letterBucket(sourceBook.title),
       authorLetter: authorBucket(sourceBook.author),
       formatBucket: sourceBook.format_bucket,
     }),
-  );
+
+  ]);
 
   // 状态码（RFC 4918 §9.8.5 / §9.9.4）：
   //   · 目标原本不存在 → 201 Created（资源已创建）
@@ -1268,10 +1333,49 @@ async function handlePut(request: Request, env: Env, node: DavNode, davPath: str
       formatBucket: meta.format,
     }),
   );
+  // 2026-10-28 审查 G：PUT 是最高频的写入口，却从来没打过榜单缓存。
+  // 新书不会出现在首页「活书脊 / 上传者榜」里，直到 1 小时 TTL 过期。
+  await purgeCreditCache();
 
   const headers = new Headers();
   if (object?.etag) headers.set('etag', `"${object.etag}"`);
   return new Response(null, { status: existing ? 204 : 201, headers });
+}
+
+/**
+ * 集合删除要失效的缓存键（**有界**：≤ 3 + 1 + MAX_COLLECTION_DELETE 个）。
+ *
+ * 覆盖：根导航、集合导航、最近收录列表、该桶列表（分桶集合）、每个成员的
+ * **请求路径下**的叶子（depth 0）。
+ *
+ * 已知边界（诚实记录，不是遗漏）：同一本书的**其它别名叶子**（`/按书名/x` 与
+ * `/按作者/x` …）的 depth-0 条目不会在这里失效，最长 `PROPFIND_TTL`（默认 300s）
+ * 后自然过期。要全量失效需 5×N 次 `cache.delete`，而 Cache API 与子请求共用
+ * 50 的池 —— 必然撞上限，那正是这次要修的问题。列表入口是**立即**生效的，
+ * 只有「直接 PROPFIND 一条刚被删掉的别名路径」会在 TTL 内短暂返回 207。
+ */
+function collectionDeleteCacheTargets(
+  collection: CollectionId,
+  bucket: string,
+  removed: Array<{ leaf_name: string }>,
+): Array<readonly [string, 0 | 1]> {
+  const col = collectionSegment(collection);
+  const recent = collectionSegment('recent');
+  const targets: Array<readonly [string, 0 | 1]> = [
+    ['/', 1],
+    [`/${col}/`, 1],
+    [`/${recent}/`, 1],
+  ];
+  if (COLLECTIONS[collection].bucketed) {
+    targets.push([`/${col}/${bucketSegment(bucket)}/`, 1]);
+  }
+  for (const b of removed) {
+    const leaf = COLLECTIONS[collection].bucketed
+      ? `/${col}/${bucketSegment(bucket)}/${b.leaf_name}`
+      : `/${col}/${b.leaf_name}`;
+    targets.push([leaf, 0]);
+  }
+  return targets;
 }
 
 async function handleDelete(request: Request, env: Env, node: DavNode, davPath: string): Promise<Response> {
@@ -1377,7 +1481,47 @@ async function handleDelete(request: Request, env: Env, node: DavNode, davPath: 
   }
 
   if (node.kind === 'nav' || node.kind === 'list') {
-    const bucket = node.kind === 'list' ? node.bucket : '';
+    // ── 分页目录：拒绝删除（2026-10-28 审查的高危发现）─────────────────
+    //
+    // 分页目录是**虚拟层**：它的成员是「第 N 页那 200 本」，不是该桶的全部。
+    // RFC 4918 §9.6.1 要求集合 DELETE 等价于 Depth: infinity —— 对
+    // `/最近收录/2/` 来说，这意味着删掉「第 2 页列出的那些」，**不是**全库。
+    //
+    // 修复前的实现把 `node.page` 整个丢掉了（`bucket = node.bucket`），于是：
+    //   DELETE /最近收录/2/  → bucketWhere('recent') 恒为 `1 = 1` → **删全库**
+    //   DELETE /按书名/A/2/  → 删掉整个 A 桶（第 1..N 页）
+    // 这不是理论风险：任何按页浏览的客户端都可能发这条 DELETE。
+    //
+    // 也没有「正确」的实现方式：删成员会立刻改变分页边界，无法定义「第 2 页
+    // 的成员」到底是什么。所以与根目录一致，明确拒绝（405），而不是猜。
+    if (node.kind === 'list' && node.page > 1) {
+      return textResponse(
+        405,
+        'DELETE on a pagination directory is not supported: it is a virtual view, '
+        + `not a real collection (page ${node.page}). Delete the bucket's page 1 or `
+        + 'use the admin console.',
+        { allow: ALLOW },
+      );
+    }
+
+    // ── 导航集合（/按书名/ 这类）：拒绝删除，而不是静默 204 ──────────────
+    //
+    // 修复前这里 `bucket = ''`，`deleteBooksInBucket(collection, '')` 对
+    // title/author/format 匹配 `*_letter = ''`（0 行），于是返回 204 —— 客户端
+    // 以为删成功了，实际什么都没删（§9.6.1 的「说谎」形态）。
+    // 导航集合的成员是**派生的桶列表**，没有实体行可删；删除整个分类
+    // 等价于删全库，风险与根目录同级，所以同样拒绝。
+    if (node.kind === 'nav') {
+      return textResponse(
+        405,
+        'DELETE on a navigation collection (/按书名/, /按作者/ …) is not supported: '
+        + 'its members are derived buckets, not a deletable collection. '
+        + 'Delete a specific bucket or use the admin console.',
+        { allow: ALLOW },
+      );
+    }
+
+    const bucket = node.bucket;
     const collection = node.collection;
 
     // ── 条件请求（RFC 9110 §13.2.2）：集合 DELETE 同样是状态变更 ────────
@@ -1449,6 +1593,20 @@ async function handleDelete(request: Request, env: Env, node: DavNode, davPath: 
     // 比对只看末段 leaf_name：叶子本来就是「leaf_name 全局唯一查找」，
     // 同一本书出现在任何桶下都指向同一资源，锁不该因为路径写法不同就失效。
     const candidates = await listBooksInBucket(env.DB, collection, bucket);
+
+    // ── 规模上限：超过就拒绝，不做「尽力删一部分」──────────────────────
+    // 依据见 MAX_COLLECTION_DELETE 的注释：R2 删除是子请求，撞 50 上限时
+    // D1 行可能已经删完，收尾逻辑会整段跳过。
+    if (candidates.length > MAX_COLLECTION_DELETE) {
+      return textResponse(
+        409,
+        `Collection holds ${candidates.length} books; this endpoint deletes at most `
+        + `${MAX_COLLECTION_DELETE} per request (Workers Free subrequest limit). `
+        + 'Delete individual books, or use the admin console in batches.',
+        { allow: ALLOW },
+      );
+    }
+
     const liveLocks = await allLiveLocks(env.DB);
     for (const [resource, lock] of liveLocks) {
       // 用 resourceMatchesLeafName 而不是「把末段解码一次再比」：库里的 resource 与
@@ -1459,32 +1617,48 @@ async function handleDelete(request: Request, env: Env, node: DavNode, davPath: 
       }
     }
 
-    const removed = await deleteBooksInBucket(env.DB, collection, bucket);
-    for (const b of removed) {
-      await env.BUCKET.delete(b.r2_key);
-      if (b.cover_key) await env.BUCKET.delete(b.cover_key);
+    // ── 删除 + **保证收尾**（2026-10-28 审查的 S1/S2）─────────────────────
+    //
+    // 收尾三件事（重算桶 / 释放锁 / 失效缓存）必须执行，哪怕 R2 删除中途失败：
+    // 以前它们排在裸循环之后，任何一次 R2 异常都会让三者一起被跳过 ——
+    // 而 D1 行已经删掉了，于是「书没了、计数还在、缓存还显示、锁还在」。
+    // 用 try/finally 把收尾钉死；单个对象删除失败只记录，不阻止收尾
+    //（留下的是不可见的孤儿对象，而不是半删状态）。
+    let removed: Array<{ leaf_name: string; r2_key: string; cover_key: string | null }> = [];
+    try {
+      removed = await deleteBooksInBucket(env.DB, collection, bucket);
+      for (const b of removed) {
+        try {
+          await env.BUCKET.delete(b.r2_key);
+          if (b.cover_key) await env.BUCKET.delete(b.cover_key);
+        } catch (err) {
+          console.error(
+            '[webdav] 集合删除时 R2 对象删除失败（留下孤儿对象）',
+            b.leaf_name,
+            err instanceof Error ? err.message : err,
+          );
+        }
+      }
+    } finally {
+      await rebuildBuckets(env.DB);
+
+      // §9.6 MUST destroy：集合与它的成员资源都已经不存在了，锁不能残留。
+      //
+      // 遍历 members 的 leaf_name（而不是只删 `resource = davPath`）：一本书可能同时
+      // 出现在别的集合路径下，而 §9.6 针对的是**资源**，不是「这次请求用的那条路径」。
+      //
+      // 集合**自身**的锁走 releaseLocksForResource（尾斜杠两种形态 + 子树前缀）：
+      // 它的资源路径是 `/最近收录/`，与成员锁（`/最近收录/x.epub`）互不冲突，
+      // 但两行都得删 —— 成员锁在删除前已被上面的 423 检查拦住，集合自身的锁则是
+      // 经 If 令牌放行后才走到这里，不删就残留。
+      await releaseLocksForLeafNames(env.DB, removed.map((b) => b.leaf_name));
+      await releaseLocksForResource(env.DB, davPath);
+
+      // 集合内容变了 → 根导航、集合导航、该桶列表、最近收录列表、成员叶子、榜单。
+      // 具体覆盖面与**已知边界**（别名叶子的 d0 条目靠 TTL 过期）见 helper 注释。
+      await purgeEntries(collectionDeleteCacheTargets(collection, bucket, removed));
+      await purgeCreditCache();
     }
-    await rebuildBuckets(env.DB);
-
-    // §9.6 MUST destroy：集合与它的成员资源都已经不存在了，锁不能残留。
-    //
-    // 遍历 members 的 leaf_name（而不是只删 `resource = davPath`）：一本书可能同时
-    // 出现在别的集合路径下，而 §9.6 针对的是**资源**，不是「这次请求用的那条路径」。
-    //
-    // 集合**自身**的锁走 releaseLocksForResource（尾斜杠两种形态 + 子树前缀）：
-    // 它的资源路径是 `/最近收录/`，与成员锁（`/最近收录/x.epub`）互不冲突，
-    // 但两行都得删 —— 成员锁在删除前已被上面的 423 检查拦住，集合自身的锁则是
-    // 经 If 令牌放行后才走到这里，不删就残留。
-    await releaseLocksForLeafNames(env.DB, removed.map((b) => b.leaf_name));
-    await releaseLocksForResource(env.DB, davPath);
-
-    // 集合内容变了，根导航与该集合的导航都要失效
-    await purgeEntries([
-      ['/', 1],
-      [`/${collectionSegment(collection)}/`, 1],
-    ]);
-    // 同上：集合删除也要更新上传者榜单
-    await purgeCreditCache();
     return new Response(null, { status: 204 });
   }
 

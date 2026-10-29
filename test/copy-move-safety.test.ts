@@ -234,3 +234,64 @@ describe('MOVE 覆盖：源消失、目标内容正确', () => {
     expect(after?.published_at, '覆盖不应把老书顶到「最近收录」最前').toBe(first?.published_at);
   });
 });
+
+// ── 2026-10-28 审查：COPY 到自身曾会用自身 body 覆写同一 R2 键 ────────────
+describe('COPY 到同一资源（RFC 4918 §9.8.5）', () => {
+  /** 读 D1 行 + R2 真实字节（不跟 302，否则读到的是跳转目标而不是对象） */
+  async function snapshot(leaf: string) {
+    const row = await testEnv.DB
+      .prepare('SELECT size, etag, r2_key FROM books WHERE leaf_name = ?')
+      .bind(leaf)
+      .first<{ size: number; etag: string; r2_key: string }>();
+    const obj = row ? await testEnv.BUCKET.get(row.r2_key) : null;
+    return { row, bytes: obj ? new Uint8Array(await obj.arrayBuffer()) : null };
+  }
+
+  it('COPY 到自身 → 204，且**没有发生重写**（uploaded 时间戳不变）', async () => {
+    await put('/最近收录/SelfCopy.epub', 'ORIGINAL-BYTES');
+    const row = await testEnv.DB
+      .prepare('SELECT size, etag, r2_key FROM books WHERE leaf_name = ?')
+      .bind('SelfCopy.epub')
+      .first<{ size: number; etag: string; r2_key: string }>();
+    expect(row).not.toBeNull();
+    const before = await testEnv.BUCKET.head(row!.r2_key);
+
+    // 间隔 20ms：R2 的 uploaded 是毫秒时间戳，同毫秒内重写会看不出差异
+    await new Promise((r) => setTimeout(r, 20));
+    const res = await copyOrMove('COPY', '/最近收录/SelfCopy.epub', '/最近收录/SelfCopy.epub');
+    expect(res.status, '同源 COPY 应当是 204 no-op').toBe(204);
+    await res.text();
+
+    const after = await testEnv.BUCKET.head(row!.r2_key);
+    // ⚠️ 只比字节是**假绿**：同源重写会写回一模一样的字节，内容自然相等。
+    // 真正的判别证据是对象被**重写**过 —— uploaded 时间戳 / size / etag。
+    // 修复前这里会「读自己 → 写同一个键」，uploaded 必然前进。
+    expect(after?.uploaded?.getTime(), '对象不能被重写（uploaded 不应前进）')
+      .toBe(before?.uploaded?.getTime());
+    expect(after?.size).toBe(before?.size);
+    expect(after?.etag).toBe(before?.etag);
+
+    const rowAfter = await testEnv.DB
+      .prepare('SELECT size, etag, r2_key FROM books WHERE leaf_name = ?')
+      .bind('SelfCopy.epub')
+      .first<{ size: number; etag: string; r2_key: string }>();
+    expect(rowAfter).toEqual(row);
+  });
+
+  it('COPY 到别名路径（同一本、不同集合路径）也按同源处理', async () => {
+    await put('/最近收录/Alias.epub', 'ALIAS-BYTES');
+    const before = await snapshot('Alias.epub');
+
+    const res = await copyOrMove(
+      'COPY',
+      '/最近收录/Alias.epub',
+      '/按作者/未知作者/Alias.epub',
+    );
+    expect(res.status).toBe(204);
+    await res.text();
+
+    const after = await snapshot('Alias.epub');
+    expect(after.bytes).toEqual(before.bytes);
+    expect(after.row).toEqual(before.row);
+  });
+});

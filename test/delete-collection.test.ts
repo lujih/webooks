@@ -75,14 +75,58 @@ describe('集合 DELETE（RFC 4918 §9.6.1）', () => {
     expect(names).toContain('Charlie.epub');
   });
 
-  it('删导航层（/按书名/）会清空该集合下的全部书', async () => {
+  it('删导航层（/按书名/）必须被拒绝，且一本书都不能少', async () => {
     await seed();
+    // 2026-10-28 审查订正：旧实现返回 **204 但一本没删** —— 对客户端宣称
+    // 「按 §9.6.1 我把这个集合连同成员都删了」，实际什么都没发生，
+    // 属于静默说谎。导航层的成员是「派生出来的桶」，没有实体行可删；
+    // 真要删就等于删全库，风险与根目录同级 → 与根目录一致明确拒绝。
     const res = await dav('/按书名/', { method: 'DELETE' });
-    expect(res.status).toBe(204);
+    expect(res.status).toBe(405);
     await res.text();
-    // title 集合是按书名导航，但它本身不含成员；成员在其各桶里。
-    // 因此删导航层应当不影响各桶里的书 —— 关键是不能误删。
     expect(await countBooks()).toBe(3);
+  });
+
+  // ── 2026-10-28 审查：分页目录 DELETE 曾会删掉整个桶/整个书库 ──────────
+  it('删分页目录（/按书名/A/2/）必须被拒绝，且一本书都不能少', async () => {
+    await seed();
+    // 修复前：`node.page` 被丢掉，DELETE /按书名/A/2/ 等价于删整个 A 桶。
+    const res = await dav('/按书名/A/2/', { method: 'DELETE' });
+    expect(res.status).toBe(405);
+    await res.text();
+    expect(await countBooks(), '分页目录不是可删集合').toBe(3);
+  });
+
+  it('删最近收录的分页目录（/最近收录/2/）不得清空书库', async () => {
+    await seed();
+    // 修复前最严重的一条：recent 的删除条件是 `1 = 1`，
+    // DELETE /最近收录/2/ 会删掉**全库**。
+    const res = await dav('/最近收录/2/', { method: 'DELETE' });
+    expect(res.status).toBe(405);
+    await res.text();
+    expect(await countBooks(), '一次请求删全库必须被阻止').toBe(3);
+  });
+
+  it('集合成员超过单请求上限时拒绝（409），不做半删', async () => {
+    // 9 本 > MAX_COLLECTION_DELETE(8)：必须整体拒绝，而不是删 8 本留 1 本
+    await testEnv.DB.batch(
+      Array.from({ length: 9 }, (_, i) =>
+        upsertBookStatement(testEnv.DB, {
+          id: `bulk-${i}`, leafName: `Bulk${i}.epub`, title: `Bulk${i}`, author: null,
+          language: null, format: 'epub', contentType: 'application/epub+zip',
+          size: 100, sha256: null, r2Key: `books/bulk-${i}`, etag: `b${i}`,
+          titleLetter: letterBucket(`Bulk${i}`), authorLetter: authorBucket(null),
+          formatBucket: 'epub', publishedAt: new Date().toISOString(),
+        }),
+      ),
+    );
+    await rebuildBuckets(testEnv.DB);
+    expect(await countBooks()).toBe(9);
+
+    const res = await dav('/按书名/B/', { method: 'DELETE' });
+    expect(res.status).toBe(409);
+    await res.text();
+    expect(await countBooks(), '超限时必须一本都不删').toBe(9);
   });
 
   it('无口令不能删集合（防止匿名清空书库）', async () => {

@@ -60,7 +60,10 @@ function propfind(path: string, depth = '1'): Promise<Response> {
 }
 
 function admin(path: string): Promise<Response> {
+  // 2026-10-28：破坏性/写动作改成**只接受 POST**（S5：GET 可被
+  // <img src> 或预取零交互触发）。这里统一用 POST。
   return SELF.fetch(`${ORIGIN}/api/admin/${path}`, {
+    method: 'POST',
     headers: { authorization: 'Bearer test-token' },
   });
 }

@@ -515,9 +515,18 @@ describe('设计系统一致性', () => {
         await SELF.fetch(`${ORIGIN}${path}`, { headers: { accept: 'text/html' } })
       ).text();
       const css = html.match(/<style>([\s\S]*?)<\/style>/)![1]!;
-      // 允许 theme 里的那个 .wrap，页面自己再定义一个就是自造
-      const wraps = [...css.matchAll(/(^|\})\s*\.wrap\s*\{/g)];
-      expect(wraps.length, `${path} 重复定义了 .wrap`).toBeLessThanOrEqual(1);
+      // ⚠️ 2026-10-28 审查 T-01：旧正则 `(^|\})\s*\.wrap\s*\{` 依赖「前一个字符
+      // 是行首或 }」—— 而 theme 的 `.wrap{` 前面是**注释结尾 `*/`**，于是
+      // theme 那一条根本匹配不到，计数恒为 0；页面再自造一条 .wrap 也只算 1，
+      // `<= 1` 照样通过（变异实验实测：加 `.wrap{max-width:60rem}` 后仍全绿）。
+      // 修法：先剥掉 CSS 注释，再直接数 `.wrap{` 选择器 —— 不依赖前一个字符。
+      const cssNoComments = css.replace(/\/\*[\s\S]*?\*\//g, '');
+      // 判定标准是「带 max-width 的 .wrap」而不是「出现过 .wrap{」：
+      // theme 自己就有两处（基础规则 + 移动端只改 padding 的覆盖），
+      // 按出现次数会误报。宽度才是「版心」的唯一声明点。
+      const wraps = [...cssNoComments.matchAll(/\.wrap\s*\{([^}]*)\}/g)]
+        .filter((m) => /max-width\s*:/.test(m[1] ?? ''));
+      expect(wraps.length, `${path} 重复定义了 .wrap 的版心宽度`).toBeLessThanOrEqual(1);
     });
   }
 
@@ -529,9 +538,16 @@ describe('设计系统一致性', () => {
       const html = await (
         await SELF.fetch(`${ORIGIN}${path}`, { headers: { accept: 'text/html' } })
       ).text();
-      const m = html.match(/\.wrap\{[^}]*max-width:\s*([^;}]+)/);
-      if (m) widths.add(m[1]!.trim());
+      // ⚠️ 2026-10-28 审查 T-02：旧写法只取**第一个** match（theme 的 52rem），
+      // 页面在后面覆盖 `.wrap{max-width:60rem}` 永远看不到。
+      // 改为收集**每一处**声明：两处不同宽度就该红。
+      const css = html.replace(/\/\*[\s\S]*?\*\//g, '');
+      for (const m of css.matchAll(/\.wrap\s*\{[^}]*max-width:\s*([^;}]+)/g)) {
+        widths.add(m[1]!.trim());
+      }
     }
+    expect(widths.size, '一个 .wrap 宽度都没读到 —— 断言在空集上成立，是假绿')
+      .toBeGreaterThan(0);
     expect(widths.size, `不同的内容宽度：${[...widths].join(' / ')}`).toBeLessThanOrEqual(1);
   });
 });

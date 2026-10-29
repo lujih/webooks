@@ -49,21 +49,41 @@ export function extractToken(request: Request): string {
 
 /**
  * 校验写口令。
- * @param expected 期望口令；为空字符串/null 表示**未启用保护**
+ *
+ * @param expected 期望口令。**未配置时一律拒绝**（fail-closed）。
+ *
+ * 为什么 2026-10-28 从 fail-open 改成 fail-closed：
+ *   旧实现 `if (!expected) return true` —— 忘配 WRITE_TOKEN 的新部署会
+ *   **对所有人开放删除/改名/覆盖**，而读与新增本来就是匿名的，于是
+ *   「匿名删光书库」成了默认配置下的合法操作。这不是「向后兼容」的取舍，
+ *   是默认不安全。
+ *   现在未配置 = 破坏性操作 401（与未配置 ADMIN_TOKEN 时管理接口整体 404
+ *   同一原则）。想开放的话必须显式配一个口令，而不是靠「忘记配置」。
+ *
+ * 注意范围：匿名**新增**（PUT 到新路径）不走这里，所以产品承诺的
+ * 「无需注册即可上传」不受影响；受影响的只有破坏性操作。
  */
 export function hasWriteToken(request: Request, expected: string | null): boolean {
-  if (!expected) return true; // 未配置 = 不保护（保持向后兼容，后台会明确告警）
+  if (!expected) return false;
   const provided = extractToken(request);
   return provided.length > 0 && safeEqual(provided, expected);
 }
 
-/** 校验管理口令（比写口令更高的权限） */
-export function hasAdminToken(request: Request, url: URL, expected: string | null): boolean {
+/**
+ * 校验管理口令（比写口令更高的权限）。
+ *
+ * **只接受 `Authorization` 头，刻意不支持 `?token=`**（2026-10-28 审查 S5）：
+ *   · 口令进了 query 就会落进浏览器历史、Cloudflare 访问日志、中间代理，
+ *     以及同源请求的 Referer（`strict-origin-when-cross-origin` 只挡跨源）；
+ *   · 更关键的是「URL 里能带口令」等于给 `<img src="…/api/admin/delete?token=…">`
+ *     这类零交互触发打开了一扇门 —— 破坏性动作不该能被一条图片请求触发。
+ * 管理页本来就只用 sessionStorage + Bearer，去掉查询参数不影响任何既有功能。
+ */
+export function hasAdminToken(request: Request, expected: string | null): boolean {
   if (!expected) return false; // 未配置 = 管理接口整体关闭（fail-closed）
   const header = request.headers.get('authorization') ?? '';
   const bearer = header.toLowerCase().startsWith('bearer ') ? header.slice(7).trim() : '';
-  const provided = bearer || (url.searchParams.get('token') ?? '');
-  return provided.length > 0 && safeEqual(provided, expected);
+  return bearer.length > 0 && safeEqual(bearer, expected);
 }
 
 /**

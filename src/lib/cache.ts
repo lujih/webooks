@@ -45,6 +45,28 @@ export async function purgeEntries(
   return removed;
 }
 
+/**
+ * 「导航层」的失效键：根目录 + 5 个集合根（按书名/作者/类型/格式/最近收录）。
+ *
+ * 用途：**批量**写路径（reindex / migrate-keys / import-manifest / MOVE）。
+ * 这类路径一次可能动十几本书，而每本书的完整失效集是 14 个键 ——
+ * 十几本 = 200+ 次 `cache.delete`，必然撞 Workers Free 的 50 子请求上限
+ *（Cache API 与子请求共用同一个池）。所以批量路径只打导航层 + 榜单。
+ *
+ * 已知边界（与 `collectionDeleteCacheTargets` 同一类取舍）：
+ * 单本书的 depth-0 叶子条目不会在批量路径里被失效，最长
+ * `PROPFIND_TTL`（默认 300s）后自然过期。列表入口是立即生效的。
+ */
+export function navCacheTargets(): Array<readonly [string, 0 | 1]> {
+  const collections: Array<'title' | 'author' | 'type' | 'format' | 'recent'> = [
+    'title', 'author', 'type', 'format', 'recent',
+  ];
+  return [
+    ['/', 1],
+    ...collections.map((c) => [`/${collectionSegment(c)}/`, 1] as const),
+  ];
+}
+
 export interface BookCacheIdentity {
   leafName: string;
   titleLetter: string;

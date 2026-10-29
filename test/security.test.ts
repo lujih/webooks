@@ -480,6 +480,74 @@ describe('管理后台 API', () => {
     expect(json.missing).toContain('never-existed.epub');
   });
 
+  // ── 2026-10-28 审查：批量删除曾接受 200 个 leafName，约 17 本即撞 50 子请求上限 ──
+  it('批量删除超过单请求上限时整体拒绝（400），一本书都不能少', async () => {
+    const names: string[] = [];
+    for (let i = 0; i < 9; i++) {
+      const leaf = `bulkcap${i}.epub`;
+      names.push(leaf);
+      await SELF.fetch(`${ORIGIN}/dav/recent/${leaf}`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/epub+zip', authorization: 'Bearer test-write-token' },
+        body: 'x',
+      });
+    }
+    const res = await SELF.fetch(`${ORIGIN}/api/admin/delete`, {
+      method: 'POST',
+      headers: { authorization: 'Bearer test-token', 'content-type': 'application/json' },
+      body: JSON.stringify({ leafNames: names }),
+    });
+    expect(res.status).toBe(400);
+    const json = (await res.json()) as { error: string; limit: number };
+    expect(json.error).toBe('too-many-leaf-names');
+    expect(json.limit).toBe(8);
+
+    // 关键：拒绝必须是**整体**的，不能删掉前 8 本
+    const row = await testEnv.DB.prepare('SELECT COUNT(*) AS n FROM books WHERE leaf_name LIKE ?')
+      .bind('bulkcap%').first<{ n: number }>();
+    expect(row?.n, '超限请求不得删除任何书').toBe(9);
+  });
+
+  it("fail-closed：未配置 WRITE_TOKEN 时破坏性操作一律拒绝", async () => {
+    // 直接测 auth 层（生产配置状态无法在 SELF.fetch 里伪造）
+    const { hasWriteToken } = await import('../src/lib/auth');
+    const req = new Request(`${ORIGIN}/dav/x.epub`, {
+      method: 'DELETE',
+      headers: { authorization: 'Bearer anything' },
+    });
+    // 旧实现 `if (!expected) return true` —— 忘配口令的部署对所有人开放删除。
+    expect(hasWriteToken(req, null), '未配置 ≠ 不设防').toBe(false);
+    expect(hasWriteToken(req, '')).toBe(false);
+    expect(hasWriteToken(req, 'anything')).toBe(true);
+    expect(hasWriteToken(req, 'wrong-value')).toBe(false);
+  });
+
+  // ── 2026-10-28 审查 S5：口令不得走 URL；破坏性动作必须 POST ──────────────
+  it('管理口令只认 Authorization 头：?token= 不再被接受', async () => {
+    // 查询参数会进浏览器历史 / 访问日志 / Referer，且能被 <img src> 触发。
+    // 旧实现 `bearer || searchParams.get('token')` 两条路等价，这条测试钉死移除。
+    const res = await SELF.fetch(`${ORIGIN}/api/admin/stats?token=test-token`);
+    expect(res.status, 'URL 里的口令必须被忽略').toBe(403);
+  });
+
+  it('破坏性动作只接受 POST：GET /api/admin/delete 返回 405', async () => {
+    const res = await SELF.fetch(`${ORIGIN}/api/admin/delete?leafNames=x.epub`, {
+      headers: { authorization: 'Bearer test-token' },
+    });
+    expect(res.status).toBe(405);
+    const allow = res.headers.get('allow');
+    expect(allow).toContain('POST');
+  });
+
+  it('只读动作仍然允许 GET（不能把管理页一起禁掉）', async () => {
+    for (const p of ['/api/admin/stats', '/api/admin/books', '/api/admin/credits']) {
+      const res = await SELF.fetch(`${ORIGIN}${p}`, {
+        headers: { authorization: 'Bearer test-token' },
+      });
+      expect(res.status, `${p} 应当允许 GET`).toBe(200);
+    }
+  });
+
   it('/admin 页面可访问，且不带任何敏感数据', async () => {
     const res = await SELF.fetch(`${ORIGIN}/admin`);
     expect(res.status).toBe(200);

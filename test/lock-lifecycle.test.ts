@@ -462,4 +462,28 @@ describe('锁表里的 % 不是非法字符：删除路径不许抛 URIError', (
       '书没了、锁还在 → TTL 内同名文件传不回来（§9.6 MUST destroy）',
     ).toEqual([]);
   });
+
+  // ── 2026-10-28 审查（协议 🟠-8）：刷新令牌无效时曾**新造一把锁** ─────────
+  it('LOCK 刷新带无效 If 令牌 → 412，且不得新造锁', async () => {
+    // 先确认表里本来没有锁
+    expect(await lockRows()).toHaveLength(0);
+
+    const res = await dav('/recent/refresh.epub', {
+      method: 'LOCK',
+      headers: {
+        'content-type': 'application/xml',
+        timeout: 'Second-300',
+        depth: '0',
+        // 一个格式合法但库里不存在的令牌
+        if: '(<urn:uuid:00000000-0000-0000-0000-000000000000>)',
+      },
+      body: LOCK_BODY,
+    });
+    expect(res.status, '无效刷新令牌必须 412，而不是 200 + 新锁').toBe(412);
+    await res.text();
+
+    // 修复前：这里会多出一把锁（200 + Lock-Token），客户端以为刷新成功。
+    expect(await lockRows(), '失败的重启不能留下新锁').toHaveLength(0);
+  });
+
 });
